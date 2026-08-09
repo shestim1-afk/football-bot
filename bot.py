@@ -5,13 +5,15 @@ Monitors live football matches across major leagues (including Bulgarian Parva L
 Sends a Telegram notification when a team has >0 shots on target but 0 goals scored,
 along with possession %, corners, and goals info.
 
-Uses api-football.com (RapidAPI) for live data.
+Uses api-football.com (direct API) for live data.
+Supports multiple API keys for higher request limits (rotates round-robin).
 """
 
 import os
 import sys
 import time
 import logging
+import itertools
 from telegram import Bot
 from telegram.error import TelegramError
 import httpx
@@ -38,8 +40,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 if not TELEGRAM_CHAT_ID:
     missing.append("TELEGRAM_CHAT_ID")
 
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
-if not RAPIDAPI_KEY:
+# Support multiple API keys separated by comma (e.g. "key1,key2,key3")
+_raw_keys = os.environ.get("RAPIDAPI_KEY", "")
+API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+if not API_KEYS:
     missing.append("RAPIDAPI_KEY")
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL", "60"))
@@ -49,11 +53,18 @@ if missing:
     log.error("Please add them in Railway > Variables tab")
     sys.exit(1)
 
-API_BASE = "https://api-football-v1.p.rapidapi.com/v3"
-HEADERS = {
-    "X-RapidAPI-Key": RAPIDAPI_KEY,
-    "X-RapidAPI-Host": "api-football-v1.p.rapidapi.com",
-}
+log.info(f"Loaded {len(API_KEYS)} API key(s) = {len(API_KEYS) * 100} requests/day")
+
+API_BASE = "https://v3.football.api-sports.io"
+
+# Round-robin key rotation
+_key_cycle = itertools.cycle(API_KEYS)
+
+
+def get_headers() -> dict:
+    key = next(_key_cycle)
+    return {"x-apisports-key": key}
+
 
 # Major league IDs (api-football.com)
 LEAGUE_IDS = {
@@ -74,15 +85,12 @@ LEAGUE_IDS = {
     340:  "Liga MX",
 }
 
-# Live fixture statuses we care about
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
-
-# Track notified (fixture_id, team_id) -> last known shots_on_target
 notified: dict[tuple[int, int], int] = {}
 
 
 def get_live_fixtures(client: httpx.Client) -> list[dict]:
-    resp = client.get(f"{API_BASE}/fixtures", params={"live": "all"}, headers=HEADERS)
+    resp = client.get(f"{API_BASE}/fixtures", params={"live": "all"}, headers=get_headers())
     resp.raise_for_status()
     data = resp.json()
     return data.get("response", [])
@@ -92,7 +100,7 @@ def get_fixture_stats(client: httpx.Client, fixture_id: int) -> list[dict]:
     resp = client.get(
         f"{API_BASE}/fixtures/statistics",
         params={"fixture": fixture_id},
-        headers=HEADERS,
+        headers=get_headers(),
     )
     resp.raise_for_status()
     data = resp.json()
