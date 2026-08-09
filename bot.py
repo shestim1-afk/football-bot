@@ -41,6 +41,7 @@ if not TELEGRAM_CHAT_ID:
     missing.append("TELEGRAM_CHAT_ID")
 
 # Support multiple API keys separated by comma (e.g. "key1,key2,key3")
+# Each free key = 100 requests/day, so 2 keys = 200, 3 keys = 300, etc.
 _raw_keys = os.environ.get("RAPIDAPI_KEY", "")
 API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 if not API_KEYS:
@@ -62,6 +63,7 @@ _key_cycle = itertools.cycle(API_KEYS)
 
 
 def get_headers() -> dict:
+    """Return headers with the next API key (round-robin)."""
     key = next(_key_cycle)
     return {"x-apisports-key": key}
 
@@ -85,7 +87,10 @@ LEAGUE_IDS = {
     340:  "Liga MX",
 }
 
+# Live fixture statuses we care about
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
+
+# Track notified (fixture_id, team_id) -> last known shots_on_target
 notified: dict[tuple[int, int], int] = {}
 
 
