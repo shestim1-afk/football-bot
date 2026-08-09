@@ -1,13 +1,12 @@
 """
 Football Live Tracker Telegram Bot
 =================================
-Monitors live football matches across major leagues.
-Sends a Telegram notification when a team has 3+ shots on target but 0 goals,
+Monitors live football matches across major leagues (including Bulgarian Parva Liga).
+Sends a Telegram notification when a team has >0 shots on target but 0 goals scored,
 along with possession %, corners, and goals info.
 
 Uses api-football.com (direct API) for live data.
 Supports multiple API keys for higher request limits (rotates round-robin).
-Uses adaptive polling: slower when no matches, faster when matches are live.
 """
 
 import os
@@ -22,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Logging ---
+# --- Logging (set up FIRST so we can see errors) ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -41,10 +40,14 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 if not TELEGRAM_CHAT_ID:
     missing.append("TELEGRAM_CHAT_ID")
 
+# Support multiple API keys separated by comma (e.g. "key1,key2,key3")
+# Each free key = 100 requests/day, so 2 keys = 200, 3 keys = 300, etc.
 _raw_keys = os.environ.get("RAPIDAPI_KEY", "")
 API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 if not API_KEYS:
     missing.append("RAPIDAPI_KEY")
+
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL", "60"))
 
 if missing:
     log.error(f"MISSING ENV VARIABLES: {', '.join(missing)}")
@@ -58,13 +61,9 @@ API_BASE = "https://v3.football.api-sports.io"
 # Round-robin key rotation
 _key_cycle = itertools.cycle(API_KEYS)
 
-# --- Adaptive polling ---
-IDLE_INTERVAL = 1800   # 30 min - no live matches
-ACTIVE_INTERVAL = 300  # 5 min  - matches in progress
-_current_interval = IDLE_INTERVAL
-
 
 def get_headers() -> dict:
+    """Return headers with the next API key (round-robin)."""
     key = next(_key_cycle)
     return {"x-apisports-key": key}
 
@@ -74,33 +73,28 @@ LEAGUE_IDS = {
     39:   "Premier League",
     140:  "La Liga",
     78:   "Bundesliga",
-    79:   "2. Bundesliga",
     135:  "Serie A",
     61:   "Ligue 1",
     2:    "Champions League",
     3:    "Europa League",
     848:  "Conference League",
-    357:  "First League (Bulgaria)",
+    211:  "Parva Liga (Bulgaria)",
     94:   "Primeira Liga",
     88:   "Eredivisie",
     203:  "Super Lig",
-    169:  "Austrian Bundesliga",
-    283:  "SuperLiga (Serbia)",
-    210:  "HNL (Croatia)",
-    345:  "Czech First League",
-    119:  "Danish Superliga",
-    137:  "Veikkausliiga (Finland)",
-    191:  "NB I (Hungary)",
+    144:  "Liga Profesional",
+    71:   "Serie A (Brazil)",
+    340:  "Liga MX",
 }
 
+# Live fixture statuses we care about
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
+
+# Track notified (fixture_id, team_id) -> last known shots_on_target
 notified: dict[tuple[int, int], int] = {}
-request_count = 0
 
 
 def get_live_fixtures(client: httpx.Client) -> list[dict]:
-    global request_count
-    request_count += 1
     resp = client.get(f"{API_BASE}/fixtures", params={"live": "all"}, headers=get_headers())
     resp.raise_for_status()
     data = resp.json()
@@ -108,8 +102,6 @@ def get_live_fixtures(client: httpx.Client) -> list[dict]:
 
 
 def get_fixture_stats(client: httpx.Client, fixture_id: int) -> list[dict]:
-    global request_count
-    request_count += 1
     resp = client.get(
         f"{API_BASE}/fixtures/statistics",
         params={"fixture": fixture_id},
@@ -146,23 +138,9 @@ def build_signal_message(fixture: dict, team_name: str, team_stats: dict) -> str
     return msg
 
 
-def check_fixtures(client: httpx.Client, bot: Bot) -> bool:
-    """Check fixtures. Returns True if tracked matches are live."""
-    global _current_interval
-
+def check_fixtures(client: httpx.Client, bot: Bot):
     fixtures = get_live_fixtures(client)
-    tracked_matches = [f for f in fixtures if f["league"]["id"] in LEAGUE_IDS]
-    log.info(f"Found {len(fixtures)} total, {len(tracked_matches)} tracked | Requests today: {request_count}")
-
-    if tracked_matches:
-        for m in tracked_matches:
-            log.info(f"  -> {m['league']['name']}: {m['teams']['home']['name']} vs {m['teams']['away']['name']} ({m['fixture']['status']['short']})")
-
-    # Adaptive interval
-    if tracked_matches:
-        _current_interval = ACTIVE_INTERVAL
-    else:
-        _current_interval = IDLE_INTERVAL
+    log.info(f"Found {len(fixtures)} live fixtures")
 
     for fixture in fixtures:
         league_id = fixture["league"]["id"]
@@ -209,7 +187,7 @@ def check_fixtures(client: httpx.Client, bot: Bot) -> bool:
                 goals = fixture["goals"]["away"] or 0
                 team_id = fixture["teams"]["away"]["id"]
 
-            if shots_on_target >= 3 and goals == 0:
+            if shots_on_target > 0 and goals == 0:
                 key = (fixture_id, team_id)
                 last_notified_shots = notified.get(key, 0)
 
@@ -230,7 +208,10 @@ def check_fixtures(client: httpx.Client, bot: Bot) -> bool:
                             chat_id=TELEGRAM_CHAT_ID,
                             text=msg,
                         )
-                        log.info(f"Signal sent: {team_name} has {shots_on_target} shots on target, 0 goals (fixture {fixture_id})")
+                        log.info(
+                            f"Signal sent: {team_name} has {shots_on_target} shots on target, 0 goals "
+                            f"(fixture {fixture_id})"
+                        )
                         notified[key] = shots_on_target
                     except TelegramError as e:
                         log.error(f"Failed to send Telegram message: {e}")
@@ -240,16 +221,13 @@ def check_fixtures(client: httpx.Client, bot: Bot) -> bool:
                 if key in notified:
                     del notified[key]
 
-    return len(tracked_matches) > 0
-
 
 def main():
     log.info("Football Live Tracker Bot starting...")
-    log.info(f"Idle poll: {IDLE_INTERVAL}s | Active poll: {ACTIVE_INTERVAL}s")
+    log.info(f"Polling every {POLL_INTERVAL_SECONDS}s")
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
 
-    # Use request() directly to avoid asyncio connection pool issues
-    bot = Bot(token=TELEGRAM_BOT_TOKEN, request=httpx.request)
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     with httpx.Client(timeout=30.0) as client:
         while True:
@@ -260,8 +238,7 @@ def main():
             except Exception as e:
                 log.error(f"Unexpected error: {e}")
 
-            log.info(f"Next check in {_current_interval}s")
-            time.sleep(_current_interval)
+            time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
