@@ -1,13 +1,27 @@
+"""
+Football Live Tracker Telegram Bot
+=================================
+Monitors live football matches across major leagues (including Bulgarian Parva Liga).
+Sends a Telegram notification when a team has >0 shots on target but 0 goals scored,
+along with possession %, corners, and goals info.
+
+Uses api-football.com (direct API) for live data.
+Supports multiple API keys for higher request limits (rotates round-robin).
+"""
+
 import os
 import sys
 import time
 import logging
+import itertools
+from telegram import Bot
+from telegram.error import TelegramError
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Logging ---
+# --- Logging (set up FIRST so we can see errors) ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -19,402 +33,212 @@ log = logging.getLogger(__name__)
 # --- Config from env ---
 missing = []
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_BOT_TOKEN:
+    missing.append("TELEGRAM_BOT_TOKEN")
 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
+if not TELEGRAM_CHAT_ID:
+    missing.append("TELEGRAM_CHAT_ID")
 
+# Support multiple API keys separated by comma (e.g. "key1,key2,key3")
+# Each free key = 100 requests/day, so 2 keys = 200, 3 keys = 300, etc.
 _raw_keys = os.environ.get("RAPIDAPI_KEY", "")
 API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
-if not API_KEYS: missing.append("RAPIDAPI_KEY")
+if not API_KEYS:
+    missing.append("RAPIDAPI_KEY")
+
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL", "60"))
 
 if missing:
     log.error(f"MISSING ENV VARIABLES: {', '.join(missing)}")
     log.error("Please add them in Railway > Variables tab")
     sys.exit(1)
 
-API_BASE = "https://v3.football.api-sports.io"
-TELEGRAM_API = "https://api.telegram.org"
+log.info(f"Loaded {len(API_KEYS)} API key(s) = {len(API_KEYS) * 100} requests/day")
 
+API_BASE = "https://v3.football.api-sports.io"
+
+# Round-robin key rotation
+_key_cycle = itertools.cycle(API_KEYS)
+
+
+def get_headers() -> dict:
+    """Return headers with the next API key (round-robin)."""
+    key = next(_key_cycle)
+    return {"x-apisports-key": key}
+
+
+# Major league IDs (api-football.com)
 LEAGUE_IDS = {
-    39: "Premier League", 140: "La Liga", 78: "Bundesliga", 79: "2. Bundesliga",
-    135: "Serie A", 61: "Ligue 1", 2: "Champions League", 3: "Europa League",
-    848: "Conference League", 357: "First League (Bulgaria)", 94: "Primeira Liga",
-    88: "Eredivisie", 203: "Super Lig", 169: "Austrian Bundesliga",
-    283: "SuperLiga (Serbia)", 210: "HNL (Croatia)", 345: "Czech First League",
-    119: "Danish Superliga", 137: "Veikkausliiga (Finland)", 191: "NB I (Hungary)",
+    39:   "Premier League",
+    140:  "La Liga",
+    78:   "Bundesliga",
+    135:  "Serie A",
+    61:   "Ligue 1",
+    2:    "Champions League",
+    3:    "Europa League",
+    848:  "Conference League",
+    211:  "Parva Liga (Bulgaria)",
+    94:   "Primeira Liga",
+    88:   "Eredivisie",
+    203:  "Super Lig",
+    144:  "Liga Profesional",
+    71:   "Serie A (Brazil)",
+    340:  "Liga MX",
 }
 
+# Live fixture statuses we care about
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
-MINUTE_MIN = 25
-MINUTE_MAX = 75
 
-# --- State ---
+# Track notified (fixture_id, team_id) -> last known shots_on_target
 notified: dict[tuple[int, int], int] = {}
-request_count = 0
-signals_sent: list[dict] = []
-
-# --- Per-key quota tracking ---
-quota_by_key: dict[str, int] = {k: 100 for k in API_KEYS}
-rate_limit_remaining: int = 10
 
 
-# ============================================================
-# API HELPERS
-# ============================================================
-
-def pick_key() -> str:
-    return max(quota_by_key, key=quota_by_key.get)
-
-
-def total_quota() -> int:
-    return sum(quota_by_key.values())
+def get_live_fixtures(client: httpx.Client) -> list[dict]:
+    resp = client.get(f"{API_BASE}/fixtures", params={"live": "all"}, headers=get_headers())
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response", [])
 
 
-def update_key_quota(resp: httpx.Response, key: str):
-    global rate_limit_remaining
-    try:
-        val = resp.headers.get("x-ratelimit-requests-remaining", "")
-        if val:
-            quota_by_key[key] = int(val)
-    except (ValueError, TypeError):
-        pass
-    try:
-        val = resp.headers.get("X-RateLimit-Remaining", "")
-        if val:
-            rate_limit_remaining = int(val)
-    except (ValueError, TypeError):
-        pass
-
-
-def api_get(client: httpx.Client, endpoint: str, params: dict = None) -> dict:
-    global request_count
-    if total_quota() <= 0:
-        raise Exception("Daily quota exhausted")
-    key = pick_key()
-    request_count += 1
+def get_fixture_stats(client: httpx.Client, fixture_id: int) -> list[dict]:
     resp = client.get(
-        f"{API_BASE}{endpoint}",
-        params=params,
-        headers={"x-apisports-key": key},
+        f"{API_BASE}/fixtures/statistics",
+        params={"fixture": fixture_id},
+        headers=get_headers(),
     )
     resp.raise_for_status()
-    update_key_quota(resp, key)
-    return resp.json()
+    data = resp.json()
+    return data.get("response", [])
 
 
-def send_telegram(client: httpx.Client, text: str) -> bool:
-    try:
-        resp = client.post(
-            f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        log.error(f"Telegram send failed: {e}")
-        return False
+def build_signal_message(fixture: dict, team_name: str, team_stats: dict) -> str:
+    league_name = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
+    home = fixture["teams"]["home"]["name"]
+    away = fixture["teams"]["away"]["name"]
+    score_home = fixture["goals"]["home"]
+    score_away = fixture["goals"]["away"]
+    minute = fixture["fixture"]["status"]["elapsed"]
+
+    possession = team_stats.get("possession", "N/A")
+    corners = team_stats.get("corners", "N/A")
+    shots_on_target = team_stats.get("shots_on_target", "?")
+    goals = team_stats.get("goals", "0")
+
+    msg = (
+        f"SHOTS ON TARGET BUT NO GOAL\n\n"
+        f"{home}  {score_home} - {score_away}  {away}\n"
+        f"{league_name}  {minute}'\n\n"
+        f"{team_name}\n"
+        f"  Shots on target: {shots_on_target}\n"
+        f"  Goals scored: {goals}\n"
+        f"  Possession: {possession}\n"
+        f"  Corners: {corners}"
+    )
+    return msg
 
 
-# ============================================================
-# CANDIDATE RANKING (uses only FREE data)
-# ============================================================
+def check_fixtures(client: httpx.Client, bot: Bot):
+    fixtures = get_live_fixtures(client)
+    log.info(f"Found {len(fixtures)} live fixtures")
 
-def rank_candidate(fixture: dict, team_id: int) -> int:
-    score = 0
-    minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
-
-    if 60 <= minute <= 75:
-        score += 3
-    elif 45 <= minute <= 59:
-        score += 2
-    elif MINUTE_MIN <= minute <= 44:
-        score += 1
-
-    home_goals = fixture["goals"]["home"] or 0
-    away_goals = fixture["goals"]["away"] or 0
-    is_home = fixture["teams"]["home"]["id"] == team_id
-    opp_goals = away_goals if is_home else home_goals
-
-    if opp_goals >= 1:
-        score += 3
-    elif home_goals == 0 and away_goals == 0:
-        score += 2
-
-    fixture_id = fixture["fixture"]["id"]
-    if (fixture_id, team_id) in notified:
-        score += 3
-
-    return score
-
-
-# ============================================================
-# QUOTA BUDGET
-# ============================================================
-
-def get_budget_mode() -> str:
-    q = total_quota()
-    if q >= 70: return "NORMAL"
-    elif q >= 40: return "CAREFUL"
-    elif q >= 20: return "STRICT"
-    elif q >= 5: return "EMERGENCY"
-    else: return "STOP"
-
-
-def get_max_candidates() -> int:
-    q = total_quota()
-    if q >= 70: return 10
-    elif q >= 40: return 5
-    elif q >= 20: return 3
-    elif q >= 5: return 1
-    else: return 0
-
-
-# ============================================================
-# DYNAMIC POLLING
-# ============================================================
-
-def get_poll_interval(best_score: int, has_candidates: bool) -> int:
-    if not has_candidates:
-        return 1800
-    if best_score >= 7: return 120
-    if best_score >= 5: return 180
-    if best_score >= 3: return 300
-    return 600
-
-
-# ============================================================
-# SIGNAL TIERS
-# ============================================================
-
-def classify_signal(sot: int, total_shots: int, goals: int) -> str | None:
-    if goals > 0 or sot < 3:
-        return None
-    if sot >= 5 and total_shots >= 10:
-        return "VERY STRONG"
-    if sot >= 4 and total_shots >= 8:
-        return "STRONG"
-    return "WATCH"
-
-
-def tier_emoji(tier: str) -> str:
-    if tier == "VERY STRONG": return "[RED]"
-    if tier == "STRONG": return "[ORANGE]"
-    return "[YELLOW]"
-
-
-# ============================================================
-# LOCAL FILTERING (zero API cost)
-# ============================================================
-
-def find_candidates(fixtures: list[dict]) -> list[tuple[dict, int, int]]:
-    candidates = []
     for fixture in fixtures:
-        lid = fixture["league"]["id"]
-        if lid not in LEAGUE_IDS:
+        league_id = fixture["league"]["id"]
+        if league_id not in LEAGUE_IDS:
             continue
+
+        fixture_id = fixture["fixture"]["id"]
         status = fixture["fixture"]["status"]["short"]
         if status not in LIVE_STATUSES:
             continue
-        minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
-        if minute < MINUTE_MIN or minute > MINUTE_MAX:
-            continue
-
-        home_goals = fixture["goals"]["home"] or 0
-        away_goals = fixture["goals"]["away"] or 0
-
-        if home_goals == 0:
-            tid = fixture["teams"]["home"]["id"]
-            rank = rank_candidate(fixture, tid)
-            candidates.append((fixture, tid, rank))
-        if away_goals == 0:
-            tid = fixture["teams"]["away"]["id"]
-            rank = rank_candidate(fixture, tid)
-            candidates.append((fixture, tid, rank))
-
-    candidates.sort(key=lambda x: x[2], reverse=True)
-    return candidates
-
-
-# ============================================================
-# MAIN CHECK CYCLE
-# ============================================================
-
-def check_cycle(client: httpx.Client) -> int:
-    data = api_get(client, "/fixtures", {"live": "all"})
-    fixtures = data.get("response", [])
-    tracked = [f for f in fixtures if f["league"]["id"] in LEAGUE_IDS]
-    budget = get_budget_mode()
-    max_cand = get_max_candidates()
-    q = total_quota()
-
-    log.info(
-        f"Quota: {q} [{budget}] | Max candidates: {max_cand} | "
-        f"Live: {len(fixtures)} | Tracked: {len(tracked)} | Requests: {request_count}"
-    )
-
-    for k, v in quota_by_key.items():
-        log.info(f"  Key {k[:8]}...: {v} remaining")
-
-    if budget == "STOP":
-        log.warning("Quota exhausted. Pausing API calls.")
-        return 0
-
-    if tracked:
-        for m in tracked:
-            minute = m["fixture"]["status"].get("elapsed", "?")
-            log.info(f"  -> {m['league']['name']}: {m['teams']['home']['name']} vs {m['teams']['away']['name']} ({m['fixture']['status']['short']} {minute}')")
-
-    candidates = find_candidates(fixtures)
-    log.info(f"  -> {len(candidates)} candidate(s) after local filter (0-goal teams, {MINUTE_MIN}-{MINUTE_MAX}')")
-
-    if not candidates:
-        return 0
-
-    selected = candidates[:max_cand]
-
-    fixture_team_map: dict[int, list[int]] = {}
-    for fixture, tid, rank in selected:
-        fid = fixture["fixture"]["id"]
-        if fid not in fixture_team_map:
-            fixture_team_map[fid] = []
-        fixture_team_map[fid].append(tid)
-
-    log.info(f"  -> Checking {len(fixture_team_map)} fixture(es) for stats (quota allows {max_cand})")
-
-    best_score = selected[0][2] if selected else 0
-
-    for fid, team_ids in fixture_team_map.items():
-        if total_quota() <= 1:
-            log.warning("Quota nearly gone, stopping stats fetches.")
-            break
 
         try:
-            stats_data = api_get(client, "/fixtures/statistics", {"fixture": fid})
-        except Exception as e:
-            log.warning(f"Stats failed for {fid}: {e}")
+            stats = get_fixture_stats(client, fixture_id)
+        except (httpx.HTTPError, Exception) as e:
+            log.warning(f"Could not fetch stats for fixture {fixture_id}: {e}")
             continue
 
-        stats = stats_data.get("response", [])
         if not stats:
-            continue
-
-        fixture = None
-        for f in fixtures:
-            if f["fixture"]["id"] == fid:
-                fixture = f
-                break
-        if not fixture:
             continue
 
         teams_data = {}
         for team_entry in stats:
             tname = team_entry["team"]["name"]
-            tmap = {}
+            team_stats_map = {}
             for s in team_entry.get("statistics", []):
-                val = s.get("value", "0")
-                if val is None: val = "0"
-                tmap[s["type"]] = str(val).strip()
-            teams_data[tname] = tmap
+                stype = s["type"]
+                svalue = s.get("value", "0")
+                if svalue is None:
+                    svalue = "0"
+                team_stats_map[stype] = str(svalue).strip()
+            teams_data[tname] = team_stats_map
 
-        for tname, tstats in teams_data.items():
-            sot_raw = tstats.get("Shots on Goal", "0")
-            shots_raw = tstats.get("Total Shots", "0")
+        for team_name, tstats in teams_data.items():
+            shots_raw = tstats.get("Shots on Goal", "0")
             try:
-                sot = int(sot_raw)
-                total_shots = int(shots_raw)
+                shots_on_target = int(shots_raw)
             except (ValueError, TypeError):
                 continue
 
-            if fixture["teams"]["home"]["name"] == tname:
-                tid = fixture["teams"]["home"]["id"]
+            if fixture["teams"]["home"]["name"] == team_name:
                 goals = fixture["goals"]["home"] or 0
+                team_id = fixture["teams"]["home"]["id"]
             else:
-                tid = fixture["teams"]["away"]["id"]
                 goals = fixture["goals"]["away"] or 0
+                team_id = fixture["teams"]["away"]["id"]
 
-            tier = classify_signal(sot, total_shots, goals)
+            if shots_on_target > 0 and goals == 0:
+                key = (fixture_id, team_id)
+                last_notified_shots = notified.get(key, 0)
 
-            if tier:
-                key = (fid, tid)
-                last_sot = notified.get(key, 0)
-
-                if sot > last_sot:
+                if shots_on_target > last_notified_shots:
                     possession = tstats.get("Ball Possession", "N/A")
                     corners = tstats.get("Corner Kicks", "N/A")
-                    opp_sot = "?"
-                    for oname, ostats in teams_data.items():
-                        if oname != tname:
-                            opp_sot = ostats.get("Shots on Goal", "?")
-                            break
 
-                    league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
-                    home = fixture["teams"]["home"]["name"]
-                    away = fixture["teams"]["away"]["name"]
-                    sh = fixture["goals"]["home"]
-                    sa = fixture["goals"]["away"]
-                    minute = fixture["fixture"]["status"]["elapsed"]
+                    team_stats_summary = {
+                        "shots_on_target": str(shots_on_target),
+                        "goals": str(goals),
+                        "possession": possession,
+                        "corners": corners,
+                    }
 
-                    msg = (
-                        f"{tier_emoji(tier)} {tier} SIGNAL\n\n"
-                        f"{home}  {sh} - {sa}  {away}\n"
-                        f"{league}  {minute}'\n\n"
-                        f"{tname}\n"
-                        f"  Shots on target: {sot}\n"
-                        f"  Total shots: {total_shots}\n"
-                        f"  Opponent SOT: {opp_sot}\n"
-                        f"  Goals: {goals}\n"
-                        f"  Possession: {possession}\n"
-                        f"  Corners: {corners}"
-                    )
-
-                    if send_telegram(client, msg):
-                        log.info(f"{tier}: {tname} - {sot} SOT, {total_shots} shots, 0 goals (fixture {fid})")
-                        notified[key] = sot
-
-                        signals_sent.append({
-                            "time": time.strftime("%Y-%m-%d %H:%M"),
-                            "fixture": fid,
-                            "team": tname,
-                            "league": league,
-                            "minute": minute,
-                            "sot": sot,
-                            "total_shots": total_shots,
-                            "opp_sot": opp_sot,
-                            "possession": possession,
-                            "tier": tier,
-                        })
+                    msg = build_signal_message(fixture, team_name, team_stats_summary)
+                    try:
+                        bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=msg,
+                        )
+                        log.info(
+                            f"Signal sent: {team_name} has {shots_on_target} shots on target, 0 goals "
+                            f"(fixture {fixture_id})"
+                        )
+                        notified[key] = shots_on_target
+                    except TelegramError as e:
+                        log.error(f"Failed to send Telegram message: {e}")
 
             else:
-                key = (fid, tid)
+                key = (fixture_id, team_id)
                 if key in notified:
                     del notified[key]
 
-    return best_score
-
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
 
 def main():
-    log.info("Football Bot v3 starting...")
+    log.info("Football Live Tracker Bot starting...")
+    log.info(f"Polling every {POLL_INTERVAL_SECONDS}s")
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
-    log.info(f"Keys: {len(API_KEYS)} (tracked individually, not assumed additive)")
-    log.info("Smart budget: rank candidates -> quota limit -> dynamic polling")
-    log.info("Signal tiers: WATCH (3 SOT) / STRONG (4+ SOT, 8+ shots) / VERY STRONG (5+ SOT, 10+ shots)")
+
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
     with httpx.Client(timeout=30.0) as client:
         while True:
             try:
-                best_score = check_cycle(client)
+                check_fixtures(client, bot)
+            except httpx.HTTPError as e:
+                log.error(f"API request failed: {e}")
             except Exception as e:
-                log.error(f"Cycle error: {e}")
-                best_score = 0
+                log.error(f"Unexpected error: {e}")
 
-            interval = get_poll_interval(best_score, best_score > 0)
-            log.info(f"Next check in {interval}s | Best candidate score: {best_score} | Quota: {total_quota()}")
-            time.sleep(interval)
+            time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
