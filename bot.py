@@ -12,7 +12,6 @@ Supports multiple API keys for higher request limits (rotates round-robin).
 import os
 import sys
 import time
-import asyncio
 import logging
 import itertools
 from telegram import Bot
@@ -41,7 +40,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 if not TELEGRAM_CHAT_ID:
     missing.append("TELEGRAM_CHAT_ID")
 
-# Support multiple API keys separated by comma
+# Support multiple API keys separated by comma (e.g. "key1,key2,key3")
+# Each free key = 100 requests/day, so 2 keys = 200, 3 keys = 300, etc.
 _raw_keys = os.environ.get("RAPIDAPI_KEY", "")
 API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
 if not API_KEYS:
@@ -63,6 +63,7 @@ _key_cycle = itertools.cycle(API_KEYS)
 
 
 def get_headers() -> dict:
+    """Return headers with the next API key (round-robin)."""
     key = next(_key_cycle)
     return {"x-apisports-key": key}
 
@@ -77,8 +78,7 @@ LEAGUE_IDS = {
     2:    "Champions League",
     3:    "Europa League",
     848:  "Conference League",
-    211:  "Parva Liga",
-    357:  "First League (Bulgaria)",
+    211:  "Parva Liga (Bulgaria)",
     94:   "Primeira Liga",
     88:   "Eredivisie",
     203:  "Super Lig",
@@ -87,7 +87,10 @@ LEAGUE_IDS = {
     340:  "Liga MX",
 }
 
+# Live fixture statuses we care about
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
+
+# Track notified (fixture_id, team_id) -> last known shots_on_target
 notified: dict[tuple[int, int], int] = {}
 
 
@@ -138,11 +141,6 @@ def build_signal_message(fixture: dict, team_name: str, team_stats: dict) -> str
 def check_fixtures(client: httpx.Client, bot: Bot):
     fixtures = get_live_fixtures(client)
     log.info(f"Found {len(fixtures)} live fixtures")
-
-    tracked_matches = [f for f in fixtures if f["league"]["id"] in LEAGUE_IDS]
-    if tracked_matches:
-        for m in tracked_matches:
-            log.info(f"  -> {m['league']['name']}: {m['teams']['home']['name']} vs {m['teams']['away']['name']} ({m['fixture']['status']['short']})")
 
     for fixture in fixtures:
         league_id = fixture["league"]["id"]
@@ -206,10 +204,10 @@ def check_fixtures(client: httpx.Client, bot: Bot):
 
                     msg = build_signal_message(fixture, team_name, team_stats_summary)
                     try:
-                        asyncio.run(bot.send_message(
+                        bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
                             text=msg,
-                        ))
+                        )
                         log.info(
                             f"Signal sent: {team_name} has {shots_on_target} shots on target, 0 goals "
                             f"(fixture {fixture_id})"
