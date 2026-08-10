@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import httpx
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,6 +47,10 @@ LEAGUE_IDS = {
 }
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
+
+# Dead hours UTC — no European league action worth polling
+DEAD_HOUR_START = 3   # 03:00 UTC
+DEAD_HOUR_END = 11     # 11:00 UTC
 
 MINUTE_MIN = 15
 MINUTE_MAX = 80
@@ -348,7 +353,7 @@ def cleanup_state(live_fixture_ids: set[int]):
     if to_delete:
         log.info(f"  Cleaned up state for {len(to_delete)} ended fixture(s)")
     # Also clean red card tracking for ended fixtures
-    expired_rc = fid for fid in sent_red_cards if fid not in live_fixture_ids
+    expired_rc = [fid for fid in sent_red_cards if fid not in live_fixture_ids]
     for fid in expired_rc:
         sent_red_cards.discard(fid)
 
@@ -604,6 +609,13 @@ def main():
 
     with httpx.Client(timeout=30.0) as client:
         while True:
+            # --- Dead hours check (no API cost) ---
+            utc_hour = datetime.now(timezone.utc).hour
+            if DEAD_HOUR_START <= utc_hour < DEAD_HOUR_END:
+                log.info(f"Dead hours ({DEAD_HOUR_START}:00-{DEAD_HOUR_END}:00 UTC), sleeping 30 min...")
+                time.sleep(1800)
+                continue
+
             try:
                 has_candidates, has_live, has_tracked_live, best_score = check_cycle(client)
             except Exception as e:
