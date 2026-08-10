@@ -47,9 +47,9 @@ LEAGUE_IDS = {
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
 
-MINUTE_MIN = 15
+MINUTE_MIN = 25
 MINUTE_MAX = 80
-MINUTE_LATE_MAX = 90
+MINUTE_LATE_MAX = 90  # only for already-tracked teams
 
 # --- State ---
 team_state: dict[tuple[int, int], dict] = {}
@@ -129,7 +129,7 @@ def send_telegram(client: httpx.Client, text: str) -> bool:
 
 
 # ============================================================
-# CANDIDATE RANKING (free data only)
+# CANDIDATE RANKING (free data only — no API cost)
 # ============================================================
 
 def is_interesting_scoreline(fixture: dict, team_id: int) -> bool:
@@ -233,16 +233,17 @@ def get_max_candidates() -> int:
     else: return 0
 
 
-def get_cycle_interval(has_candidates: bool, has_live: bool) -> int:
+def get_cycle_interval(has_candidates: bool, has_live: bool, has_tracked_live: bool) -> int:
+    """Only fast-poll when OUR tracked leagues have live matches."""
     eq = effective_quota()
-    if not has_live:
-        return 1800
+    if not has_tracked_live:
+        return 1800  # 30 min — no tracked matches live, global matches don't matter
     if not has_candidates:
-        if eq >= 40: return 300
-        else: return 600
-    if eq >= 40: return 180
-    elif eq >= 20: return 300
-    else: return 600
+        if eq >= 40: return 300   # 5 min
+        else: return 600  # 10 min when quota is tight
+    if eq >= 40: return 180   # 3 min
+    elif eq >= 20: return 300  # 5 min
+    else: return 600  # 10 min
 
 
 # ============================================================
@@ -348,19 +349,23 @@ def cleanup_state(live_fixture_ids: set[int]):
 
 
 # ============================================================
-# MAIN CYCLE
+# MAIN CYCLE — unified, always fresh data
 # ============================================================
 
-def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
+def check_cycle(client: httpx.Client) -> tuple[bool, bool, bool, int]:
+    """Returns (has_candidates, has_any_live, has_tracked_live, best_rank_score)."""
+
+    # --- STEP 1: Always-fresh discovery (1 request) ---
     try:
         data = api_get(client, "/fixtures", {"live": "all"})
     except Exception as e:
         log.error(f"Discovery request failed: {e}")
-        return False, False, 0
+        return False, False, False, 0
 
     fixtures = data.get("response", [])
     tracked = [f for f in fixtures if f["league"]["id"] in LEAGUE_IDS]
     has_any_live = len(fixtures) > 0
+    has_tracked_live = len(tracked) > 0
     eq = effective_quota()
     budget = get_budget_mode()
 
@@ -369,7 +374,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
 
     if budget == "STOP":
         log.warning("Quota exhausted.")
-        return False, has_any_live, 0
+        return False, has_any_live, has_tracked_live, 0
 
     if tracked:
         for m in tracked:
@@ -380,12 +385,14 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
     live_ids = {f["fixture"]["id"] for f in fixtures}
     cleanup_state(live_ids)
 
+    # --- STEP 2: Local pre-filter (free) ---
     candidates = find_candidates(fixtures)
     log.info(f"  -> {len(candidates)} team-candidate(s) ({MINUTE_MIN}-{MINUTE_MAX}')")
 
     if not candidates:
-        return False, has_any_live, 0
+        return False, has_any_live, has_tracked_live, 0
 
+    # --- STEP 3: Quota-aware selection ---
     max_cand = get_max_candidates()
 
     fixture_team_map: dict[int, list[tuple[int, int]]] = {}
@@ -402,6 +409,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
     log.info(f"  -> Checking {len(selected)} fixture(s) for stats")
     best_score = selected[0][1] if selected else 0
 
+    # --- STEP 4: Get statistics for selected fixtures ---
     for fid, _, team_entries in selected:
         if effective_quota() <= 3:
             log.warning("Quota nearly gone, stopping stats fetches.")
@@ -453,7 +461,6 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
                 total_shots = int(tstats.get("Total Shots", "0"))
                 corners = int(tstats.get("Corner Kicks", "0"))
                 possession = tstats.get("Ball Possession", "50%")
-                red_cards = int(tstats.get("Red Cards", "0"))
             except (ValueError, TypeError):
                 continue
 
@@ -464,29 +471,10 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
             prev_goals = state.get("last_goals", current_goals) if state else current_goals
             scored_since_last = current_goals > prev_goals
 
-            # --- RED CARD SIGNAL (independent of SOT) ---
-            prev_red = state.get("last_red", 0) if state else 0
-            if red_cards >= 1 and red_cards > prev_red:
-                league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
-                home = fixture["teams"]["home"]["name"]
-                away = fixture["teams"]["away"]["name"]
-                sh = fixture["goals"]["home"]
-                sa = fixture["goals"]["away"]
-                rc_msg = (
-                    f"\U0001f534 RED CARD\n\n"
-                    f"{home}  {sh} - {sa}  {away}\n"
-                    f"{league}  {minute}'\n\n"
-                    f"{tname} has {red_cards} red card(s)\n"
-                )
-                send_telegram(client, rc_msg)
-                log.info(f"RED CARD: {tname} ({red_cards}) in {home} vs {away} (fixture {fid})")
-
-            # ALWAYS update state
             team_state[(fid, tid)] = {
                 "last_sot": sot,
                 "last_minute": minute,
                 "last_goals": current_goals,
-                "last_red": red_cards,
             }
 
             if tier:
@@ -518,7 +506,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
                 if trend:
                     msg += f"  Trend: {trend}\n"
                 if scored_since_last:
-                    msg += f"  \u26bd Scored since last signal - pressure continues\n"
+                    msg += f"  \u26bd Scored since last signal — pressure continues\n"
 
                 if send_telegram(client, msg):
                     log.info(f"SIGNAL {tier}: {tname} ({ctx}) - "
@@ -532,42 +520,48 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
                     "trend": trend, "scored_since_last": scored_since_last,
                 })
 
-    return len(candidates) > 0, has_any_live, best_score
+    return len(candidates) > 0, has_any_live, has_tracked_live, best_score
 
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v7.1 — SOT is King + Red Cards")
+    log.info("Football Bot v7.1 — SOT is King (tracked-only polling)")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (quota from API headers)")
     log.info("")
     log.info("Architecture: unified cycle, always fresh data")
     log.info("  Every cycle: /fixtures?live=all (1 req) + selective stats")
-    log.info("  0 live: 30 min | No candidates: 5 min | Has candidates: 3 min")
+    log.info("  0 tracked live: 30 min | Tracked, no candidates: 5 min | Has candidates: 3 min")
     log.info("")
-    log.info("Signals:")
-    log.info("  GOAL PRESSURE: 3+ SOT, SOT increased since last check")
-    log.info("  RED CARD: any team with >= 1 red card (new)")
+    log.info("Signal logic:")
+    log.info("  Trigger: 3+ SOT AND SOT increased since last check")
     log.info("  No goal restriction. Score is context only.")
-    log.info("  Minute window: 15-80' (80-90' for already-tracked)")
+    log.info("  Post-goal: monitoring CONTINUES")
     log.info("")
     log.info("Tier = SOT count:")
     log.info("  3 SOT    = PRESSURE (yellow)")
     log.info("  4 SOT    = STRONG (orange)")
     log.info("  5+ SOT   = VERY STRONG (red)")
     log.info("  Rapid SOT growth (>= 0.3/min) bumps tier up by 1")
+    log.info("")
+    log.info("Context stats (in message, NOT tier drivers):")
+    log.info("  Possession, corners, total shots, opponent SOT, scoreline")
     log.info("=" * 60)
 
     with httpx.Client(timeout=30.0) as client:
         while True:
             try:
-                has_candidates, has_live, best_score = check_cycle(client)
+                has_candidates, has_live, has_tracked_live, best_score = check_cycle(client)
             except Exception as e:
                 log.error(f"Cycle error: {e}")
-                has_candidates, has_live, best_score = False, False, 0
+                has_candidates, has_live, has_tracked_live, best_score = False, False, False, 0
 
-            interval = get_cycle_interval(has_candidates, has_live)
+            interval = get_cycle_interval(has_candidates, has_live, has_tracked_live)
             log.info(f"Next in {interval}s ({interval // 60}m) | "
                      f"Quota: {total_quota()} | Reqs: {request_count} | "
                      f"Signals: {len(signals_sent)}")
