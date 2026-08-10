@@ -628,7 +628,7 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
 def do_discovery(client: httpx.Client) -> bool:
     """Run one discovery cycle. Updates global state.
     Returns True if discovery succeeded."""
-    global last_discovery_time, cached_fixtures
+    global last_discovery_time, cached_fixtures, fast_monitored
 
     data = api_get(client, "/fixtures", {"live": "all"})
     cached_fixtures = data.get("response", [])
