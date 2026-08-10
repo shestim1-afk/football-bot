@@ -47,7 +47,7 @@ LEAGUE_IDS = {
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
 
-MINUTE_MIN = 25
+MINUTE_MIN = 15
 MINUTE_MAX = 80
 MINUTE_LATE_MAX = 90  # only for already-tracked teams
 
@@ -55,6 +55,7 @@ MINUTE_LATE_MAX = 90  # only for already-tracked teams
 team_state: dict[tuple[int, int], dict] = {}
 request_count = 0
 signals_sent: list[dict] = []
+sent_red_cards: set[int] = set()  # fixture IDs that already triggered red card signal
 
 # --- Per-key quota tracking ---
 quota_by_key: dict[str, int | None] = {k: None for k in API_KEYS}
@@ -346,6 +347,10 @@ def cleanup_state(live_fixture_ids: set[int]):
         del team_state[k]
     if to_delete:
         log.info(f"  Cleaned up state for {len(to_delete)} ended fixture(s)")
+    # Also clean red card tracking for ended fixtures
+    expired_rc = fid for fid in sent_red_cards if fid not in live_fixture_ids
+    for fid in expired_rc:
+        sent_red_cards.discard(fid)
 
 
 # ============================================================
@@ -435,6 +440,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, bool, int]:
 
         minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
 
+        # Parse all team stats into a dict
         teams_data = {}
         for team_entry in stats:
             tname = team_entry["team"]["name"]
@@ -446,6 +452,47 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, bool, int]:
                 tmap[s["type"]] = str(val).strip()
             teams_data[tname] = tmap
 
+        # --- RED CARD CHECK (per fixture, once) ---
+        if fid not in sent_red_cards:
+            total_reds = 0
+            red_details = []
+            for tname, tstats in teams_data.items():
+                rc = 0
+                rc_raw = tstats.get("Red Cards", "0")
+                try:
+                    rc = int(rc_raw)
+                except (ValueError, TypeError):
+                    pass
+                if rc > 0:
+                    total_reds += rc
+                    red_details.append(f"{tname}: {rc}")
+
+            if total_reds >= 1:
+                sent_red_cards.add(fid)
+                league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
+                home = fixture["teams"]["home"]["name"]
+                away = fixture["teams"]["away"]["name"]
+                sh = fixture["goals"]["home"]
+                sa = fixture["goals"]["away"]
+
+                rc_msg = (
+                    f"\U0001f7e5 <b>RED CARD ALERT</b>\n\n"
+                    f"{home}  {sh} - {sa}  {away}\n"
+                    f"{league}  {minute}'\n\n"
+                    f"\U0001f7e5 Red Cards: {', '.join(red_details)}\n"
+                )
+                # Add SOT context if available
+                sot_parts = []
+                for tname, tstats in teams_data.items():
+                    sot_val = tstats.get("Shots on Goal", "?")
+                    sot_parts.append(f"{tname}: {sot_val} SOT")
+                if sot_parts:
+                    rc_msg += f"\U0001f3af {', '.join(sot_parts)}\n"
+
+                if send_telegram(client, rc_msg):
+                    log.info(f"RED CARD: {home} vs {away} - {', '.join(red_details)} (fixture {fid})")
+
+        # --- SOT SIGNAL CHECK (per team) ---
         for tid, _ in team_entries:
             tname = None
             if fixture["teams"]["home"]["id"] == tid:
@@ -529,7 +576,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, bool, int]:
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v7.1 — SOT is King (tracked-only polling)")
+    log.info("Football Bot v8 — SOT is King + Red Card Alerts")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (quota from API headers)")
@@ -539,16 +586,18 @@ def main():
     log.info("  0 tracked live: 30 min | Tracked, no candidates: 5 min | Has candidates: 3 min")
     log.info("")
     log.info("Signal logic:")
-    log.info("  Trigger: 3+ SOT AND SOT increased since last check")
+    log.info("  SOT Trigger: 3+ SOT AND SOT increased since last check")
+    log.info("  Red Card Trigger: >=1 red card in match (once per fixture)")
     log.info("  No goal restriction. Score is context only.")
     log.info("  Post-goal: monitoring CONTINUES")
     log.info("")
-    log.info("Tier = SOT count:")
+    log.info("SOT Tier = SOT count:")
     log.info("  3 SOT    = PRESSURE (yellow)")
     log.info("  4 SOT    = STRONG (orange)")
     log.info("  5+ SOT   = VERY STRONG (red)")
     log.info("  Rapid SOT growth (>= 0.3/min) bumps tier up by 1")
     log.info("")
+    log.info("Minute window: 15'-80' (15'-90' for already tracked teams)")
     log.info("Context stats (in message, NOT tier drivers):")
     log.info("  Possession, corners, total shots, opponent SOT, scoreline")
     log.info("=" * 60)
