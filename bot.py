@@ -453,6 +453,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
                 total_shots = int(tstats.get("Total Shots", "0"))
                 corners = int(tstats.get("Corner Kicks", "0"))
                 possession = tstats.get("Ball Possession", "50%")
+                red_cards = int(tstats.get("Red Cards", "0"))
             except (ValueError, TypeError):
                 continue
 
@@ -463,10 +464,29 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
             prev_goals = state.get("last_goals", current_goals) if state else current_goals
             scored_since_last = current_goals > prev_goals
 
+            # --- RED CARD SIGNAL (independent of SOT) ---
+            prev_red = state.get("last_red", 0) if state else 0
+            if red_cards >= 1 and red_cards > prev_red:
+                league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
+                home = fixture["teams"]["home"]["name"]
+                away = fixture["teams"]["away"]["name"]
+                sh = fixture["goals"]["home"]
+                sa = fixture["goals"]["away"]
+                rc_msg = (
+                    f"\U0001f534 RED CARD\n\n"
+                    f"{home}  {sh} - {sa}  {away}\n"
+                    f"{league}  {minute}'\n\n"
+                    f"{tname} has {red_cards} red card(s)\n"
+                )
+                send_telegram(client, rc_msg)
+                log.info(f"RED CARD: {tname} ({red_cards}) in {home} vs {away} (fixture {fid})")
+
+            # ALWAYS update state
             team_state[(fid, tid)] = {
                 "last_sot": sot,
                 "last_minute": minute,
                 "last_goals": current_goals,
+                "last_red": red_cards,
             }
 
             if tier:
@@ -498,7 +518,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
                 if trend:
                     msg += f"  Trend: {trend}\n"
                 if scored_since_last:
-                    msg += f"  \u26bd Scored since last signal — pressure continues\n"
+                    msg += f"  \u26bd Scored since last signal - pressure continues\n"
 
                 if send_telegram(client, msg):
                     log.info(f"SIGNAL {tier}: {tname} ({ctx}) - "
@@ -517,7 +537,7 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, int]:
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v7 — SOT is King")
+    log.info("Football Bot v7.1 — SOT is King + Red Cards")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (quota from API headers)")
@@ -526,19 +546,17 @@ def main():
     log.info("  Every cycle: /fixtures?live=all (1 req) + selective stats")
     log.info("  0 live: 30 min | No candidates: 5 min | Has candidates: 3 min")
     log.info("")
-    log.info("Signal logic:")
-    log.info("  Trigger: 3+ SOT AND SOT increased since last check")
+    log.info("Signals:")
+    log.info("  GOAL PRESSURE: 3+ SOT, SOT increased since last check")
+    log.info("  RED CARD: any team with >= 1 red card (new)")
     log.info("  No goal restriction. Score is context only.")
-    log.info("  Post-goal: monitoring CONTINUES")
+    log.info("  Minute window: 15-80' (80-90' for already-tracked)")
     log.info("")
     log.info("Tier = SOT count:")
     log.info("  3 SOT    = PRESSURE (yellow)")
     log.info("  4 SOT    = STRONG (orange)")
     log.info("  5+ SOT   = VERY STRONG (red)")
     log.info("  Rapid SOT growth (>= 0.3/min) bumps tier up by 1")
-    log.info("")
-    log.info("Context stats (in message, NOT tier drivers):")
-    log.info("  Possession, corners, total shots, opponent SOT, scoreline")
     log.info("=" * 60)
 
     with httpx.Client(timeout=30.0) as client:
