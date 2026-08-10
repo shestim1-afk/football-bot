@@ -48,13 +48,11 @@ LEAGUE_IDS = {
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
 
 # Minute windows
-# Normal monitoring: 25-80' (pressure builds over time, late pressure matters)
-# Extended monitoring: 80-90' — only for fixtures already being tracked (known candidates)
 MINUTE_MIN = 25
 MINUTE_MAX = 80
 MINUTE_LATE_MAX = 90  # only for fixtures already in team_state
 
-# --- Architecture v6 ---
+# --- Architecture v6.1 ---
 # TWO-LOOP DESIGN:
 #
 #   DISCOVERY LOOP (slow, cheap)
@@ -65,7 +63,8 @@ MINUTE_LATE_MAX = 90  # only for fixtures already in team_state
 #           |
 #           v
 #     Update active_fixtures + candidates list
-#     Sleep 5-10 min (quota-dependent)
+#     Sleep 5-30 min (quota + live-match dependent)
+#     If 0 live matches: sleep 30 min
 #
 #   MONITORING LOOP (fast, expensive)
 #     For each active candidate fixture:
@@ -79,40 +78,21 @@ MINUTE_LATE_MAX = 90  # only for fixtures already in team_state
 #           |
 #           v
 #       Telegram signal
-#     Sleep 2-5 min (based on strongest candidate)
-#
-# The key insight: monitoring cycles do NOT call /fixtures?live=all.
-# Discovery happens independently. Monitoring uses cached fixture data
-# and only requests statistics.
+#     Sleep 2-7 min (based on strongest candidate)
 
 # --- State ---
-# Key: (fixture_id, team_id) -> {
-#   last_sot, last_minute, last_shots, last_goals,
-#   fixture: <cached fixture dict for this team>
-# }
-# Tracks SOT history so we only signal on INCREASES.
-# NOT reset when a team scores. Goals tracked to detect inter-signal scoring.
 team_state: dict[tuple[int, int], dict] = {}
 request_count = 0
 signals_sent: list[dict] = []
 
-# Cached fixtures from last discovery (used by monitoring loop)
-# Key: fixture_id -> fixture dict
 cached_fixtures: dict[int, dict] = {}
-
-# Active candidates from last discovery
-# List of (fixture_id, team_id, rank_score)
 active_candidates: list[tuple[int, int, int]] = []
 
 # --- Per-key quota tracking ---
-# Initialize to None; set from first API response header.
-# Do NOT assume each key = 100 requests independently.
 quota_by_key: dict[str, int | None] = {k: None for k in API_KEYS}
 
 
 def pick_key() -> str:
-    """Pick the key with the most remaining quota.
-    Unknown keys get priority (to probe their actual quota)."""
     def sort_val(k):
         v = quota_by_key.get(k)
         return v if v is not None else 999
@@ -120,8 +100,6 @@ def pick_key() -> str:
 
 
 def total_quota() -> int:
-    """Sum of known remaining quotas. Unknown keys NOT counted
-    (they're available for probing but we don't assume a value)."""
     return sum(v for v in quota_by_key.values() if v is not None)
 
 
@@ -130,16 +108,12 @@ def unknown_key_count() -> int:
 
 
 def effective_quota() -> int:
-    """Quota for budget decisions. Includes unknown keys as a
-    conservative estimate (+10 each) so we don't under-utilize them.
-    Capped at a safety limit to prevent runaway spending."""
     known = total_quota()
     unknown_bonus = unknown_key_count() * 10
-    return min(known + unknown_bonus, 150)  # hard safety cap
+    return min(known + unknown_bonus, 150)
 
 
 def update_key_quota(resp: httpx.Response, key: str):
-    """Read actual quota from API response header."""
     try:
         val = resp.headers.get("x-ratelimit-requests-remaining", "")
         if val:
@@ -187,23 +161,17 @@ def send_telegram(client: httpx.Client, text: str) -> bool:
 
 
 # ============================================================
-# CANDIDATE RANKING (free data only — no API cost)
+# CANDIDATE RANKING (free data only)
 # ============================================================
 
 def is_interesting_scoreline(fixture: dict, team_id: int) -> bool:
-    """Check if the scoreline makes this team worth monitoring.
-    NOT a 0-goals filter. Only filters out blowouts."""
     is_home = fixture["teams"]["home"]["id"] == team_id
     tg = (fixture["goals"]["home"] if is_home else fixture["goals"]["away"]) or 0
     og = (fixture["goals"]["away"] if is_home else fixture["goals"]["home"]) or 0
-
-    # Up by 3+ = likely coasting, skip
     if tg - og >= 3:
         return False
-    # Down by 4+ = probably collapsed, skip
     if og - tg >= 4:
         return False
-
     return True
 
 
@@ -213,12 +181,9 @@ def get_team_goals(fixture: dict, team_id: int) -> int:
 
 
 def rank_candidate(fixture: dict, team_id: int) -> int:
-    """Score a candidate 0-10 using free data only.
-    Higher = more likely to be generating real attacking pressure."""
     score = 0
     minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
 
-    # Time pressure: later = more urgency
     if 65 <= minute <= MINUTE_MAX: score += 3
     elif 55 <= minute <= 64: score += 2
     elif MINUTE_MIN <= minute <= 54: score += 1
@@ -229,19 +194,17 @@ def rank_candidate(fixture: dict, team_id: int) -> int:
     is_home = fixture["teams"]["home"]["id"] == team_id
     og = og_away if is_home else og_home
 
-    # Scoreline context
     if og > tg:
-        if og - tg == 1: score += 4  # trailing by 1 = pushing hard
-        else: score += 3  # trailing by more = still urgent
+        if og - tg == 1: score += 4
+        else: score += 3
     elif tg == 0 and og == 0:
-        score += 2  # 0-0: both pushing for opener
+        score += 2
     elif tg > og:
-        if tg - og == 1: score += 2  # narrow lead, pressing for insurance
-        else: score += 1  # comfortable, less urgency
+        if tg - og == 1: score += 2
+        else: score += 1
     else:
-        score += 2  # drawing (1-1, 2-2)
+        score += 2
 
-    # Prior pressure: had SOT before = likely still generating
     fid = fixture["fixture"]["id"]
     prev = team_state.get((fid, team_id))
     if prev and prev.get("last_sot", 0) >= 2:
@@ -269,12 +232,12 @@ def get_score_emoji(fixture: dict, team_id: int) -> str:
     tg = (fixture["goals"]["home"] if is_home else fixture["goals"]["away"]) or 0
     og = (fixture["goals"]["away"] if is_home else fixture["goals"]["home"]) or 0
 
-    if og - tg == 1: return "🔥🔥"  # trailing by 1 = desperate urgency
-    if tg == og: return "🔥"       # open match
-    if tg - og == 1: return "🔥"   # pressing for insurance
-    if og - tg == 2: return "🔥"   # urgent comeback attempt
-    if tg - og >= 2: return "⚠️"   # comfortable, may coast
-    if og - tg >= 3: return "⚠️"   # probably overwhelmed
+    if og - tg == 1: return "🔥🔥"
+    if tg == og: return "🔥"
+    if tg - og == 1: return "🔥"
+    if og - tg == 2: return "🔥"
+    if tg - og >= 2: return "⚠️"
+    if og - tg >= 3: return "⚠️"
     return ""
 
 
@@ -285,7 +248,7 @@ def get_score_emoji(fixture: dict, team_id: int) -> str:
 def get_budget_mode() -> str:
     eq = effective_quota()
     if unknown_key_count() > 0 and total_quota() == 0:
-        return "PROBE"  # haven't probed any key yet
+        return "PROBE"
     if eq >= 70: return "NORMAL"
     elif eq >= 40: return "CAREFUL"
     elif eq >= 20: return "STRICT"
@@ -294,10 +257,9 @@ def get_budget_mode() -> str:
 
 
 def get_max_candidates() -> int:
-    """Max fixtures to request statistics for per monitoring cycle."""
     eq = effective_quota()
     if unknown_key_count() > 0 and total_quota() == 0:
-        return 2  # probing mode: conservative
+        return 2
     if eq >= 70: return 5
     elif eq >= 40: return 3
     elif eq >= 20: return 2
@@ -306,81 +268,54 @@ def get_max_candidates() -> int:
 
 
 def get_discovery_interval() -> int:
-    """Seconds between /fixtures?live=all discovery scans."""
     eq = effective_quota()
     if unknown_key_count() > 0 and total_quota() == 0:
-        return 300  # 5 min while probing
-    if eq >= 70: return 300   # 5 min
-    elif eq >= 40: return 600  # 10 min
-    elif eq >= 20: return 900  # 15 min
-    else: return 1800  # 30 min
+        return 300
+    if eq >= 70: return 300
+    elif eq >= 40: return 600
+    elif eq >= 20: return 900
+    else: return 1800
 
 
 def get_monitoring_interval(best_score: int) -> int:
-    """Seconds between monitoring cycles (stats-only, no discovery).
-    Only called when there ARE active candidates."""
-    if best_score >= 8: return 120  # 2 min
-    if best_score >= 6: return 180  # 3 min
-    if best_score >= 4: return 300  # 5 min
-    return 420  # 7 min
+    if best_score >= 8: return 120
+    if best_score >= 6: return 180
+    if best_score >= 4: return 300
+    return 420
 
 
 # ============================================================
-# SIGNAL CLASSIFICATION — Pressure Scoring System
-# ============================================================
-# Score-based, not rigid conditions. Each stat adds points.
-#
-#   +3   5+ SOT
-#   +2   4 SOT
-#   +2   10+ total shots
-#   +1   8+ total shots
-#   +2   SOT increased since last check
-#   +2   rapid SOT growth (>= 0.2 per minute)
-#   +1   55%+ possession
-#   +1   3+ corners
-#
-# Tiers:
-#   0-4   PRESSURE    (yellow)
-#   5-7   STRONG      (orange)
-#   8+    VERY STRONG (red)
+# SIGNAL CLASSIFICATION — Pressure Scoring
 # ============================================================
 
 def calc_pressure_score(sot: int, total_shots: int, corners: int,
                           possession_pct: float, state: dict | None,
                           current_minute: int) -> tuple[int, float, str]:
-    """Calculate pressure score and return (score, sot_rate, trend_string).
-    Does NOT check SOT >= 3 or SOT increase here — caller handles that."""
     score = 0
     sot_rate = 0.0
     trend = ""
 
-    # SOT volume
     if sot >= 5: score += 3
     elif sot >= 4: score += 2
 
-    # Total shots
     if total_shots >= 10: score += 2
     elif total_shots >= 8: score += 1
 
-    # SOT increase (already verified by caller, but add points for it)
     if state and state.get("last_sot", 0) > 0:
-        score += 2  # confirmed increase
+        score += 2
 
-    # SOT growth rate
     if state and state.get("last_minute", 0) > 0:
         prev_min = state["last_minute"]
         prev_sot = state["last_sot"]
         mins_passed = max(current_minute - prev_min, 1)
         sot_rate = (sot - prev_sot) / mins_passed
         if sot_rate >= 0.2:
-            score += 2  # rapid growth
+            score += 2
         trend = f"{prev_sot} -> {sot} SOT in {mins_passed}'"
 
-    # Possession
     if possession_pct >= 55:
         score += 1
 
-    # Corners
     if corners >= 3:
         score += 1
 
@@ -390,18 +325,13 @@ def calc_pressure_score(sot: int, total_shots: int, corners: int,
 def classify_signal(sot: int, total_shots: int, corners: int,
                      possession_raw: str, state: dict | None,
                      current_minute: int) -> tuple[str | None, str]:
-    """Return (tier, trend_string) or (None, "").
-    Requirements:
-      1. SOT >= 3 (hard floor)
-      2. SOT must have INCREASED since last check (dedup)"""
     if sot < 3:
         return None, ""
 
     last_sot = state["last_sot"] if state else 0
     if sot <= last_sot:
-        return None, ""  # no increase = no new signal
+        return None, ""
 
-    # Parse possession
     try:
         possession_pct = float(possession_raw.replace("%", ""))
     except (ValueError, TypeError):
@@ -436,8 +366,6 @@ def tier_label(tier: str) -> str:
 # ============================================================
 
 def find_candidates(fixtures: list[dict]) -> list[tuple[int, int, int]]:
-    """Return ranked list of (fixture_id, team_id, rank_score).
-    Scoreline is context, not a filter."""
     candidates = []
     for fixture in fixtures:
         lid = fixture["league"]["id"]
@@ -452,12 +380,10 @@ def find_candidates(fixtures: list[dict]) -> list[tuple[int, int, int]]:
         home_tid = fixture["teams"]["home"]["id"]
         away_tid = fixture["teams"]["away"]["id"]
 
-        # Minute window: 25-80 normally, 80-90 only if already tracked
         in_window = False
         if MINUTE_MIN <= minute <= MINUTE_MAX:
             in_window = True
         elif MINUTE_MAX < minute <= MINUTE_LATE_MAX:
-            # Late window: only if this team was already being monitored
             if (fid, home_tid) in team_state or (fid, away_tid) in team_state:
                 in_window = True
 
@@ -480,7 +406,6 @@ def cleanup_state(live_fixture_ids: set[int]):
     if to_delete:
         log.info(f"  Cleaned up state for {len(to_delete)} ended fixture(s)")
 
-    # Also clean cached fixtures
     for fid in list(cached_fixtures.keys()):
         if fid not in live_fixture_ids:
             del cached_fixtures[fid]
@@ -490,21 +415,20 @@ def cleanup_state(live_fixture_ids: set[int]):
 # DISCOVERY LOOP (slow, cheap — 1 request)
 # ============================================================
 
-def run_discovery(client: httpx.Client) -> bool:
+def run_discovery(client: httpx.Client) -> tuple[bool, int]:
     """Fetch all live fixtures, filter, rank, update active candidates.
-    Returns True if there are candidates to monitor."""
+    Returns (has_candidates, total_live_count)."""
     global active_candidates
 
     try:
         data = api_get(client, "/fixtures", {"live": "all"})
     except Exception as e:
         log.error(f"Discovery request failed: {e}")
-        return False
+        return False, 0
 
     fixtures = data.get("response", [])
     tracked = [f for f in fixtures if f["league"]["id"] in LEAGUE_IDS]
 
-    # Update cached fixtures
     cached_fixtures.clear()
     for f in fixtures:
         cached_fixtures[f["fixture"]["id"]] = f
@@ -521,7 +445,7 @@ def run_discovery(client: httpx.Client) -> bool:
     if budget == "STOP":
         log.warning("Quota exhausted.")
         active_candidates = []
-        return False
+        return False, len(fixtures)
 
     if tracked:
         for m in tracked:
@@ -529,37 +453,30 @@ def run_discovery(client: httpx.Client) -> bool:
             log.info(f"  -> {m['league']['name']}: {m['teams']['home']['name']} vs "
                      f"{m['teams']['away']['name']} ({m['fixture']['status']['short']} {minute}')")
 
-    # Cleanup state for ended fixtures
     live_ids = {f["fixture"]["id"] for f in fixtures}
     cleanup_state(live_ids)
 
-    # Find and rank candidates (local filter, zero API cost)
     active_candidates = find_candidates(fixtures)
     log.info(f"  -> {len(active_candidates)} team-candidate(s) ({MINUTE_MIN}-{MINUTE_MAX}')")
 
-    return len(active_candidates) > 0
+    return len(active_candidates) > 0, len(fixtures)
 
 
 # ============================================================
 # MONITORING LOOP (fast, expensive — 1 request per fixture)
-# Does NOT call /fixtures?live=all. Uses cached fixtures.
 # ============================================================
 
 def run_monitoring(client: httpx.Client) -> int:
-    """Check statistics for active candidates only.
-    Returns the best candidate rank score."""
     if not active_candidates:
         return 0
 
     max_cand = get_max_candidates()
     eq = effective_quota()
 
-    # Deduplicate by fixture
     fixture_team_map: dict[int, list[tuple[int, int]]] = {}
     for fid, tid, rank in active_candidates:
         fixture_team_map.setdefault(fid, []).append((tid, rank))
 
-    # Sort fixtures by best team rank
     fixture_ranks = []
     for fid, teams in fixture_team_map.items():
         best_rank = max(r for _, r in teams)
@@ -588,14 +505,12 @@ def run_monitoring(client: httpx.Client) -> int:
         if not stats:
             continue
 
-        # Get fixture from cache (no API call)
         fixture = cached_fixtures.get(fid)
         if not fixture:
             continue
 
         minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
 
-        # Parse team stats
         teams_data = {}
         for team_entry in stats:
             tname = team_entry["team"]["name"]
@@ -625,11 +540,9 @@ def run_monitoring(client: httpx.Client) -> int:
             except (ValueError, TypeError):
                 continue
 
-            # --- SIGNAL LOGIC ---
             state = team_state.get((fid, tid))
             tier, trend = classify_signal(sot, total_shots, corners, possession, state, minute)
 
-            # Detect if team scored since last signal
             current_goals = get_team_goals(fixture, tid)
             prev_goals = state.get("last_goals", current_goals) if state else current_goals
             scored_since_last = current_goals > prev_goals
@@ -669,7 +582,6 @@ def run_monitoring(client: httpx.Client) -> int:
                     log.info(f"SIGNAL {tier}: {tname} ({ctx}) - "
                              f"{sot} SOT, {total_shots} shots, {corners} corners (fixture {fid})")
 
-                # ALWAYS update state
                 team_state[(fid, tid)] = {
                     "last_sot": sot,
                     "last_minute": minute,
@@ -685,7 +597,6 @@ def run_monitoring(client: httpx.Client) -> int:
                     "trend": trend, "scored_since_last": scored_since_last,
                 })
             else:
-                # No signal, but update state for SOT tracking + goal tracking
                 team_state[(fid, tid)] = {
                     "last_sot": sot,
                     "last_minute": minute,
@@ -702,7 +613,7 @@ def run_monitoring(client: httpx.Client) -> int:
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v6 — Two-Loop Pressure Detection")
+    log.info("Football Bot v6.1 — Two-Loop Pressure Detection")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (quota from API headers, not assumed)")
@@ -711,6 +622,7 @@ def main():
     log.info("  DISCOVERY  /fixtures?live=all  -> every 5-30 min (1 req)")
     log.info("  MONITORING /fixtures/statistics -> 2-7 min (1 req per fixture)")
     log.info("  Key: monitoring does NOT re-fetch live fixtures")
+    log.info("  Idle (0 live): 30 min between checks")
     log.info("")
     log.info("Signal logic:")
     log.info("  Trigger: 3+ SOT (hard floor)")
@@ -737,7 +649,6 @@ def main():
                 active_candidates[0][2] if active_candidates else 0
             ) if has_candidates else 0
 
-            # --- Decide: discover or monitor? ---
             should_discover = (
                 (now - last_discovery) >= discovery_interval
                 or not has_candidates
@@ -745,22 +656,28 @@ def main():
 
             if should_discover:
                 try:
-                    has_candidates = run_discovery(client)
+                    has_candidates, live_count = run_discovery(client)
                 except Exception as e:
                     log.error(f"Discovery cycle error: {e}")
                     has_candidates = False
+                    live_count = 0
                 last_discovery = time.time()
-                sleep_time = monitoring_interval if has_candidates else discovery_interval
+                if has_candidates:
+                    sleep_time = monitoring_interval
+                elif live_count == 0:
+                    # No matches at all — back off hard
+                    sleep_time = 1800  # 30 min
+                else:
+                    # Matches exist but none tracked/in window
+                    sleep_time = discovery_interval
             else:
-                # --- Monitoring cycle (no discovery request) ---
                 try:
                     best_score = run_monitoring(client)
                     if best_score > 0:
                         sleep_time = get_monitoring_interval(best_score)
                     else:
-                        # Candidates went cold — force next cycle to rediscover
                         has_candidates = False
-                        sleep_time = 60  # quick re-discover
+                        sleep_time = 60
                 except Exception as e:
                     log.error(f"Monitoring cycle error: {e}")
                     sleep_time = discovery_interval
