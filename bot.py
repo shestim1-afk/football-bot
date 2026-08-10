@@ -52,7 +52,7 @@ LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
 DEAD_HOUR_START = 3   # 03:00 UTC
 DEAD_HOUR_END = 11     # 11:00 UTC
 
-MINUTE_MIN = 15
+MINUTE_MIN = 25
 MINUTE_MAX = 80
 MINUTE_LATE_MAX = 90  # only for already-tracked teams
 
@@ -61,9 +61,17 @@ team_state: dict[tuple[int, int], dict] = {}
 request_count = 0
 signals_sent: list[dict] = []
 sent_red_cards: set[int] = set()  # fixture IDs that already triggered red card signal
+rate_limited_until: float = 0.0  # timestamp — back off until this time
 
 # --- Per-key quota tracking ---
 quota_by_key: dict[str, int | None] = {k: None for k in API_KEYS}
+
+# --- Adaptive polling state ---
+last_discovery_time: float = 0.0
+last_stats_check: dict[int, float] = {}   # fixture_id -> timestamp of last stats fetch
+fast_monitored: set[int] = set()         # fixture IDs currently fast-polled
+fast_priority: dict[int, int] = {}       # fixture_id -> rank score (for ordering)
+cached_fixtures: list[dict] = []        # last discovery result (reused by stats checks)
 
 
 def pick_key() -> str:
@@ -116,8 +124,11 @@ def api_get(client: httpx.Client, endpoint: str, params: dict = None) -> dict:
         params=params,
         headers={"x-apisports-key": key},
     )
-    resp.raise_for_status()
     update_key_quota(resp, key)
+    if resp.status_code == 429:
+        rate_limited_until = time.time() + 300
+        raise Exception("Rate limited (429), backing off 5 min")
+    resp.raise_for_status()
     return resp.json()
 
 
@@ -221,39 +232,65 @@ def get_budget_mode() -> str:
     eq = effective_quota()
     if unknown_key_count() > 0 and total_quota() == 0:
         return "PROBE"
-    if eq >= 70: return "NORMAL"
-    elif eq >= 40: return "CAREFUL"
-    elif eq >= 20: return "STRICT"
-    elif eq >= 5: return "EMERGENCY"
+    if eq >= 60: return "NORMAL"
+    elif eq >= 30: return "CAREFUL"
+    elif eq >= 10: return "STRICT"
+    elif eq >= 1: return "EMERGENCY"
     else: return "STOP"
 
 
-def get_max_candidates() -> int:
+def get_max_fast_monitored() -> int:
+    """Max fixtures to fast-poll simultaneously."""
     eq = effective_quota()
     if unknown_key_count() > 0 and total_quota() == 0:
         return 2
-    if eq >= 70: return 5
-    elif eq >= 40: return 3
-    elif eq >= 20: return 2
-    elif eq >= 5: return 1
+    if eq >= 60: return 5
+    elif eq >= 30: return 3
+    elif eq >= 10: return 2
+    elif eq >= 1: return 1
     else: return 0
 
 
-def get_cycle_interval(has_candidates: bool, has_live: bool, has_tracked_live: bool) -> int:
-    """Only fast-poll when OUR tracked leagues have live matches."""
-    eq = effective_quota()
+def get_discovery_interval(budget_mode: str, has_tracked_live: bool, has_candidates: bool) -> int:
+    """Seconds between /fixtures?live=all calls."""
+    # No tracked leagues live at all — very slow
     if not has_tracked_live:
-        return 1800  # 30 min — no tracked matches live, global matches don't matter
+        return 1800  # 30 min
+
+    # Tracked live but no active candidates
     if not has_candidates:
-        if eq >= 40: return 300   # 5 min
-        else: return 600  # 10 min when quota is tight
-    if eq >= 40: return 180   # 3 min
-    elif eq >= 20: return 300  # 5 min
-    else: return 600  # 10 min
+        if budget_mode in ("NORMAL", "CAREFUL"):
+            return 300   # 5 min
+        elif budget_mode == "STRICT":
+            return 600   # 10 min
+        else:  # EMERGENCY
+            return 1200  # 20 min
+
+    # Fast-monitoring active — slower discovery to save budget for stats
+    if budget_mode == "NORMAL":
+        return 600   # 10 min
+    elif budget_mode == "CAREFUL":
+        return 600
+    elif budget_mode == "STRICT":
+        return 900   # 15 min
+    else:  # EMERGENCY
+        return 1200  # 20 min
+
+
+def get_stats_interval(budget_mode: str) -> int:
+    """Seconds between stats checks for a single fast-monitored fixture."""
+    if budget_mode == "NORMAL":
+        return 90    # 1.5 min — fast SOT detection
+    elif budget_mode == "CAREFUL":
+        return 150   # 2.5 min
+    elif budget_mode == "STRICT":
+        return 300   # 5 min
+    else:  # EMERGENCY
+        return 600   # 10 min
 
 
 # ============================================================
-# SIGNAL CLASSIFICATION — SOT is king
+# SIGNAL CLASSIFICATION — SOT is king (UNCHANGED)
 # ============================================================
 
 TIER_ORDER = ["PRESSURE", "STRONG", "VERY STRONG"]
@@ -309,7 +346,7 @@ def tier_label(tier: str) -> str:
 
 
 # ============================================================
-# LOCAL FILTERING (zero API cost)
+# LOCAL FILTERING (zero API cost — UNCHANGED)
 # ============================================================
 
 def find_candidates(fixtures: list[dict]) -> list[tuple[int, int, int]]:
@@ -359,32 +396,23 @@ def cleanup_state(live_fixture_ids: set[int]):
 
 
 # ============================================================
-# MAIN CYCLE — unified, always fresh data
+# DISCOVERY — fetch live fixtures, update candidates & fast_monitored
 # ============================================================
 
-def check_cycle(client: httpx.Client) -> tuple[bool, bool, bool, int]:
-    """Returns (has_candidates, has_any_live, has_tracked_live, best_rank_score)."""
+def do_discovery(client: httpx.Client) -> bool:
+    """Run one discovery cycle. Updates global state.
+    Returns True if discovery succeeded."""
+    global last_discovery_time, cached_fixtures
 
-    # --- STEP 1: Always-fresh discovery (1 request) ---
-    try:
-        data = api_get(client, "/fixtures", {"live": "all"})
-    except Exception as e:
-        log.error(f"Discovery request failed: {e}")
-        return False, False, False, 0
+    data = api_get(client, "/fixtures", {"live": "all"})
+    cached_fixtures = data.get("response", [])
+    last_discovery_time = time.time()
 
-    fixtures = data.get("response", [])
-    tracked = [f for f in fixtures if f["league"]["id"] in LEAGUE_IDS]
-    has_any_live = len(fixtures) > 0
-    has_tracked_live = len(tracked) > 0
-    eq = effective_quota()
+    tracked = [f for f in cached_fixtures if f["league"]["id"] in LEAGUE_IDS]
     budget = get_budget_mode()
 
-    log.info(f"Quota: {total_quota()} [{budget}] | "
-             f"Live: {len(fixtures)} | Tracked: {len(tracked)} | Requests: {request_count}")
-
-    if budget == "STOP":
-        log.warning("Quota exhausted.")
-        return False, has_any_live, has_tracked_live, 0
+    log.info(f"Discovery: Quota: {total_quota()} | Mode: {budget} | "
+             f"Live: {len(cached_fixtures)} | Tracked: {len(tracked)} | Requests: {request_count}")
 
     if tracked:
         for m in tracked:
@@ -392,241 +420,337 @@ def check_cycle(client: httpx.Client) -> tuple[bool, bool, bool, int]:
             log.info(f"  -> {m['league']['name']}: {m['teams']['home']['name']} vs "
                      f"{m['teams']['away']['name']} ({m['fixture']['status']['short']} {minute}')")
 
-    live_ids = {f["fixture"]["id"] for f in fixtures}
+    # Cleanup ended fixtures from all state
+    live_ids = {f["fixture"]["id"] for f in cached_fixtures}
     cleanup_state(live_ids)
+    fast_monitored &= live_ids
+    fast_priority = {fid: fast_priority[fid] for fid in fast_monitored if fid in live_ids}
+    for fid in list(last_stats_check):
+        if fid not in live_ids:
+            del last_stats_check[fid]
 
-    # --- STEP 2: Local pre-filter (free) ---
-    candidates = find_candidates(fixtures)
+    # Local pre-filter
+    candidates = find_candidates(cached_fixtures)
     log.info(f"  -> {len(candidates)} team-candidate(s) ({MINUTE_MIN}-{MINUTE_MAX}')")
 
-    if not candidates:
-        return False, has_any_live, has_tracked_live, 0
-
-    # --- STEP 3: Quota-aware selection ---
-    max_cand = get_max_candidates()
-
-    fixture_team_map: dict[int, list[tuple[int, int]]] = {}
+    # Update fast_monitored: rank fixtures, keep top N
+    max_fast = get_max_fast_monitored()
+    fixture_best_rank: dict[int, int] = {}
     for fid, tid, rank in candidates:
-        fixture_team_map.setdefault(fid, []).append((tid, rank))
+        if fid not in fixture_best_rank or rank > fixture_best_rank[fid]:
+            fixture_best_rank[fid] = rank
 
-    fixture_ranks = []
-    for fid, teams in fixture_team_map.items():
-        best_rank = max(r for _, r in teams)
-        fixture_ranks.append((fid, best_rank, teams))
-    fixture_ranks.sort(key=lambda x: x[1], reverse=True)
+    sorted_fids = sorted(fixture_best_rank.keys(),
+                         key=lambda f: fixture_best_rank[f], reverse=True)
 
-    selected = fixture_ranks[:max_cand]
-    log.info(f"  -> Checking {len(selected)} fixture(s) for stats")
-    best_score = selected[0][1] if selected else 0
+    fast_monitored.clear()
+    for fid in sorted_fids[:max_fast]:
+        fast_monitored.add(fid)
+        fast_priority[fid] = fixture_best_rank[fid]
 
-    # --- STEP 4: Get statistics for selected fixtures ---
-    for fid, _, team_entries in selected:
-        if effective_quota() <= 3:
-            log.warning("Quota nearly gone, stopping stats fetches.")
-            break
-
-        try:
-            stats_data = api_get(client, "/fixtures/statistics", {"fixture": fid})
-        except Exception as e:
-            log.warning(f"Stats failed for fixture {fid}: {e}")
-            continue
-
-        stats = stats_data.get("response", [])
-        if not stats:
-            continue
-
-        fixture = None
-        for f in fixtures:
-            if f["fixture"]["id"] == fid:
-                fixture = f
-                break
-        if not fixture:
-            continue
-
-        minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
-
-        # Parse all team stats into a dict
-        teams_data = {}
-        for team_entry in stats:
-            tname = team_entry["team"]["name"]
-            tmap = {}
-            for s in team_entry.get("statistics", []):
-                val = s.get("value", "0")
-                if val is None:
-                    val = "0"
-                tmap[s["type"]] = str(val).strip()
-            teams_data[tname] = tmap
-
-        # --- RED CARD CHECK (per fixture, once) ---
-        if fid not in sent_red_cards:
-            total_reds = 0
-            red_details = []
-            for tname, tstats in teams_data.items():
-                rc = 0
-                rc_raw = tstats.get("Red Cards", "0")
-                try:
-                    rc = int(rc_raw)
-                except (ValueError, TypeError):
-                    pass
-                if rc > 0:
-                    total_reds += rc
-                    red_details.append(f"{tname}: {rc}")
-
-            if total_reds >= 1:
-                sent_red_cards.add(fid)
-                league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
-                home = fixture["teams"]["home"]["name"]
-                away = fixture["teams"]["away"]["name"]
-                sh = fixture["goals"]["home"]
-                sa = fixture["goals"]["away"]
-
-                rc_msg = (
-                    f"\U0001f7e5 <b>RED CARD ALERT</b>\n\n"
-                    f"{home}  {sh} - {sa}  {away}\n"
-                    f"{league}  {minute}'\n\n"
-                    f"\U0001f7e5 Red Cards: {', '.join(red_details)}\n"
-                )
-                # Add SOT context if available
-                sot_parts = []
-                for tname, tstats in teams_data.items():
-                    sot_val = tstats.get("Shots on Goal", "?")
-                    sot_parts.append(f"{tname}: {sot_val} SOT")
-                if sot_parts:
-                    rc_msg += f"\U0001f3af {', '.join(sot_parts)}\n"
-
-                if send_telegram(client, rc_msg):
-                    log.info(f"RED CARD: {home} vs {away} - {', '.join(red_details)} (fixture {fid})")
-
-        # --- SOT SIGNAL CHECK (per team) ---
-        for tid, _ in team_entries:
-            tname = None
-            if fixture["teams"]["home"]["id"] == tid:
-                tname = fixture["teams"]["home"]["name"]
-            elif fixture["teams"]["away"]["id"] == tid:
-                tname = fixture["teams"]["away"]["name"]
-            if not tname or tname not in teams_data:
-                continue
-
-            tstats = teams_data[tname]
-            try:
-                sot = int(tstats.get("Shots on Goal", "0"))
-                total_shots = int(tstats.get("Total Shots", "0"))
-                corners = int(tstats.get("Corner Kicks", "0"))
-                possession = tstats.get("Ball Possession", "50%")
-            except (ValueError, TypeError):
-                continue
-
-            state = team_state.get((fid, tid))
-            tier, trend, sot_rate = classify_signal(sot, state, minute)
-
-            current_goals = get_team_goals(fixture, tid)
-            prev_goals = state.get("last_goals", current_goals) if state else current_goals
-            scored_since_last = current_goals > prev_goals
-
-            team_state[(fid, tid)] = {
-                "last_sot": sot,
-                "last_minute": minute,
-                "last_goals": current_goals,
-            }
-
-            if tier:
-                ctx = get_score_context(fixture, tid)
-                score_emoji = get_score_emoji(fixture, tid)
-                opp_sot = "?"
-                for oname, ostats in teams_data.items():
-                    if oname != tname:
-                        opp_sot = ostats.get("Shots on Goal", "?")
-                        break
-
-                league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
-                home = fixture["teams"]["home"]["name"]
-                away = fixture["teams"]["away"]["name"]
-                sh = fixture["goals"]["home"]
-                sa = fixture["goals"]["away"]
-
-                msg = (
-                    f"{tier_emoji(tier)} {tier_label(tier)} {tier} GOAL PRESSURE {score_emoji}\n\n"
-                    f"{home}  {sh} - {sa}  {away}\n"
-                    f"{league}  {minute}'\n\n"
-                    f"{tname} ({ctx})\n"
-                    f"  Shots on target: {sot}\n"
-                    f"  Total shots: {total_shots}\n"
-                    f"  Opponent SOT: {opp_sot}\n"
-                    f"  Possession: {possession}\n"
-                    f"  Corners: {corners}\n"
-                )
-                if trend:
-                    msg += f"  Trend: {trend}\n"
-                if scored_since_last:
-                    msg += f"  \u26bd Scored since last signal — pressure continues\n"
-
-                if send_telegram(client, msg):
-                    log.info(f"SIGNAL {tier}: {tname} ({ctx}) - "
-                             f"{sot} SOT, {total_shots} shots (fixture {fid})")
-
-                signals_sent.append({
-                    "time": time.strftime("%Y-%m-%d %H:%M"),
-                    "fixture": fid, "team": tname, "league": league,
-                    "minute": minute, "sot": sot, "total_shots": total_shots,
-                    "corners": corners, "context": ctx, "tier": tier,
-                    "trend": trend, "scored_since_last": scored_since_last,
-                })
-
-    return len(candidates) > 0, has_any_live, has_tracked_live, best_score
+    log.info(f"  -> Fast-monitored: {len(fast_monitored)} fixture(s)")
+    return True
 
 
 # ============================================================
-# MAIN LOOP
+# STATS CHECK — fetch + process stats for one fixture
+# ============================================================
+
+def check_fixture_stats(client: httpx.Client, fid: int) -> bool:
+    """Fetch stats for one fixture and process signals.
+    Returns True if the request was made (even if no signal)."""
+    # Find fixture in cache
+    fixture = None
+    for f in cached_fixtures:
+        if f["fixture"]["id"] == fid:
+            fixture = f
+            break
+    if not fixture:
+        fast_monitored.discard(fid)
+        return False
+
+    # Pre-check: still live and in window?
+    status = fixture["fixture"]["status"]["short"]
+    if status not in LIVE_STATUSES:
+        fast_monitored.discard(fid)
+        return False
+    minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
+    if minute > MINUTE_LATE_MAX:
+        fast_monitored.discard(fid)
+        log.info(f"  -> Fixture {fid} past {MINUTE_LATE_MAX}', removed from fast monitoring")
+        return False
+
+    # Fetch stats
+    try:
+        stats_data = api_get(client, "/fixtures/statistics", {"fixture": fid})
+    except Exception as e:
+        log.warning(f"  Stats failed for fixture {fid}: {e}")
+        return False
+
+    last_stats_check[fid] = time.time()
+
+    stats = stats_data.get("response", [])
+    if not stats:
+        return True
+
+    # Parse all team stats into a dict
+    teams_data = {}
+    for team_entry in stats:
+        tname = team_entry["team"]["name"]
+        tmap = {}
+        for s in team_entry.get("statistics", []):
+            val = s.get("value", "0")
+            if val is None:
+                val = "0"
+            tmap[s["type"]] = str(val).strip()
+        teams_data[tname] = tmap
+
+    # --- RED CARD CHECK (per fixture, once) ---
+    if fid not in sent_red_cards:
+        total_reds = 0
+        red_details = []
+        for tname, tstats in teams_data.items():
+            rc = 0
+            rc_raw = tstats.get("Red Cards", "0")
+            try:
+                rc = int(rc_raw)
+            except (ValueError, TypeError):
+                pass
+            if rc > 0:
+                total_reds += rc
+                red_details.append(f"{tname}: {rc}")
+
+        if total_reds >= 1:
+            sent_red_cards.add(fid)
+            league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
+            home = fixture["teams"]["home"]["name"]
+            away = fixture["teams"]["away"]["name"]
+            sh = fixture["goals"]["home"]
+            sa = fixture["goals"]["away"]
+
+            rc_msg = (
+                f"\U0001f7e5 <b>RED CARD ALERT</b>\n\n"
+                f"{home}  {sh} - {sa}  {away}\n"
+                f"{league}  {minute}'\n\n"
+                f"\U0001f7e5 Red Cards: {', '.join(red_details)}\n"
+            )
+            # Add SOT context if available
+            sot_parts = []
+            for tname, tstats in teams_data.items():
+                sot_val = tstats.get("Shots on Goal", "?")
+                sot_parts.append(f"{tname}: {sot_val} SOT")
+            if sot_parts:
+                rc_msg += f"\U0001f3af {', '.join(sot_parts)}\n"
+
+            if send_telegram(client, rc_msg):
+                log.info(f"  RED CARD: {home} vs {away} - {', '.join(red_details)} (fixture {fid})")
+
+    # --- SOT SIGNAL CHECK (per team in this fixture) ---
+    home_tid = fixture["teams"]["home"]["id"]
+    away_tid = fixture["teams"]["away"]["id"]
+    for tid in [home_tid, away_tid]:
+        tname = None
+        if fixture["teams"]["home"]["id"] == tid:
+            tname = fixture["teams"]["home"]["name"]
+        elif fixture["teams"]["away"]["id"] == tid:
+            tname = fixture["teams"]["away"]["name"]
+        if not tname or tname not in teams_data:
+            continue
+
+        tstats = teams_data[tname]
+        try:
+            sot = int(tstats.get("Shots on Goal", "0"))
+            total_shots = int(tstats.get("Total Shots", "0"))
+            corners = int(tstats.get("Corner Kicks", "0"))
+            possession = tstats.get("Ball Possession", "50%")
+        except (ValueError, TypeError):
+            continue
+
+        state = team_state.get((fid, tid))
+        tier, trend, sot_rate = classify_signal(sot, state, minute)
+
+        current_goals = get_team_goals(fixture, tid)
+        prev_goals = state.get("last_goals", current_goals) if state else current_goals
+        scored_since_last = current_goals > prev_goals
+
+        team_state[(fid, tid)] = {
+            "last_sot": sot,
+            "last_minute": minute,
+            "last_goals": current_goals,
+        }
+
+        if tier:
+            ctx = get_score_context(fixture, tid)
+            score_emoji = get_score_emoji(fixture, tid)
+            opp_sot = "?"
+            for oname, ostats in teams_data.items():
+                if oname != tname:
+                    opp_sot = ostats.get("Shots on Goal", "?")
+                    break
+
+            league = LEAGUE_IDS.get(fixture["league"]["id"], fixture["league"]["name"])
+            home = fixture["teams"]["home"]["name"]
+            away = fixture["teams"]["away"]["name"]
+            sh = fixture["goals"]["home"]
+            sa = fixture["goals"]["away"]
+
+            msg = (
+                f"{tier_emoji(tier)} {tier_label(tier)} {tier} GOAL PRESSURE {score_emoji}\n\n"
+                f"{home}  {sh} - {sa}  {away}\n"
+                f"{league}  {minute}'\n\n"
+                f"{tname} ({ctx})\n"
+                f"  Shots on target: {sot}\n"
+                f"  Total shots: {total_shots}\n"
+                f"  Opponent SOT: {opp_sot}\n"
+                f"  Possession: {possession}\n"
+                f"  Corners: {corners}\n"
+            )
+            if trend:
+                msg += f"  Trend: {trend}\n"
+            if scored_since_last:
+                msg += f"  \u26bd Scored since last signal — pressure continues\n"
+
+            if send_telegram(client, msg):
+                log.info(f"  SIGNAL {tier}: {tname} ({ctx}) - "
+                         f"{sot} SOT, {total_shots} shots (fixture {fid})")
+
+            signals_sent.append({
+                "time": time.strftime("%Y-%m-%d %H:%M"),
+                "fixture": fid, "team": tname, "league": league,
+                "minute": minute, "sot": sot, "total_shots": total_shots,
+                "corners": corners, "context": ctx, "tier": tier,
+                "trend": trend, "scored_since_last": scored_since_last,
+            })
+
+    return True
+
+
+# ============================================================
+# MAIN LOOP — adaptive polling with independent timers
 # ============================================================
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v8 — SOT is King + Red Card Alerts")
+    log.info("Football Bot v9 — Adaptive Polling")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (quota from API headers)")
     log.info("")
-    log.info("Architecture: unified cycle, always fresh data")
-    log.info("  Every cycle: /fixtures?live=all (1 req) + selective stats")
-    log.info("  0 tracked live: 30 min | Tracked, no candidates: 5 min | Has candidates: 3 min")
+    log.info("Architecture: independent discovery + stats timers")
+    log.info("  No tracked live:     discovery every 30 min")
+    log.info("  Tracked, no cand:    discovery every 5 min")
+    log.info("  Fast monitoring:     stats every 90s, discovery every 10 min")
+    log.info("  Dead hours:          03:00-11:00 UTC (0 requests)")
     log.info("")
-    log.info("Signal logic:")
+    log.info("Budget (treat ~90/100 as usable):")
+    log.info("  >=60: NORMAL   | 30-59: CAREFUL | 10-29: STRICT")
+    log.info("  1-9: EMERGENCY | 0: STOP")
+    log.info("")
+    log.info("Signal logic (UNCHANGED):")
     log.info("  SOT Trigger: 3+ SOT AND SOT increased since last check")
-    log.info("  Red Card Trigger: >=1 red card in match (once per fixture)")
-    log.info("  No goal restriction. Score is context only.")
-    log.info("  Post-goal: monitoring CONTINUES")
+    log.info("  Red Card Trigger: >=1 red card (once per fixture)")
+    log.info("  3 SOT=PRESSURE  4 SOT=STRONG  5+ SOT=VERY STRONG")
+    log.info("  Rapid SOT growth (>=0.3/min) bumps tier")
     log.info("")
-    log.info("SOT Tier = SOT count:")
-    log.info("  3 SOT    = PRESSURE (yellow)")
-    log.info("  4 SOT    = STRONG (orange)")
-    log.info("  5+ SOT   = VERY STRONG (red)")
-    log.info("  Rapid SOT growth (>= 0.3/min) bumps tier up by 1")
-    log.info("")
-    log.info("Minute window: 15'-80' (15'-90' for already tracked teams)")
-    log.info("Context stats (in message, NOT tier drivers):")
-    log.info("  Possession, corners, total shots, opponent SOT, scoreline")
+    log.info(f"Minute window: {MINUTE_MIN}'-{MINUTE_MAX}' ({MINUTE_MIN}'-{MINUTE_LATE_MAX}' tracked)")
     log.info("=" * 60)
 
     with httpx.Client(timeout=30.0) as client:
         while True:
-            # --- Dead hours check (no API cost) ---
+            now = time.time()
             utc_hour = datetime.now(timezone.utc).hour
+
+            # --- Dead hours (zero API cost) ---
             if DEAD_HOUR_START <= utc_hour < DEAD_HOUR_END:
                 log.info(f"Dead hours ({DEAD_HOUR_START}:00-{DEAD_HOUR_END}:00 UTC), sleeping 30 min...")
                 time.sleep(1800)
                 continue
 
-            try:
-                has_candidates, has_live, has_tracked_live, best_score = check_cycle(client)
-            except Exception as e:
-                log.error(f"Cycle error: {e}")
-                has_candidates, has_live, has_tracked_live, best_score = False, False, False, 0
+            # --- Rate limit backoff ---
+            if now < rate_limited_until:
+                sleep_remaining = int(rate_limited_until - now)
+                log.warning(f"Rate limited, backing off {sleep_remaining}s")
+                time.sleep(min(sleep_remaining, 60))
+                continue
 
-            interval = get_cycle_interval(has_candidates, has_live, has_tracked_live)
-            log.info(f"Next in {interval}s ({interval // 60}m) | "
-                     f"Quota: {total_quota()} | Reqs: {request_count} | "
-                     f"Signals: {len(signals_sent)}")
-            time.sleep(interval)
+            budget = get_budget_mode()
+
+            if budget == "STOP":
+                log.warning(f"Quota exhausted ({total_quota()}), sleeping 30 min...")
+                time.sleep(1800)
+                continue
+
+            # --- Determine current state from cached data ---
+            has_tracked_live = bool(
+                [f for f in cached_fixtures if f["league"]["id"] in LEAGUE_IDS]
+            ) if cached_fixtures else False
+            has_candidates = bool(fast_monitored)
+
+            # --- DISCOVERY (timed independently) ---
+            discovery_interval = get_discovery_interval(budget, has_tracked_live, has_candidates)
+            need_discovery = (now - last_discovery_time) >= discovery_interval
+
+            if need_discovery:
+                try:
+                    do_discovery(client)
+                    # Refresh state after discovery
+                    has_candidates = bool(fast_monitored)
+                    has_tracked_live = bool(
+                        [f for f in cached_fixtures if f["league"]["id"] in LEAGUE_IDS]
+                    )
+                    # Recalculate discovery interval with fresh state
+                    discovery_interval = get_discovery_interval(budget, has_tracked_live, has_candidates)
+                except Exception as e:
+                    log.error(f"Discovery failed: {e}")
+                    time.sleep(60)
+                    continue
+
+            # --- STATS CHECKS (one per loop iteration, highest priority first) ---
+            stats_interval = get_stats_interval(budget)
+            stats_checked = False
+
+            if fast_monitored and budget != "STOP":
+                # Sort by priority (highest first)
+                ordered = sorted(fast_monitored,
+                                key=lambda f: fast_priority.get(f, 0), reverse=True)
+                for fid in ordered:
+                    time_since_check = now - last_stats_check.get(fid, 0)
+                    if time_since_check < stats_interval:
+                        continue
+                    if effective_quota() <= 3:
+                        log.warning("  Quota nearly gone, skipping stats.")
+                        break
+
+                    check_fixture_stats(client, fid)
+                    stats_checked = True
+                    break  # One stats request per loop iteration
+
+            # --- CALCULATE SLEEP ---
+            now = time.time()
+            next_disc_in = max(0, discovery_interval - (now - last_discovery_time))
+
+            next_stats_in = 9999
+            if fast_monitored:
+                for fid in fast_monitored:
+                    fid_next = max(0, stats_interval - (now - last_stats_check.get(fid, 0)))
+                    next_stats_in = min(next_stats_in, fid_next)
+            if not fast_monitored:
+                next_stats_in = -1  # N/A
+
+            sleep_time = min(next_disc_in, next_stats_in) if next_stats_in >= 0 else next_disc_in
+            sleep_time = max(sleep_time, 10)   # min 10s
+            sleep_time = min(sleep_time, 60)   # max 60s — re-evaluate often
+
+            tracked_count = len([f for f in cached_fixtures if f["league"]["id"] in LEAGUE_IDS]) if cached_fixtures else 0
+            stats_str = f"{int(next_stats_in)}s" if next_stats_in >= 0 else "N/A"
+            log.info(
+                f"Quota: {total_quota()} | Mode: {budget} | "
+                f"Tracked: {tracked_count} | Fast: {len(fast_monitored)} | "
+                f"Next disc: {int(next_disc_in)}s | Next stats: {stats_str} | "
+                f"Sleep: {int(sleep_time)}s | Reqs: {request_count} | Signals: {len(signals_sent)}"
+            )
+
+            time.sleep(sleep_time)
 
 
 if __name__ == "__main__":
