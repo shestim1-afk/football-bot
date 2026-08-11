@@ -87,10 +87,12 @@ minute_limit: int | None = None
 key_health: list[dict] = []
 rr_index: int = 0  # round-robin counter
 
-# --- v9.5.3: Per-team diversification tracking ---
-# Tracks (fixture_id, team_id) tuples instead of just fixture IDs.
-# One team signaling no longer slows down monitoring the opponent.
-signaled_teams: set[tuple[int, int]] = set()
+# --- v9.5.4: Per-team signal limit tracking ---
+# Key: (fixture_id, team_id) -> {"count": N, "goals_at_last_signal": G}
+# 1st signal: always sent (SOT >= 3, the gold signal)
+# 2nd signal: sent if +1 SOT (guaranteed by classify_signal dedup)
+# 3rd+ signal: only if +2 SOT jump AND 0 goals scored since LAST signal
+signaled_teams: dict[tuple[int, int], dict] = {}
 # Keep fixture-level set for backward compat in logs/cleanup
 signaled_fixtures: set[int] = set()
 
@@ -570,10 +572,10 @@ def cleanup_state(live_fixture_ids: set[int]):
     for fid in list(signaled_fixtures):
         if fid not in live_fixture_ids:
             signaled_fixtures.discard(fid)
-    # v9.5.3: Clean per-team signaled set
+    # v9.5.4: Clean per-team signaled dict
     for key in list(signaled_teams):
         if key[0] not in live_fixture_ids:
-            signaled_teams.discard(key)
+            signaled_teams.pop(key, None)
     for fid in list(last_stats_check):
         if fid not in live_fixture_ids:
             del last_stats_check[fid]
@@ -646,7 +648,6 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
     best_sot = get_fixture_best_sot(fid)
     has_state = best_sot > 0 or any(f == fid for f, _ in team_state)
     # v9.5.3: Per-team signaled check
-    # Only apply 2x slowdown if THIS specific team has signaled
     team_signaled_count = sum(1 for (f, t) in signaled_teams if f == fid)
     both_teams_signaled = team_signaled_count >= 2
 
@@ -903,10 +904,56 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         if not tier:
             continue
 
-        # --- v9.5.3: Signal generated! ---
-        # Track per-team (not per-fixture) for diversification
-        is_new_team = (fid, tid) not in signaled_teams
-        signaled_teams.add((fid, tid))
+        # --- v9.5.4: Signal limit rules ---
+        # 1st signal: always send (the gold signal, SOT >= 3)
+        # 2nd signal: sent if +1 SOT (already guaranteed by classify_signal)
+        # 3rd+ signal: only if +2 SOT jump AND 0 goals since LAST signal
+        team_sig = signaled_teams.get((fid, tid))
+        sig_count = team_sig["count"] if team_sig else 0
+
+        if sig_count >= 2:
+            # 3rd+ signal: need +2 SOT jump
+            prev_sot = state["last_sot"] if state else 0
+            sot_jump = sot - prev_sot
+            if sot_jump < 2:
+                log.info(
+                    f"  BLOCKED {tier}: {tname} - "
+                    f"{sot} SOT (+{sot_jump} only, need +2) "
+                    f"(sig #{sig_count + 1}, fixture {fid})"
+                )
+                continue
+
+            # Check if team scored since LAST signal
+            is_home_check = (tid == home_tid)
+            current_goals = (
+                fixture["goals"]["home"] if is_home_check
+                else fixture["goals"]["away"]
+            ) or 0
+            goals_at_last = team_sig.get("goals_at_last_signal", current_goals)
+            if current_goals > goals_at_last:
+                log.info(
+                    f"  BLOCKED {tier}: {tname} - "
+                    f"{sot} SOT (+{sot_jump}) but scored "
+                    f"{current_goals - goals_at_last} goal(s) since last signal "
+                    f"(sig #{sig_count + 1}, fixture {fid})"
+                )
+                continue
+
+        # --- Signal passes all checks, send it ---
+        # Always update goals_at_last_signal to current goals
+        is_new_team = sig_count == 0
+        is_home_sg = (tid == home_tid)
+        goals_now = (
+            fixture["goals"]["home"] if is_home_sg
+            else fixture["goals"]["away"]
+        ) or 0
+        if is_new_team:
+            signaled_teams[(fid, tid)] = {
+                "count": 1, "goals_at_last_signal": goals_now
+            }
+        else:
+            signaled_teams[(fid, tid)]["count"] = sig_count + 1
+            signaled_teams[(fid, tid)]["goals_at_last_signal"] = goals_now
         signaled_fixtures.add(fid)
 
         league = LEAGUE_IDS.get(
@@ -915,9 +962,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         sh = fixture["goals"]["home"] or 0
         sa = fixture["goals"]["away"] or 0
 
-        # Build the new v9.5 Telegram message format
+        # Build the signal message
+        sig_num = sig_count + 1
+        sig_label = f"{sig_num}{'st' if sig_num == 1 else 'nd' if sig_num == 2 else 'rd' if sig_num == 3 else 'th'}"
         msg = (
-            f"{tier_emoji(tier)} {tier} GOAL PRESSURE\n\n"
+            f"{tier_emoji(tier)} {tier} GOAL PRESSURE ({sig_label})\n\n"
             f"{home['name']}  {sh} - {sa}  {away['name']}\n"
             f"{league} | {minute}'\n\n"
             f"{tname}\n"
@@ -935,7 +984,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             log.info(
                 f"  SIGNAL {tier}: {tname} - "
                 f"{sot} SOT, xG={xg_str} (fixture {fid}, "
-                f"{'NEW' if is_new_team else 'update'})"
+                f"{sig_label} signal)"
             )
 
         signals_sent.append({
@@ -943,7 +992,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "fixture": fid, "team": tname, "league": league,
             "minute": minute, "sot": sot, "xg": xg_str,
             "red_cards": red_card_str, "tier": tier,
-            "trend": trend, "is_new": True,
+            "trend": trend, "is_new": is_new_team,
         })
 
 
@@ -1061,7 +1110,7 @@ def check_monitored_stats(
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v9.5.3 — Per-Team Signaling + Live Score/Minute Fix")
+    log.info("Football Bot v9.5.4 — Signal Limits: 1st always, 2nd +1 SOT, 3rd+ +2 SOT & 0 goals")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin with health tracking)")
@@ -1095,7 +1144,7 @@ def main():
     log.info("  SOT==1:               1.2x base")
     log.info("  SOT==0:               1.5x base")
     log.info("  Signaled fixtures: 2x all intervals (both teams signaled)")
-    log.info("  v9.5.3: Per-team signaling + live score/minute refresh")
+    log.info("  v9.5.4: Signal limits — 1st always, 2nd +1 SOT, 3rd+ +2 SOT & 0 goals since last")
     log.info("=" * 60)
 
     with httpx.Client(timeout=30.0) as client:
@@ -1235,6 +1284,7 @@ def main():
                     parts.append(f"{fid}(SOT={sot},sig={sig_flag},{remaining}s)")
                 fast_window_info = f" | FastWin: {', '.join(parts)}"
 
+            total_signals = sum(v["count"] for v in signaled_teams.values())
             stats_str = (
                 f"{int(next_stats_in)}s" if next_stats_in >= 0 else "N/A"
             )
@@ -1242,7 +1292,7 @@ def main():
                 f"Quota: {quota_remaining}/{quota_limit} | "
                 f"Mode: {get_budget_mode()} | "
                 f"Tracked: {tracked_count} | Mon: {len(fast_monitored)} | "
-                f"Sig: {len(signaled_teams)}teams/{len(signaled_fixtures)}fix | "
+                f"Sig: {len(signaled_teams)}teams/{len(signaled_fixtures)}fix/{total_signals}sent | "
                 f"Keys: {healthy_key_count()}/{len(API_KEYS)} | "
                 f"Next disc: {int(next_disc_in)}s | Next stats: {stats_str} | "
                 f"Sleep: {int(sleep_time)}s | Reqs: {request_count} | "
