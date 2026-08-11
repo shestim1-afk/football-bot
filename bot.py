@@ -52,11 +52,11 @@ LEAGUE_IDS = {
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
 
-# Active monitoring window: 14:00-23:00 Bulgaria local time
-# Uses actual Sofia timezone (handles EET/EEST DST automatically)
+# Active monitoring window: dynamically computed from daily schedule
+# Falls back to 14:00-23:00 if schedule fetch fails
 BULGARIA_TZ = ZoneInfo("Europe/Sofia")
-ACTIVE_HOUR_START = 14  # 14:00 local
-ACTIVE_HOUR_END = 23    # 23:00 local
+ACTIVE_HOUR_START_FALLBACK = 14  # fallback
+ACTIVE_HOUR_END_FALLBACK = 23    # fallback
 
 # v9.5: 20'-80' window (strict — no late tracking beyond 80')
 MINUTE_MIN = 20
@@ -88,10 +88,10 @@ key_health: list[dict] = []
 rr_index: int = 0  # round-robin counter
 
 # --- v9.5.4: Per-team signal limit tracking ---
-# Key: (fixture_id, team_id) -> {"count": N, "goals_at_signal": G}
-# 1st signal: always sent
-# 2nd signal: only if +1 SOT (guaranteed by classify_signal)
-# 3rd+ signal: only if +2 SOT jump AND 0 goals scored since 1st signal
+# Key: (fixture_id, team_id) -> {"count": N, "goals_at_last_signal": G}
+# 1st signal: always sent (SOT >= 3, the gold signal)
+# 2nd signal: sent if +1 SOT (guaranteed by classify_signal dedup)
+# 3rd+ signal: only if +2 SOT jump AND 0 goals scored since LAST signal
 signaled_teams: dict[tuple[int, int], dict] = {}
 # Keep fixture-level set for backward compat in logs/cleanup
 signaled_fixtures: set[int] = set()
@@ -105,6 +105,13 @@ cached_fixtures: list[dict] = []        # last discovery result (reused for filt
 
 # --- Fast SOT window state ---
 fast_sot_until: dict[int, float] = {}
+
+# --- Dynamic active hours (v9.5.4) ---
+# Computed once per day from /fixtures?date=today (1 API call)
+dynamic_active_start: int = ACTIVE_HOUR_START_FALLBACK
+dynamic_active_end: int = ACTIVE_HOUR_END_FALLBACK
+schedule_date: str = ""  # YYYY-MM-DD of cached schedule
+schedule_no_matches: bool = False
 
 
 # ============================================================
@@ -237,10 +244,8 @@ def api_get(client: httpx.Client, endpoint: str, params: dict = None) -> dict:
         update_quota(resp)
 
         if resp.status_code == 429:
-            # Rate limit: mark this key and try another immediately
             mark_key_rate_limited(key, 120.0)
             attempts += 1
-            # If NO healthy keys remain, set global backoff
             if healthy_key_count() == 0:
                 rate_limited_until = time.time() + 120
                 raise Exception("Rate limited (429) on all keys, backing off 120s")
@@ -297,9 +302,6 @@ def rank_candidate(fixture: dict, team_id: int) -> int:
     prev = team_state.get((fid, team_id))
     prev_sot = prev.get("last_sot", 0) if prev else 0
 
-    # Scaled heavily so it always dominates other factors.
-    # SOT=0 unknown=10, SOT=1=100, SOT=2=300, SOT=3=600,
-    # SOT=4=900, SOT=5=1200, SOT=6+=1500
     if prev_sot >= 6:
         score += 1500
     elif prev_sot >= 5:
@@ -313,7 +315,7 @@ def rank_candidate(fixture: dict, team_id: int) -> int:
     elif prev_sot >= 1:
         score += 100
     else:
-        score += 10  # unknown — worth a first check
+        score += 10
 
     # --- 2. xG (important secondary — up to ~150 points) ---
     if prev and prev.get("last_xg"):
@@ -340,7 +342,6 @@ def rank_candidate(fixture: dict, team_id: int) -> int:
         score += 40
     elif abs(tg - og) <= 1:
         score += 20
-    # No penalty for any scoreline — all scorelines eligible
 
     # --- 5. Diversification (modest unsignaled bonus) ---
     if fid not in signaled_fixtures:
@@ -368,14 +369,6 @@ def get_budget_mode() -> str:
 
 
 def get_max_fast_monitored() -> int:
-    """v9.5: Dynamic max monitored fixtures.
-
-    With batched API requests (up to 20 fixtures per request),
-    monitoring more fixtures costs the same as monitoring few.
-    The real cost driver is polling frequency, not fixture count.
-
-    Reserve ~10 credits for discovery + safety.
-    """
     if quota_remaining is None:
         return 10
 
@@ -383,13 +376,9 @@ def get_max_fast_monitored() -> int:
     if available <= 0:
         return 0
 
-    # Conservative: ~5 batched requests per fixture lifecycle.
-    # With batching, this is very conservative since one request
-    # covers up to 20 fixtures simultaneously.
     estimated_per_fixture = 4
     max_by_quota = available // estimated_per_fixture
 
-    # Floor: at least 1 if we have any budget.  Cap: batch size limit.
     return min(BATCH_SIZE_LIMIT, max(1, max_by_quota))
 
 
@@ -398,8 +387,6 @@ def get_discovery_interval(
     has_tracked_live: bool,
     has_candidates: bool,
 ) -> int:
-    """Seconds between live-fixture discovery calls."""
-
     if not has_tracked_live:
         return 1800
 
@@ -422,12 +409,6 @@ def get_discovery_interval(
 
 
 def get_stats_interval(budget_mode: str) -> int:
-    """Base interval for statistics batched requests.
-
-    v9.5: With 10+ fixtures monitored, each batched request checks
-    multiple fixtures simultaneously. The base interval is the minimum
-    time between ANY stats request.
-    """
     if budget_mode == "NORMAL":
         return 240
     if budget_mode == "CAREFUL":
@@ -490,11 +471,9 @@ def bump_tier(tier: str) -> str:
 
 
 def classify_signal(sot: int, state: dict | None, current_minute: int) -> tuple[str | None, str, float]:
-    # SOT < 3: NO signal (mandatory criterion)
     if sot < 3:
         return None, "", 0.0
 
-    # Deduplication: only send when SOT increases
     last_sot = state["last_sot"] if state else 0
     if sot <= last_sot:
         return None, "", 0.0
@@ -532,11 +511,6 @@ def tier_emoji(tier: str) -> str:
 # ============================================================
 
 def find_candidates(fixtures: list[dict]) -> list[tuple[int, int, int]]:
-    """Find all candidate teams from live fixtures in tracked leagues.
-
-    v9.5: No scoreline filtering — all fixtures in the 20'-80' window
-    are candidates. Scoreline affects RANKING, not inclusion.
-    """
     candidates = []
     for fixture in fixtures:
         lid = fixture["league"]["id"]
@@ -547,7 +521,6 @@ def find_candidates(fixtures: list[dict]) -> list[tuple[int, int, int]]:
             continue
         minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
 
-        # v9.5: strict 20'-80' window, no late tracking
         if minute < MINUTE_MIN or minute > MINUTE_MAX:
             continue
 
@@ -555,7 +528,6 @@ def find_candidates(fixtures: list[dict]) -> list[tuple[int, int, int]]:
         home_tid = fixture["teams"]["home"]["id"]
         away_tid = fixture["teams"]["away"]["id"]
 
-        # Both teams are candidates — ranking decides priority
         candidates.append((fid, home_tid, rank_candidate(fixture, home_tid)))
         candidates.append((fid, away_tid, rank_candidate(fixture, away_tid)))
 
@@ -572,7 +544,6 @@ def cleanup_state(live_fixture_ids: set[int]):
     for fid in list(signaled_fixtures):
         if fid not in live_fixture_ids:
             signaled_fixtures.discard(fid)
-    # v9.5.4: Clean per-team signaled dict
     for key in list(signaled_teams):
         if key[0] not in live_fixture_ids:
             signaled_teams.pop(key, None)
@@ -595,7 +566,6 @@ def find_cached_fixture(fid: int):
 
 
 def is_fixture_monitorable(fixture: dict) -> bool:
-    """v9.5: strict 80' max — no late tracking beyond 80'."""
     status = fixture["fixture"]["status"]["short"]
     if status not in LIVE_STATUSES:
         return False
@@ -610,9 +580,6 @@ def is_fixture_monitorable(fixture: dict) -> bool:
 # ============================================================
 
 def get_fixture_sot_priority(fid: int) -> int:
-    """Dynamic priority for stats polling order.
-    Higher = more urgent.
-    """
     best_sot = get_fixture_best_sot(fid)
     has_state = best_sot > 0 or any(f == fid for f, _ in team_state)
     is_signaled = fid in signaled_fixtures
@@ -628,7 +595,6 @@ def get_fixture_sot_priority(fid: int) -> int:
     else:
         base = 10
 
-    # v9.5.3: Penalize only if BOTH teams have signaled
     both_signaled = all(
         (fid, tid) in signaled_teams
         for (f, tid) in team_state if f == fid
@@ -640,23 +606,14 @@ def get_fixture_sot_priority(fid: int) -> int:
 
 
 def get_sot_based_interval(fid: int, base_interval: int) -> int:
-    """v9.5: SOT-aware polling interval with diversification.
-
-    Already-signaled fixtures get 2x interval to prioritize new matches.
-    Fast window only activates for unsignaled fixtures.
-    """
     best_sot = get_fixture_best_sot(fid)
     has_state = best_sot > 0 or any(f == fid for f, _ in team_state)
-    # v9.5.3: Per-team signaled check
-    # Only apply 2x slowdown if THIS specific team has signaled
     team_signaled_count = sum(1 for (f, t) in signaled_teams if f == fid)
     both_teams_signaled = team_signaled_count >= 2
 
     if not has_state:
         interval = base_interval
     elif best_sot >= 2 and not both_teams_signaled and is_fast_sot_active(fid):
-        # Fast window: poll at shorter interval (but not 60s to save quota)
-        # v9.5.3: active as long as at least one team is unsignaled
         interval = 120
     elif best_sot >= 2:
         interval = 180
@@ -665,7 +622,6 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
     else:
         interval = int(base_interval * 1.5)
 
-    # v9.5.3: Only apply 2x if BOTH teams in this fixture have signaled
     if both_teams_signaled:
         interval = int(interval * 2.0)
 
@@ -677,9 +633,6 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
 # ============================================================
 
 def do_discovery(client: httpx.Client) -> bool:
-    """Run one discovery cycle. Updates global state.
-    Returns True if discovery succeeded.
-    """
     global last_discovery_time, cached_fixtures, fast_monitored
 
     data = api_get(client, "/fixtures", {"live": "all"})
@@ -703,32 +656,26 @@ def do_discovery(client: httpx.Client) -> bool:
                 f"({m['fixture']['status']['short']} {minute}')"
             )
 
-    # Cleanup ended fixtures from all state
     live_ids = {f["fixture"]["id"] for f in cached_fixtures}
     cleanup_state(live_ids)
 
-    # Local pre-filter
     candidates = find_candidates(cached_fixtures)
     log.info(f"  -> {len(candidates)} team-candidate(s) ({MINUTE_MIN}-{MINUTE_MAX}')")
 
-    # Build fixture -> best rank mapping
     max_fast = get_max_fast_monitored()
     fixture_best_rank: dict[int, int] = {}
     for fid, tid, rank in candidates:
         if fid not in fixture_best_rank or rank > fixture_best_rank[fid]:
             fixture_best_rank[fid] = rank
 
-    # --- Preserve existing monitored fixtures that are still valid ---
     retained = set()
     for fid in list(fast_monitored):
         fixture = find_cached_fixture(fid)
         if fixture and is_fixture_monitorable(fixture):
             retained.add(fid)
 
-    # Merge: keep existing + add new candidates
     merged = retained | set(fixture_best_rank.keys())
 
-    # If over limit, rank all and keep top N
     if len(merged) > max_fast:
         all_ranked = []
         for fid in merged:
@@ -740,7 +687,6 @@ def do_discovery(client: httpx.Client) -> bool:
         all_ranked.sort(key=lambda x: x[1], reverse=True)
         merged = set(fid for fid, _ in all_ranked[:max_fast])
 
-    # Update global state
     fast_monitored.clear()
     fast_monitored |= merged
     for fid in merged:
@@ -762,7 +708,6 @@ def do_discovery(client: httpx.Client) -> bool:
 # ============================================================
 
 def parse_xg(tstats: dict) -> str:
-    """Extract xG from team statistics. Returns string or 'N/A'."""
     for key in ("Expected Goals", "expectedGoals", "Expected goals"):
         val = tstats.get(key)
         if val is not None:
@@ -774,7 +719,6 @@ def parse_xg(tstats: dict) -> str:
 
 
 def get_red_card_string(teams_data: dict, home_name: str, away_name: str) -> str:
-    """Build red card string for the signal message."""
     parts = []
     for tname, tstats in teams_data.items():
         try:
@@ -790,11 +734,6 @@ def get_red_card_string(teams_data: dict, home_name: str, away_name: str) -> str
 
 
 def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
-    """Process one fixture from batched /fixtures?ids=... response.
-
-    v9.5: New signal format with xG, top SOT player, red cards.
-    Strict 80' cutoff. Tracks signaled fixtures for diversification.
-    """
     fid = fixture["fixture"]["id"]
 
     status = fixture["fixture"]["status"]["short"]
@@ -805,7 +744,6 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
 
     minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
 
-    # v9.5: strict 80' max — remove from monitoring immediately
     if minute > MINUTE_MAX:
         fast_monitored.discard(fid)
         expire_fast_sot(fid)
@@ -821,7 +759,6 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
     if not statistics:
         return
 
-    # Parse all team stats into a dict keyed by team name
     teams_data = {}
     for team_entry in statistics:
         team = team_entry.get("team", {})
@@ -839,9 +776,6 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
     if not teams_data:
         return
 
-    # --- Fast SOT window management (fixture-level) ---
-    # Check BOTH teams' SOT. Activate if either >= 2.
-    # v9.5: Only activate for unsignaled fixtures.
     best_current_sot = 0
     for tname, tstats in teams_data.items():
         try:
@@ -850,7 +784,6 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             current_sot = 0
         best_current_sot = max(best_current_sot, current_sot)
 
-    # v9.5.3: Activate fast window unless BOTH teams have signaled
     if best_current_sot >= 2:
         team_sig_count = sum(1 for (f, t) in signaled_teams if f == fid)
         if team_sig_count < 2 and not is_fast_sot_active(fid):
@@ -858,15 +791,12 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
     elif best_current_sot < 2:
         expire_fast_sot(fid)
 
-    # --- Pre-compute red cards and xG for both teams ---
     red_card_str = get_red_card_string(teams_data, home["name"], away["name"])
 
-    # Parse xG for both teams
     team_xg = {}
     for tname, tstats in teams_data.items():
         team_xg[tname] = parse_xg(tstats)
 
-    # --- SOT SIGNAL CHECK (per team) ---
     for tid, tname in ((home_tid, home["name"]), (away_tid, away["name"])):
         tstats = teams_data.get(tname)
         if not tstats:
@@ -877,10 +807,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         except (ValueError, TypeError):
             continue
 
-        # Get xG for this team
         xg_str = team_xg.get(tname, "N/A")
 
-        # Get opponent SOT and xG
         opponent_sot = "0"
         opponent_xg = "N/A"
         for oname, ostats in teams_data.items():
@@ -895,7 +823,6 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         state = team_state.get((fid, tid))
         tier, trend, sot_rate = classify_signal(sot, state, minute)
 
-        # Store state AFTER classification (for next comparison)
         team_state[(fid, tid)] = {
             "last_sot": sot,
             "last_minute": minute,
@@ -906,14 +833,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             continue
 
         # --- v9.5.4: Signal limit rules ---
-        # 1st signal: always send (the gold signal)
-        # 2nd signal: only if +1 SOT (already guaranteed by classify_signal)
-        # 3rd+ signal: only if +2 SOT jump AND 0 goals since 1st signal
+        # 1st signal: always send (the gold signal, SOT >= 3)
+        # 2nd signal: sent if +1 SOT (already guaranteed by classify_signal)
+        # 3rd+ signal: only if +2 SOT jump AND 0 goals since LAST signal
         team_sig = signaled_teams.get((fid, tid))
         sig_count = team_sig["count"] if team_sig else 0
 
         if sig_count >= 2:
-            # 3rd+ signal: need +2 SOT jump
             prev_sot = state["last_sot"] if state else 0
             sot_jump = sot - prev_sot
             if sot_jump < 2:
@@ -924,35 +850,36 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 )
                 continue
 
-            # Check if team scored since first signal
             is_home_check = (tid == home_tid)
             current_goals = (
                 fixture["goals"]["home"] if is_home_check
                 else fixture["goals"]["away"]
             ) or 0
-            goals_at_first = team_sig.get("goals_at_signal", current_goals)
-            if current_goals > goals_at_first:
+            goals_at_last = team_sig.get("goals_at_last_signal", current_goals)
+            if current_goals > goals_at_last:
                 log.info(
                     f"  BLOCKED {tier}: {tname} - "
                     f"{sot} SOT (+{sot_jump}) but scored "
-                    f"{current_goals - goals_at_first} goal(s) since 1st signal "
+                    f"{current_goals - goals_at_last} goal(s) since last signal "
                     f"(sig #{sig_count + 1}, fixture {fid})"
                 )
                 continue
 
         # --- Signal passes all checks, send it ---
+        # Always update goals_at_last_signal to current goals
         is_new_team = sig_count == 0
+        is_home_sg = (tid == home_tid)
+        goals_now = (
+            fixture["goals"]["home"] if is_home_sg
+            else fixture["goals"]["away"]
+        ) or 0
         if is_new_team:
-            is_home_sg = (tid == home_tid)
-            goals_at_signal = (
-                fixture["goals"]["home"] if is_home_sg
-                else fixture["goals"]["away"]
-            ) or 0
             signaled_teams[(fid, tid)] = {
-                "count": 1, "goals_at_signal": goals_at_signal
+                "count": 1, "goals_at_last_signal": goals_now
             }
         else:
             signaled_teams[(fid, tid)]["count"] = sig_count + 1
+            signaled_teams[(fid, tid)]["goals_at_last_signal"] = goals_now
         signaled_fixtures.add(fid)
 
         league = LEAGUE_IDS.get(
@@ -961,7 +888,6 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         sh = fixture["goals"]["home"] or 0
         sa = fixture["goals"]["away"] or 0
 
-        # Build the signal message
         sig_num = sig_count + 1
         sig_label = f"{sig_num}{'st' if sig_num == 1 else 'nd' if sig_num == 2 else 'rd' if sig_num == 3 else 'th'}"
         msg = (
@@ -999,15 +925,6 @@ def check_monitored_stats(
     client: httpx.Client,
     fixture_ids: list[int],
 ) -> bool:
-    """Fetch statistics for monitored fixtures.
-
-    v9.5.3:
-    1. First batch-refresh score/minute via /fixtures?ids=X-Y-Z (1 call)
-    2. Then fetch individual /fixtures/statistics?fixture=X for SOT data
-    This ensures signals show live scores and correct match minutes.
-
-    Also always updates last_stats_check to prevent infinite re-polling.
-    """
     global last_stats_check, cached_fixtures
 
     valid_ids = []
@@ -1026,9 +943,6 @@ def check_monitored_stats(
     if not valid_ids:
         return False
 
-    # --- v9.5.3: Refresh cached fixture data (score/minute) ---
-    # Use /fixtures?ids=X-Y-Z to get fresh scores and minutes.
-    # This endpoint returns fixture metadata but NOT statistics.
     if valid_ids:
         ids_str = "-".join(str(fid) for fid in valid_ids)
         try:
@@ -1037,11 +951,9 @@ def check_monitored_stats(
             )
             refresh_response = refresh_data.get("response", [])
             if refresh_response:
-                # Update cached fixtures with fresh data
                 refreshed_ids = set()
                 for rf in refresh_response:
                     rf_id = rf["fixture"]["id"]
-                    # Find and update the cached entry, or add new
                     for i, cf in enumerate(cached_fixtures):
                         if cf["fixture"]["id"] == rf_id:
                             cached_fixtures[i] = rf
@@ -1075,12 +987,10 @@ def check_monitored_stats(
 
             any_success = True
 
-            # Build a merged fixture dict from FRESH cached data + fresh stats
             cached = find_cached_fixture(fid)
             if not cached:
                 continue
 
-            # Create a copy with the statistics injected
             merged = {
                 "fixture": cached["fixture"],
                 "teams": cached["teams"],
@@ -1094,13 +1004,105 @@ def check_monitored_stats(
             log.warning(f"  Stats failed for fixture {fid}: {e}")
             checked_ids.append(fid)
 
-    # v9.5.2 FIX: ALWAYS update last_stats_check to prevent 10s loop.
-    # Even if the response was empty or failed, we still waited and tried.
     now = time.time()
     for fid in checked_ids:
         last_stats_check[fid] = now
 
     return any_success
+
+
+# ============================================================
+# DYNAMIC ACTIVE HOURS (v9.5.4)
+# ============================================================
+
+def fetch_daily_active_hours(client: httpx.Client) -> bool:
+    """Fetch today's fixtures and compute the active monitoring window.
+
+    Calls /fixtures?date=YYYY-MM-DD once per day (1 API call).
+    Sets dynamic_active_start/end based on actual kickoff times.
+    Returns True if schedule was fetched successfully.
+    """
+    global dynamic_active_start, dynamic_active_end
+    global schedule_date, schedule_no_matches
+
+    today_bulgaria = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+
+    # Already fetched today
+    if schedule_date == today_bulgaria:
+        return not schedule_no_matches
+
+    log.info(f"Fetching daily schedule for {today_bulgaria} (1 API call)...")
+
+    try:
+        data = api_get(client, "/fixtures", {"date": today_bulgaria})
+        all_fixtures = data.get("response", [])
+
+        # Filter by tracked leagues and extract kickoff hours (Bulgaria local)
+        kickoff_hours = []
+        for f in all_fixtures:
+            lid = f["league"]["id"]
+            if lid not in LEAGUE_IDS:
+                continue
+
+            date_str = f["fixture"]["date"]
+            try:
+                kickoff_utc = datetime.fromisoformat(
+                    date_str.replace("Z", "+00:00")
+                )
+                kickoff_local = kickoff_utc.astimezone(BULGARIA_TZ)
+                # Store as fractional hours (e.g., 18.5 = 18:30)
+                kickoff_hours.append(
+                    kickoff_local.hour + kickoff_local.minute / 60.0
+                )
+            except Exception:
+                continue
+
+        schedule_date = today_bulgaria
+
+        if not kickoff_hours:
+            schedule_no_matches = True
+            log.info(
+                f"  No tracked league matches today — "
+                f"bot will sleep all day (0 credits used)"
+            )
+            return False
+
+        schedule_no_matches = False
+        earliest = min(kickoff_hours)
+        latest = max(kickoff_hours)
+
+        # Buffer: 30 min before earliest kickoff (be ready at 20'),
+        # 100 min after latest kickoff (cover full 90' match + buffer)
+        window_start = earliest - (30 / 60)
+        window_end = latest + (100 / 60)
+
+        # Convert to integer hours, floor start / ceil end
+        dynamic_active_start = max(0, int(window_start))
+        dynamic_active_end = min(24, int(window_end) + (1 if window_end % 1 > 0 else 0))
+
+        match_count = len(kickoff_hours)
+        log.info(
+            f"  {match_count} matches: kickoffs "
+            f"{int(earliest):02d}:{int((earliest % 1) * 60):02d} - "
+            f"{int(latest):02d}:{int((latest % 1) * 60):02d} Bulgaria"
+        )
+        log.info(
+            f"  Active window: "
+            f"{dynamic_active_start:02d}:00 - {dynamic_active_end:02d}:00 Bulgaria "
+            f"(saves {max(0, dynamic_active_start - ACTIVE_HOUR_START_FALLBACK) + max(0, ACTIVE_HOUR_END_FALLBACK - dynamic_active_end)}h of idle polling)"
+        )
+        return True
+
+    except Exception as e:
+        log.warning(
+            f"Schedule fetch failed: {e}, "
+            f"using fallback {ACTIVE_HOUR_START_FALLBACK}:00-{ACTIVE_HOUR_END_FALLBACK}:00"
+        )
+        dynamic_active_start = ACTIVE_HOUR_START_FALLBACK
+        dynamic_active_end = ACTIVE_HOUR_END_FALLBACK
+        schedule_date = today_bulgaria
+        schedule_no_matches = False
+        return True
 
 
 # ============================================================
@@ -1127,7 +1129,7 @@ def main():
     log.info("  Format: SOT, xG, opponent SOT/xG, red cards, trend")
     log.info("")
     log.info("Architecture: discovery + batched SOT-smart stats")
-    log.info(f"  Active: {ACTIVE_HOUR_START}:00-{ACTIVE_HOUR_END}:00 Bulgaria local (Sofia TZ, DST-auto)")
+    log.info(f"  Active: DYNAMIC from daily schedule (fallback {ACTIVE_HOUR_START_FALLBACK}:00-{ACTIVE_HOUR_END_FALLBACK}:00)")
     log.info(f"  Fast SOT window: {FAST_SOT_WINDOW}s (unsignaled only)")
     log.info("")
     log.info("Quota: subscription-level from API headers (not additive)")
@@ -1143,21 +1145,30 @@ def main():
     log.info("  SOT==1:               1.2x base")
     log.info("  SOT==0:               1.5x base")
     log.info("  Signaled fixtures: 2x all intervals (both teams signaled)")
-    log.info("  v9.5.4: Signal limits — 1st always, 2nd +1 SOT, 3rd+ +2 SOT & no goals")
+    log.info("  v9.5.4: Signal limits — 1st always, 2nd +1 SOT, 3rd+ +2 SOT & 0 goals since last")
     log.info("=" * 60)
 
     with httpx.Client(timeout=30.0) as client:
         while True:
             now = time.time()
-            utc_hour = datetime.now(timezone.utc).hour
+
+            # --- Fetch daily schedule (1 call/day, re-fetches on date change) ---
+            has_matches = fetch_daily_active_hours(client)
+
+            if not has_matches:
+                log.info(
+                    "No tracked matches today, sleeping 30 min..."
+                )
+                time.sleep(1800)
+                continue
 
             # --- Dead hours (zero API cost) ---
-            # Check using actual Bulgaria local hour (handles DST)
+            # Uses dynamic window from today's schedule
             local_hour = datetime.now(BULGARIA_TZ).hour
-            if not (ACTIVE_HOUR_START <= local_hour < ACTIVE_HOUR_END):
+            if not (dynamic_active_start <= local_hour < dynamic_active_end):
                 log.info(
                     f"Dead hours (local {local_hour}:00, "
-                    f"active {ACTIVE_HOUR_START}:00-{ACTIVE_HOUR_END}:00 Bulgaria), "
+                    f"active {dynamic_active_start:02d}:00-{dynamic_active_end:02d}:00 Bulgaria), "
                     f"sleeping 30 min..."
                 )
                 time.sleep(1800)
