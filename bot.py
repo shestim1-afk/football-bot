@@ -51,11 +51,11 @@ LEAGUE_IDS = {
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
 
-# Dead hours UTC — no European league action worth polling
-# 21:00 UTC = 23:00 EET (Bulgaria) — no evening matches worth tracking
-# 08:00 UTC = 10:00 EET (Bulgaria) — earliest kickoffs ~18:00 local
+# Dead hours UTC — bot sleeps outside active monitoring window
+# Active: 14:00-23:00 EET (Bulgaria) = 12:00-21:00 UTC
+# Dead:   21:00-12:00 UTC (wraps around midnight)
 DEAD_HOUR_START = 21  # 21:00 UTC (23:00 Bulgaria)
-DEAD_HOUR_END = 8     # 08:00 UTC (10:00 Bulgaria)
+DEAD_HOUR_END = 12    # 12:00 UTC (14:00 Bulgaria)
 
 MINUTE_MIN = 25
 MINUTE_MAX = 80
@@ -1007,7 +1007,8 @@ def main():
             utc_hour = datetime.now(timezone.utc).hour
 
             # --- Dead hours (zero API cost) ---
-            if DEAD_HOUR_START <= utc_hour < DEAD_HOUR_END:
+            # Handles wrap-around: 21:00 UTC to 12:00 UTC next day
+            if DEAD_HOUR_START <= utc_hour or utc_hour < DEAD_HOUR_END:
                 log.info(
                     f"Dead hours ({DEAD_HOUR_START}:00-{DEAD_HOUR_END}:00 UTC), "
                     f"sleeping 30 min..."
