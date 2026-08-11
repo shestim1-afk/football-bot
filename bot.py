@@ -3,7 +3,7 @@ import sys
 import time
 import logging
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -1126,17 +1126,27 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
     global dynamic_active_start, dynamic_active_end
     global schedule_date, schedule_no_matches
     
-    today_bulgaria = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+    today_bulgaria = datetime.now(BULGARIA_TZ)
+    today_str = today_bulgaria.strftime("%Y-%m-%d")
+    tomorrow_str = (today_bulgaria + timedelta(days=1)).strftime("%Y-%m-%d")
     
     # Already fetched today
-    if schedule_date == today_bulgaria:
+    if schedule_date == today_str:
         return not schedule_no_matches
     
-    log.info(f"Fetching daily schedule for {today_bulgaria} (1 API call)...")
+    log.info(f"Fetching daily schedule for {today_str} + {tomorrow_str} (2 API calls)...")
     
     try:
-        data = api_get(client, "/fixtures", {"date": today_bulgaria})
-        all_fixtures = data.get("response", [])
+        # Query BOTH today and tomorrow (Bulgaria time) to handle timezone edge cases.
+        # A match at 22:00 UTC on Aug 11 is 01:00 Aug 12 Bulgaria — API has it
+        # under Aug 11, so querying only Aug 12 would miss it.
+        all_fixtures = []
+        for query_date in [today_str, tomorrow_str]:
+            try:
+                data = api_get(client, "/fixtures", {"date": query_date})
+                all_fixtures.extend(data.get("response", []))
+            except Exception as e:
+                log.warning(f"  Schedule fetch for {query_date} failed: {e}")
         
         # Filter by tracked leagues and extract kickoff hours (Bulgaria local)
         kickoff_hours = []
@@ -1151,6 +1161,9 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
                     date_str.replace("Z", "+00:00")
                 )
                 kickoff_local = kickoff_utc.astimezone(BULGARIA_TZ)
+                # Only include matches that fall within today's Bulgaria date
+                if kickoff_local.strftime("%Y-%m-%d") != today_str:
+                    continue
                 # Store as fractional hours (e.g., 18.5 = 18:30)
                 kickoff_hours.append(
                     kickoff_local.hour + kickoff_local.minute / 60.0
@@ -1158,13 +1171,13 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
             except Exception:
                 continue
         
-        schedule_date = today_bulgaria
+        schedule_date = today_str
         
         if not kickoff_hours:
             schedule_no_matches = True
             log.info(
-                f"  No tracked league matches today — "
-                f"bot will sleep all day (0 credits used)"
+                f"  No tracked league matches today ({today_str}) — "
+                f"bot will sleep all day (2 credits used)"
             )
             return False
         
@@ -1201,7 +1214,7 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
         )
         dynamic_active_start = ACTIVE_HOUR_START_FALLBACK
         dynamic_active_end = ACTIVE_HOUR_END_FALLBACK
-        schedule_date = today_bulgaria
+        schedule_date = today_str
         schedule_no_matches = False
         return True
 
