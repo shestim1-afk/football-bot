@@ -88,10 +88,10 @@ key_health: list[dict] = []
 rr_index: int = 0  # round-robin counter
 
 # --- v9.5.4: Per-team signal limit tracking ---
-# Key: (fixture_id, team_id) -> {"count": N, "goals_at_last_signal": G}
-# 1st signal: always sent (SOT >= 3, the gold signal)
-# 2nd signal: sent if +1 SOT (guaranteed by classify_signal dedup)
-# 3rd+ signal: only if +2 SOT jump AND 0 goals scored since LAST signal
+# Key: (fixture_id, team_id) -> {"count": N, "goals_at_signal": G}
+# 1st signal: always sent
+# 2nd signal: only if +1 SOT (guaranteed by classify_signal)
+# 3rd+ signal: only if +2 SOT jump AND 0 goals scored since 1st signal
 signaled_teams: dict[tuple[int, int], dict] = {}
 # Keep fixture-level set for backward compat in logs/cleanup
 signaled_fixtures: set[int] = set()
@@ -648,6 +648,7 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
     best_sot = get_fixture_best_sot(fid)
     has_state = best_sot > 0 or any(f == fid for f, _ in team_state)
     # v9.5.3: Per-team signaled check
+    # Only apply 2x slowdown if THIS specific team has signaled
     team_signaled_count = sum(1 for (f, t) in signaled_teams if f == fid)
     both_teams_signaled = team_signaled_count >= 2
 
@@ -905,9 +906,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             continue
 
         # --- v9.5.4: Signal limit rules ---
-        # 1st signal: always send (the gold signal, SOT >= 3)
-        # 2nd signal: sent if +1 SOT (already guaranteed by classify_signal)
-        # 3rd+ signal: only if +2 SOT jump AND 0 goals since LAST signal
+        # 1st signal: always send (the gold signal)
+        # 2nd signal: only if +1 SOT (already guaranteed by classify_signal)
+        # 3rd+ signal: only if +2 SOT jump AND 0 goals since 1st signal
         team_sig = signaled_teams.get((fid, tid))
         sig_count = team_sig["count"] if team_sig else 0
 
@@ -923,37 +924,35 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 )
                 continue
 
-            # Check if team scored since LAST signal
+            # Check if team scored since first signal
             is_home_check = (tid == home_tid)
             current_goals = (
                 fixture["goals"]["home"] if is_home_check
                 else fixture["goals"]["away"]
             ) or 0
-            goals_at_last = team_sig.get("goals_at_last_signal", current_goals)
-            if current_goals > goals_at_last:
+            goals_at_first = team_sig.get("goals_at_signal", current_goals)
+            if current_goals > goals_at_first:
                 log.info(
                     f"  BLOCKED {tier}: {tname} - "
                     f"{sot} SOT (+{sot_jump}) but scored "
-                    f"{current_goals - goals_at_last} goal(s) since last signal "
+                    f"{current_goals - goals_at_first} goal(s) since 1st signal "
                     f"(sig #{sig_count + 1}, fixture {fid})"
                 )
                 continue
 
         # --- Signal passes all checks, send it ---
-        # Always update goals_at_last_signal to current goals
         is_new_team = sig_count == 0
-        is_home_sg = (tid == home_tid)
-        goals_now = (
-            fixture["goals"]["home"] if is_home_sg
-            else fixture["goals"]["away"]
-        ) or 0
         if is_new_team:
+            is_home_sg = (tid == home_tid)
+            goals_at_signal = (
+                fixture["goals"]["home"] if is_home_sg
+                else fixture["goals"]["away"]
+            ) or 0
             signaled_teams[(fid, tid)] = {
-                "count": 1, "goals_at_last_signal": goals_now
+                "count": 1, "goals_at_signal": goals_at_signal
             }
         else:
             signaled_teams[(fid, tid)]["count"] = sig_count + 1
-            signaled_teams[(fid, tid)]["goals_at_last_signal"] = goals_now
         signaled_fixtures.add(fid)
 
         league = LEAGUE_IDS.get(
@@ -1144,7 +1143,7 @@ def main():
     log.info("  SOT==1:               1.2x base")
     log.info("  SOT==0:               1.5x base")
     log.info("  Signaled fixtures: 2x all intervals (both teams signaled)")
-    log.info("  v9.5.4: Signal limits — 1st always, 2nd +1 SOT, 3rd+ +2 SOT & 0 goals since last")
+    log.info("  v9.5.4: Signal limits — 1st always, 2nd +1 SOT, 3rd+ +2 SOT & no goals")
     log.info("=" * 60)
 
     with httpx.Client(timeout=30.0) as client:
