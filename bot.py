@@ -52,8 +52,10 @@ LEAGUE_IDS = {
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
 
 # Dead hours UTC — no European league action worth polling
-DEAD_HOUR_START = 3   # 03:00 UTC
-DEAD_HOUR_END = 11     # 11:00 UTC
+# 21:00 UTC = 23:00 EET (Bulgaria) — no evening matches worth tracking
+# 08:00 UTC = 10:00 EET (Bulgaria) — earliest kickoffs ~18:00 local
+DEAD_HOUR_START = 21  # 21:00 UTC (23:00 Bulgaria)
+DEAD_HOUR_END = 8     # 08:00 UTC (10:00 Bulgaria)
 
 MINUTE_MIN = 25
 MINUTE_MAX = 80
@@ -970,7 +972,7 @@ def main():
     log.info("  No tracked live:       discovery 30 min")
     log.info("  Tracked, no cand:      discovery 15-40 min (by budget)")
     log.info("  Active monitoring:     discovery 30-60 min, stats batched")
-    log.info("  Dead hours:            03:00-11:00 UTC (0 requests)")
+    log.info(f"  Dead hours:            {DEAD_HOUR_START}:00-{DEAD_HOUR_END}:00 UTC ({DEAD_HOUR_START+2}:00-{DEAD_HOUR_END+2}:00 Bulgaria)")
     log.info("")
     log.info("Quota: REAL subscription-level from API headers (not additive)")
     log.info("  >=51: NORMAL  (240s base stats)")
