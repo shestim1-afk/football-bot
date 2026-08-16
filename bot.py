@@ -110,7 +110,9 @@ signaled_fixtures: set[int] = set()
 # Persisted to JSONL file so data survives restarts.
 signal_outcomes: list[dict] = []
 OUTCOME_WINDOW_MINUTES = 15  # game minutes for "imminent" window
-OUTCOMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signal_outcomes.jsonl")
+_VOLUME_DIR = os.environ.get("VOLUME_DIR", "/data")
+os.makedirs(_VOLUME_DIR, exist_ok=True)
+OUTCOMES_FILE = os.path.join(_VOLUME_DIR, "signal_outcomes.jsonl")
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
