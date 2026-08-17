@@ -2806,7 +2806,7 @@ def main():
                 if NIGHT_HOUR_START <= h < NIGHT_HOUR_END:
                     wake_at = now_bg.replace(hour=NIGHT_HOUR_END, minute=0, second=0, microsecond=0)
                     sleep_s = int((wake_at - now_bg).total_seconds())
-                     sleep_s = max(sleep_s, 60)  # min 60s to avoid infinite loop
+                    sleep_s = max(sleep_s, 60)  # min 60s to avoid infinite loop
                 else:
                     sleep_s = 1800  # 30 min during daytime no-matches
                 log.info(
