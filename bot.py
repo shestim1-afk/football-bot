@@ -4376,6 +4376,7 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
 # ============================================================
 
 def main():
+    global signal_outcomes, eod_report_sent_date
     log.info("=" * 60)
     log.info("Football Bot v10.32 — Auto EOD report (subprocess, zero API cost)")
     log.info("=" * 60)
