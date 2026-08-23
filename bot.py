@@ -131,10 +131,12 @@ signaled_teams: dict[tuple[int, int], dict] = {}
 # Keep fixture-level set for backward compat in logs/cleanup
 signaled_fixtures: set[int] = set()
 
-# --- v9.8: Signal outcome tracking (backtesting) ---
-# Records every signal sent, tracks TWO outcomes:
-#   outcome_15min: HIT if team scored within 15 game minutes ("imminent goal")
-#   outcome_full:  HIT if team scored at all before match ended ("eventual goal")
+# --- v10.28: Signal outcome tracking (backtesting) ---
+# Records every signal sent with enriched recency data for empirical analysis.
+#   PRIMARY KPI:   outcome_full (did they score at any point after signal before FT?)
+#   SECONDARY KPI: outcome_5min/10min/15min (how quickly did they score?)
+# v10.28: Added recency fields: SOT/shots/xG/IB/corners at previous poll,
+#   5min ago, 10min ago, deltas, GPS change, seconds since last signal, recency_ratio.
 # Persisted to JSONL file on persistent volume so data survives restarts.
 signal_outcomes: list[dict] = []
 OUTCOME_WINDOW_MINUTES = 15  # game minutes for "imminent" window
@@ -1304,6 +1306,157 @@ def calculate_goal_pressure_score(
     return score, desc, components
 
 
+def _build_recency_fields(
+    fid: int, tid: int, minute: int,
+    sot: int, total_shots: int, shots_inside_box: int,
+    shots_off_target: int, xg_value: float | None, corners: int,
+    gps: float, accel_count: int,
+) -> dict:
+    """v10.28: Compute enriched recency fields from GPS history.
+
+    For every signal (and poll), compute historical snapshots at
+    previous poll, ~5 game minutes ago, and ~10 game minutes ago.
+    Also compute deltas, GPS change, seconds since last signal, and
+    a recency_ratio that measures how "fresh" the pressure is.
+
+    recency_ratio = (SOT_last_10m_delta) / max(SOT_total, 1)
+    High ratio = most SOT arrived recently (fresh pressure).
+    Low ratio = SOT accumulated over a long period (stale pressure).
+    """
+    history = team_gps_history.get((fid, tid), [])
+    fields = {
+        # Previous poll values
+        "prev_poll_sot": None, "prev_poll_shots": None,
+        "prev_poll_ib": None, "prev_poll_xg": None,
+        "prev_poll_corners": None, "prev_poll_gps": None,
+        # 5 game minutes ago
+        "sot_5m_ago": None, "shots_5m_ago": None,
+        "ib_5m_ago": None, "xg_5m_ago": None,
+        "corners_5m_ago": None, "gps_5m_ago": None,
+        # 10 game minutes ago
+        "sot_10m_ago": None, "shots_10m_ago": None,
+        "ib_10m_ago": None, "xg_10m_ago": None,
+        "corners_10m_ago": None, "gps_10m_ago": None,
+        # Deltas from previous poll
+        "delta_sot": None, "delta_shots": None,
+        "delta_ib": None, "delta_xg": None,
+        "delta_corners": None, "delta_gps": None,
+        # 5min and 10min window deltas
+        "sot_delta_5m": None, "shots_delta_5m": None,
+        "xg_delta_5m": None, "ib_delta_5m": None,
+        "corners_delta_5m": None,
+        "sot_delta_10m": None, "shots_delta_10m": None,
+        "xg_delta_10m": None, "ib_delta_10m": None,
+        "corners_delta_10m": None,
+        # Derived
+        "seconds_since_prev_signal": None,
+        "gps_change": None,
+        "recency_ratio": None,
+    }
+
+    if not history:
+        return fields
+
+    # Previous poll (most recent entry before this one)
+    prev = history[-1] if history else None
+    if prev:
+        fields["prev_poll_sot"] = prev.get("sot")
+        fields["prev_poll_shots"] = prev.get("total_shots")
+        fields["prev_poll_ib"] = prev.get("shots_inside_box")
+        fields["prev_poll_xg"] = prev.get("xg")
+        fields["prev_poll_corners"] = prev.get("corners")
+        fields["prev_poll_gps"] = round(prev.get("gps", 0), 1)
+
+        # Deltas from previous poll
+        fields["delta_sot"] = sot - (prev.get("sot") or 0)
+        fields["delta_shots"] = total_shots - (prev.get("total_shots") or 0)
+        fields["delta_ib"] = shots_inside_box - (prev.get("shots_inside_box") or 0)
+        prev_xg = prev.get("xg")
+        if xg_value is not None and prev_xg is not None:
+            try:
+                fields["delta_xg"] = round(xg_value - float(prev_xg), 3)
+            except (ValueError, TypeError):
+                pass
+        fields["delta_corners"] = corners - (prev.get("corners") or 0)
+        fields["delta_gps"] = round(gps - prev.get("gps", 0), 1)
+
+    # Find entries at ~5 and ~10 game minutes ago
+    entry_5m = None
+    entry_10m = None
+    for entry in reversed(history):
+        e_min = entry.get("minute", 0)
+        if entry_5m is None and e_min <= minute - 5:
+            entry_5m = entry
+        if entry_10m is None and e_min <= minute - 10:
+            entry_10m = entry
+        if entry_10m is not None:
+            break
+
+    if entry_5m:
+        fields["sot_5m_ago"] = entry_5m.get("sot")
+        fields["shots_5m_ago"] = entry_5m.get("total_shots")
+        fields["ib_5m_ago"] = entry_5m.get("shots_inside_box")
+        fields["xg_5m_ago"] = entry_5m.get("xg")
+        fields["corners_5m_ago"] = entry_5m.get("corners")
+        fields["gps_5m_ago"] = round(entry_5m.get("gps", 0), 1)
+
+        fields["sot_delta_5m"] = sot - (entry_5m.get("sot") or 0)
+        fields["shots_delta_5m"] = total_shots - (entry_5m.get("total_shots") or 0)
+        e5m_xg = entry_5m.get("xg")
+        if xg_value is not None and e5m_xg is not None:
+            try:
+                fields["xg_delta_5m"] = round(xg_value - float(e5m_xg), 3)
+            except (ValueError, TypeError):
+                pass
+        fields["ib_delta_5m"] = shots_inside_box - (entry_5m.get("shots_inside_box") or 0)
+        fields["corners_delta_5m"] = corners - (entry_5m.get("corners") or 0)
+
+    if entry_10m:
+        fields["sot_10m_ago"] = entry_10m.get("sot")
+        fields["shots_10m_ago"] = entry_10m.get("total_shots")
+        fields["ib_10m_ago"] = entry_10m.get("shots_inside_box")
+        fields["xg_10m_ago"] = entry_10m.get("xg")
+        fields["corners_10m_ago"] = entry_10m.get("corners")
+        fields["gps_10m_ago"] = round(entry_10m.get("gps", 0), 1)
+
+        fields["sot_delta_10m"] = sot - (entry_10m.get("sot") or 0)
+        fields["shots_delta_10m"] = total_shots - (entry_10m.get("total_shots") or 0)
+        e10m_xg = entry_10m.get("xg")
+        if xg_value is not None and e10m_xg is not None:
+            try:
+                fields["xg_delta_10m"] = round(xg_value - float(e10m_xg), 3)
+            except (ValueError, TypeError):
+                pass
+        fields["ib_delta_10m"] = shots_inside_box - (entry_10m.get("shots_inside_box") or 0)
+        fields["corners_delta_10m"] = corners - (entry_10m.get("corners") or 0)
+
+    # Seconds since previous signal for this team
+    team_sig = signaled_teams.get((fid, tid))
+    if team_sig and team_sig.get("last_signal_time", 0) > 0:
+        fields["seconds_since_prev_signal"] = round(time.time() - team_sig["last_signal_time"])
+
+    # GPS change (current vs earliest history entry)
+    if len(history) >= 1:
+        fields["gps_change"] = round(gps - history[0].get("gps", 0), 1)
+
+    # Recency ratio: what fraction of SOT arrived in the last 10 game minutes?
+    # High = fresh pressure, Low = accumulated pressure
+    sot_10m_ago = fields.get("sot_10m_ago")
+    if sot_10m_ago is not None and sot > 0:
+        fields["recency_ratio"] = round(
+            (sot - sot_10m_ago) / sot, 3
+        )
+    elif entry_5m is not None and sot > 0:
+        # Fallback: use 5m window if no 10m data
+        sot_5m_ago = fields.get("sot_5m_ago")
+        if sot_5m_ago is not None:
+            fields["recency_ratio"] = round(
+                (sot - sot_5m_ago) / sot, 3
+            )
+
+    return fields
+
+
 def record_pressure_poll(
     fid: int, tid: int, tname: str, league: str,
     minute: int, sot: int, total_shots: int,
@@ -1321,6 +1474,8 @@ def record_pressure_poll(
 
     v10.26: Added real data_quality field (fraction of non-null/non-zero fields)
     replacing the previous hardcoded 0.5 that never varied.
+
+    v10.28: Added recency fields (prev poll, 5m/10m ago, deltas, recency_ratio).
     """
     try:
         # v10.26: Compute real data quality score (0.0-1.0)
@@ -1335,6 +1490,13 @@ def record_pressure_poll(
             "possession": possession > 0,  # always False (dead field)
         }
         data_quality = sum(1 for v in key_fields.values() if v) / len(key_fields)
+
+        # v10.28: Compute recency fields from GPS history
+        recency = _build_recency_fields(
+            fid, tid, minute, sot, total_shots,
+            shots_inside_box, shots_off_target, xg_value, corners,
+            gps, accel_count,
+        )
 
         entry = {
             "ts": time.time(),
@@ -1360,6 +1522,8 @@ def record_pressure_poll(
             "accel_count": accel_count,
             "score_home": score_home, "score_away": score_away,
         }
+        # v10.28: Merge recency fields into poll entry
+        entry.update(recency)
         with open(POLL_DATA_FILE, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
@@ -2381,10 +2545,9 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
         hf = sum(1 for e in resolved if e.get("outcome_full") == "HIT")
 
         lines.append(f"✅ Resolved: {total}")
-        lines.append(f"  5 min:  {h5}/{total} ({h5/total*100:.0f}%)")
-        lines.append(f"  10 min: {h10}/{total} ({h10/total*100:.0f}%)")
-        lines.append(f"  15 min: {h15}/{total} ({h15/total*100:.0f}%)")
-        lines.append(f"  Full:   {hf}/{total} ({hf/total*100:.0f}%)")
+        # v10.28: Full WR is PRIMARY KPI — show first and prominently
+        lines.append(f"  ⭐ Full WR: {hf}/{total} ({hf/total*100:.0f}%)")
+        lines.append(f"  Timing: 5m {h5}/{total} | 10m {h10}/{total} | 15m {h15}/{total}")
         lines.append("")
 
         # By tier
@@ -2396,11 +2559,11 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
             t_h15 = sum(1 for e in tier_r if e.get("outcome_15min") == "HIT")
             t_hf = sum(1 for e in tier_r if e.get("outcome_full") == "HIT")
             avg_gps = sum(e.get("gps", 0) for e in tier_r) / t
-            lines.append(f"  {tier}: 15m {t_h15}/{t} ({t_h15/t*100:.0f}%) | full {t_hf}/{t} ({t_hf/t*100:.0f}%) | avg GPS {avg_gps:.0f}")
+            lines.append(f"  {tier}: full {t_hf}/{t} ({t_hf/t*100:.0f}%) | 15m {t_h15}/{t} ({t_h15/t*100:.0f}%) | avg GPS {avg_gps:.0f}")
 
         lines.append("")
 
-        # By trigger type (GPS/EARLY WARNING vs SOT/CRITICAL)
+        # By trigger type — v10.28: full WR first
         gps_sigs = [e for e in resolved if e.get("gps_triggered")]
         sot_sigs = [e for e in resolved if not e.get("gps_triggered")]
         if gps_sigs:
@@ -2409,16 +2572,16 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
             g_hf = sum(1 for e in gps_sigs if e.get("outcome_full") == "HIT")
             avg_gps = sum(e.get("gps", 0) for e in gps_sigs) / g_t
             avg_sot = sum(e.get("sot", 0) for e in gps_sigs) / g_t
-            lines.append(f"  GPS-triggered (EARLY WARNING): 15m {g_h15}/{g_t} ({g_h15/g_t*100:.0f}%) | full {g_hf}/{g_t} ({g_hf/g_t*100:.0f}%) | avg GPS {avg_gps:.0f} SOT {avg_sot:.1f}")
+            lines.append(f"  GPS-triggered (EW): full {g_hf}/{g_t} ({g_hf/g_t*100:.0f}%) | 15m {g_h15}/{g_t} ({g_h15/g_t*100:.0f}%) | avg GPS {avg_gps:.0f} SOT {avg_sot:.1f}")
         if sot_sigs:
             s_t = len(sot_sigs)
             s_h15 = sum(1 for e in sot_sigs if e.get("outcome_15min") == "HIT")
             s_hf = sum(1 for e in sot_sigs if e.get("outcome_full") == "HIT")
-            lines.append(f"  SOT-triggered (CRITICAL/SOT>=3): 15m {s_h15}/{s_t} ({s_h15/s_t*100:.0f}%) | full {s_hf}/{s_t} ({s_hf/s_t*100:.0f}%)")
+            lines.append(f"  SOT-triggered (CRITICAL): full {s_hf}/{s_t} ({s_hf/s_t*100:.0f}%) | 15m {s_h15}/{s_t} ({s_h15/s_t*100:.0f}%)")
 
         lines.append("")
 
-        # v10.27: By window tag
+        # v10.27/28: By window tag — full WR first
         for wt_label, wt_key in [("CORE (21-60')", "CORE"), ("EARLY OVERRIDE (<21')", "EARLY_OVERRIDE"), ("LATE OVERRIDE (61'+)", "LATE_OVERRIDE")]:
             group = [e for e in resolved if e.get("window_tag") == wt_key]
             if not group:
@@ -2427,7 +2590,7 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
             w_h15 = sum(1 for e in group if e.get("outcome_15min") == "HIT")
             w_hf = sum(1 for e in group if e.get("outcome_full") == "HIT")
             avg_gps = sum(e.get("gps", 0) for e in group) / w_t
-            lines.append(f"  {wt_label}: 15m {w_h15}/{w_t} ({w_h15/w_t*100:.0f}%) | full {w_hf}/{w_t} ({w_hf/w_t*100:.0f}%) | avg GPS {avg_gps:.0f}")
+            lines.append(f"  {wt_label}: full {w_hf}/{w_t} ({w_hf/w_t*100:.0f}%) | 15m {w_h15}/{w_t} ({w_h15/w_t*100:.0f}%) | avg GPS {avg_gps:.0f}")
 
         lines.append("")
 
@@ -2444,7 +2607,7 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
             g_t = len(group)
             g_h15 = sum(1 for e in group if e.get("outcome_15min") == "HIT")
             g_hf = sum(1 for e in group if e.get("outcome_full") == "HIT")
-            lines.append(f"  {range_label}: 15m {g_h15}/{g_t} ({g_h15/g_t*100:.0f}%) | full {g_hf}/{g_t} ({g_hf/g_t*100:.0f}%)")
+            lines.append(f"  {range_label}: full {g_hf}/{g_t} ({g_hf/g_t*100:.0f}%) | 15m {g_h15}/{g_t} ({g_h15/g_t*100:.0f}%)")
 
         lines.append("")
 
@@ -2463,7 +2626,7 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
             g_h15 = sum(1 for e in group if e.get("outcome_15min") == "HIT")
             g_hf = sum(1 for e in group if e.get("outcome_full") == "HIT")
             avg_gps = sum(e.get("gps", 0) for e in group) / g_t
-            lines.append(f"  {min_label}: 5m {g_h5}/{g_t} | 15m {g_h15}/{g_t} ({g_h15/g_t*100:.0f}%) | full {g_hf}/{g_t} ({g_hf/g_t*100:.0f}%) | avg GPS {avg_gps:.0f}")
+            lines.append(f"  {min_label}: full {g_hf}/{g_t} ({g_hf/g_t*100:.0f}%) | 15m {g_h15}/{g_t} ({g_h15/g_t*100:.0f}%) | 5m {g_h5}/{g_t} | avg GPS {avg_gps:.0f}")
 
         lines.append("")
 
@@ -2508,17 +2671,39 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
                 lines.append("  ".join(row_parts))
             lines.append("")
 
-        # Last 10 resolved signals detail
+        # Last 10 resolved signals detail — v10.28: full outcome first, show recency_ratio
         recent = resolved[-10:]
         lines.append("📋 Last signals:")
         for e in recent:
-            o15 = e.get("outcome_15min", "?")
             of_ = e.get("outcome_full", "?")
-            icon = "✅" if o15 == "HIT" else "❌"
-            gm = e.get("goal_minute_15", "")
+            o15 = e.get("outcome_15min", "?")
+            icon = "✅" if of_ == "HIT" else "❌"
+            gm = e.get("goal_minute_full") or e.get("goal_minute_15", "")
             gm_str = f" goal@{gm}'" if gm else ""
             trigger = "GPS" if e.get("gps_triggered") else "SOT"
-            lines.append(f"  {icon} {e.get('team_name','?')} | {e.get('league','?')} | GPS {e.get('gps','?')} | SOT {e.get('sot','?')} | {trigger} | 15m:{o15} full:{of_}{gm_str}")
+            rr = e.get("recency_ratio")
+            rr_str = f" RR:{rr:.2f}" if rr is not None else ""
+            lines.append(f"  {icon} {e.get('team_name','?')} | {e.get('league','?')} | GPS {e.get('gps','?')} | SOT {e.get('sot','?')} | {trigger} | full:{of_} 15m:{o15}{gm_str}{rr_str}")
+
+        # v10.28: Recency ratio analysis (if data available)
+        with_rr = [e for e in resolved if e.get("recency_ratio") is not None]
+        if len(with_rr) >= 5:
+            lines.append("")
+            lines.append("🔄 Recency Analysis (fresh vs accumulated pressure):")
+            # Bin by recency_ratio: low (accumulated) vs high (fresh)
+            mid = 0.3
+            low_rr = [e for e in with_rr if e.get("recency_ratio", 0) < mid]
+            high_rr = [e for e in with_rr if e.get("recency_ratio", 0) >= mid]
+            for label, group in [(f"RR <{mid} (accumulated)", low_rr), (f"RR ≥{mid} (fresh pressure)", high_rr)]:
+                if len(group) < 2:
+                    continue
+                gt = len(group)
+                ghf = sum(1 for e in group if e.get("outcome_full") == "HIT")
+                gh15 = sum(1 for e in group if e.get("outcome_15min") == "HIT")
+                avg_rr = sum(e.get("recency_ratio", 0) for e in group) / gt
+                avg_gps = sum(e.get("gps", 0) for e in group) / gt
+                avg_accel = sum(e.get("accel_count", 0) for e in group) / gt
+                lines.append(f"  {label}: full {ghf}/{gt} ({ghf/gt*100:.0f}%) | 15m {gh15}/{gt} ({gh15/gt*100:.0f}%) | avg RR {avg_rr:.2f} GPS {avg_gps:.0f} accel {avg_accel:.1f}")
     else:
         lines.append("No resolved signals yet.")
 
@@ -3327,6 +3512,27 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         if trend:
             msg += f"\nTrend: {trend}"
 
+        # v10.28: Show recency info in signal message
+        _recency_preview = _build_recency_fields(
+            fid, tid, minute, sot, total_shots,
+            shots_inside_box, shots_off_target, xg_value, corners,
+            gps, accel_count,
+        )
+        _rr = _recency_preview.get("recency_ratio")
+        _sot_d5 = _recency_preview.get("sot_delta_5m")
+        _sot_d10 = _recency_preview.get("sot_delta_10m")
+        _gps_chg = _recency_preview.get("gps_change")
+        if _rr is not None or _sot_d5 or _gps_chg:
+            msg += "\n\n"
+            if _rr is not None:
+                msg += f"\U0001f504 Recency: {_rr:.0%}"
+            if _sot_d5 is not None:
+                msg += f" | SOT +{_sot_d5} (5m)"
+            if _sot_d10 is not None:
+                msg += f" +{_sot_d10} (10m)"
+            if _gps_chg is not None:
+                msg += f" | GPS {_gps_chg:+.0f}"
+
         if send_telegram(client, msg):
             log.info(
                 f"  SIGNAL {tier}: {tname} - "
@@ -3376,6 +3582,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "goals_at_signal": goals_now,
             "opponent_goals_at_signal": opp_goals,
             "is_home": is_home_sg,
+            "minutes_remaining": 90 - minute,  # v10.28: natural time ceiling for late signals
             "outcome_5min": None,   # v10: expanded windows
             "outcome_10min": None,  # v10: expanded windows
             "outcome_15min": None,
@@ -3388,6 +3595,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "gps_triggered": tier == "EARLY WARNING",
             "resolved": False,
         })
+        # v10.28: Merge enriched recency fields into signal outcome
+        recency = _build_recency_fields(
+            fid, tid, minute, sot, total_shots,
+            shots_inside_box, shots_off_target, xg_value, corners,
+            gps, accel_count,
+        )
+        signal_outcomes[-1].update(recency)
         # v10.11: Save pending outcome immediately (survives restarts)
         save_outcome(signal_outcomes[-1])
 
