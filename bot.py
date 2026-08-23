@@ -4536,6 +4536,40 @@ def main():
         while True:
             now = time.time()
 
+            # v10.33: EOD report — MUST be before sleep blocks, not after them.
+            # Bug: old position was after stats/sleep, but both sleep paths
+            # (no-matches + dead-hours) do `continue`, making EOD unreachable.
+            # Fix: check at top of loop where nothing can skip it.
+            _eod_resolved = [e for e in signal_outcomes if e["resolved"]]
+            _eod_pending = [e for e in signal_outcomes if not e["resolved"]]
+            _eod_has_live = bool(
+                [f for f in cached_fixtures if is_tracked_match(f)]
+            ) if cached_fixtures else False
+            if (_eod_resolved or _eod_pending) and not _eod_has_live and not fast_monitored:
+                # Try resolving any pending outcomes first
+                if _eod_pending:
+                    try:
+                        resolve_stale_outcomes(client)
+                    except Exception:
+                        pass
+                    _eod_resolved = [e for e in signal_outcomes if e["resolved"]]
+                if _eod_resolved:
+                    log_outcome_summary()
+                    today_bg = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+                    if eod_report_sent_date != today_bg:
+                        try:
+                            subprocess.run(
+                                ["python3", "eod_report.py", "--send", "--days", "1", "--quiet"],
+                                cwd="/app", timeout=60,
+                            )
+                            eod_report_sent_date = today_bg
+                            log.info("v10.33: EOD report sent via subprocess")
+                        except Exception as e:
+                            log.warning(f"v10.33: EOD report subprocess failed: {e}")
+                    # v10.19.3: Rewrite file before clearing
+                    rewrite_outcomes_file()
+                    signal_outcomes.clear()
+
             # --- Fetch daily schedule (1 call/day, re-fetches on date change) ---
             has_matches = fetch_daily_active_hours(client)
             
@@ -4799,31 +4833,15 @@ def main():
             )
 
             # v9.8: Log outcome summary when all matches done
-            # v10.15: Also try resolving stale outcomes first — fixtures
-            # that went FT disappear from /fixtures?live=all, so pending
-            # signals for them never get resolved during normal discovery.
+            # v10.33: EOD trigger moved to top of loop (before sleep blocks).
+            # This block now only handles the summary log + stale resolution.
             if (resolved_outcomes or pending_outcomes) and not has_tracked_live and not fast_monitored:
-                # Try to resolve any remaining pending (FT fixtures not in live feed)
                 if pending_outcomes:
                     resolve_stale_outcomes(client)
-                    # Recompute after resolution attempt
                     resolved_outcomes = [e for e in signal_outcomes if e["resolved"]]
                     pending_outcomes = [e for e in signal_outcomes if not e["resolved"]]
                 if resolved_outcomes:
                     log_outcome_summary()
-                    # v10.32: Auto-send EOD report via subprocess (once per day)
-                    today_bg = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
-                    if eod_report_sent_date != today_bg:
-                        try:
-                            subprocess.run(
-                                ["python3", "eod_report.py", "--send", "--days", "1", "--quiet"],
-                                cwd="/app", timeout=60,
-                            )
-                            eod_report_sent_date = today_bg
-                            log.info("v10.32: EOD report sent via subprocess")
-                        except Exception as e:
-                            log.warning(f"v10.32: EOD report subprocess failed: {e}")
-                    # v10.19.3: Rewrite file before clearing — preserves all resolved data
                     rewrite_outcomes_file()
                     signal_outcomes.clear()
 
