@@ -3578,13 +3578,25 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             ) or 0
             goals_at_last = team_sig.get("goals_at_last_signal", current_goals)
             if current_goals > goals_at_last:
-                log.info(
-                    f"  BLOCKED {tier}: {tname} - "
-                    f"{sot} SOT (+{sot_jump}) but scored "
-                    f"{current_goals - goals_at_last} goal(s) since last signal "
-                    f"(sig #{sig_count + 1}, fixture {fid})"
-                )
-                continue
+                if sot_jump >= 1:
+                    # v10.33: Team scored AND SOT still rising —
+                    # "they scored and they're STILL coming."
+                    # Pressure is escalating, not resolved. Let signal through.
+                    log.info(
+                        f"  GOAL-PRESSURE CONTINUES: {tname} — scored "
+                        f"{current_goals - goals_at_last} goal(s) but SOT +{sot_jump}, "
+                        f"pressure escalating (sig #{sig_count + 1}, fixture {fid})"
+                    )
+                else:
+                    # Scored but SOT stalled — pressure likely resolved, block.
+                    signaled_teams[(fid, tid)]["goals_at_last_signal"] = current_goals
+                    log.info(
+                        f"  BLOCKED {tier}: {tname} - "
+                        f"{sot} SOT (+{sot_jump}) but scored "
+                        f"{current_goals - goals_at_last} goal(s) with no SOT increase "
+                        f"— pressure likely resolved (sig #{sig_count + 1}, fixture {fid})"
+                    )
+                    continue
 
         # --- Signal passes all checks, send it ---
         is_new_team = sig_count == 0
@@ -4378,7 +4390,7 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
 def main():
     global signal_outcomes, eod_report_sent_date
     log.info("=" * 60)
-    log.info("Football Bot v10.32 — Auto EOD report (subprocess, zero API cost)")
+    log.info("Football Bot v10.33 — Post-goal pressure continuation + EOD report")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
