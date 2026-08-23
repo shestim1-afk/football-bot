@@ -877,18 +877,22 @@ def classify_signal(
         sot_rate = (sot - prev_sot) / mins_passed
         trend = f"{prev_sot} -> {sot} SOT in {mins_passed}'"
 
-    # v10.24: IB RATIO HARD FLOOR — <50% means most shots are outside the box.
-    # Data: 0% short-term HIT (0/5), only 1/5 full HIT was 92' consolation while losing 1-3.
-    # Teams chipping long-range shots generate high shot volume but no danger.
-    if inside_box_ratio < 0.50:
-        return None, "", 0.0
-
-    # SAFETY NET: SOT >= 3 ALWAYS triggers CRITICAL (proven v9.x trigger)
-    # No quality gate needed — SOT>=3 is the gold standard.
+    # v10.29: SOT≥3 SAFETY NET — must fire BEFORE IB gate.
+    # Bug: v10.24 placed IB<50% before this check, so a team with 8 SOT
+    # but IB=42.9% (Nordsjaelland, 77') was blocked. SOT≥3 is the
+    # gold standard — if 3+ shots are on target, pressure is real
+    # regardless of where other (off-target) shots came from.
     if sot >= 3:
         last_sot = state["last_sot"] if state else 0
         if sot > last_sot:  # dedup: only on SOT increase
             return "CRITICAL", trend, sot_rate
+        return None, "", 0.0
+
+    # v10.24: IB RATIO HARD FLOOR — <50% means most shots are outside the box.
+    # Data: 0% short-term HIT (0/5), only 1/5 full HIT was 92' consolation while losing 1-3.
+    # Teams chipping long-range shots generate high shot volume but no danger.
+    # Applies ONLY to GPS-based signals (SOT < 3). SOT≥3 bypasses above.
+    if inside_box_ratio < 0.50:
         return None, "", 0.0
 
     # v10.24: GPS FLOOR for EARLY WARNING — GPS<60 means composite pressure
@@ -4233,7 +4237,7 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v10.28 — Enriched recency data collection + Full WR primary KPI")
+    log.info("Football Bot v10.29 — SOT≥3 bypasses IB gate (Nordsjaelland fix)")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
