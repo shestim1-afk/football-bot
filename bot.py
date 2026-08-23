@@ -2245,6 +2245,22 @@ def _log_outcome_block(label: str, resolved: list[dict]) -> None:
             f"full {s_hf}/{s_t} ({s_hf/s_t*100:.0f}%)"
         )
 
+    # v10.27: By window tag (CORE / EARLY_OVERRIDE / LATE_OVERRIDE)
+    for wt in ("CORE", "EARLY_OVERRIDE", "LATE_OVERRIDE"):
+        group = [e for e in resolved if e.get("window_tag") == wt]
+        if not group:
+            continue
+        w_h15 = sum(1 for e in group if e.get("outcome_15min") == "HIT")
+        w_hf = sum(1 for e in group if e.get("outcome_full") == "HIT")
+        w_t = len(group)
+        avg_gps = sum(e.get("gps", 0) for e in group) / w_t
+        avg_min = sum(e.get("game_minute", 0) for e in group) / w_t
+        log.info(
+            f"  {wt}: 15min {w_h15}/{w_t} ({w_h15/w_t*100:.0f}%) | "
+            f"full {w_hf}/{w_t} ({w_hf/w_t*100:.0f}%) | "
+            f"avg GPS: {avg_gps:.0f}, avg min: {avg_min:.0f}'"
+        )
+
     # By GPS score range
     for range_label, range_filter in [
         ("GPS 55-64", lambda e: 55 <= e.get("gps", 0) < 65),
@@ -2399,6 +2415,19 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
             s_h15 = sum(1 for e in sot_sigs if e.get("outcome_15min") == "HIT")
             s_hf = sum(1 for e in sot_sigs if e.get("outcome_full") == "HIT")
             lines.append(f"  SOT-triggered (CRITICAL/SOT>=3): 15m {s_h15}/{s_t} ({s_h15/s_t*100:.0f}%) | full {s_hf}/{s_t} ({s_hf/s_t*100:.0f}%)")
+
+        lines.append("")
+
+        # v10.27: By window tag
+        for wt_label, wt_key in [("CORE (21-60')", "CORE"), ("EARLY OVERRIDE (<21')", "EARLY_OVERRIDE"), ("LATE OVERRIDE (61'+)", "LATE_OVERRIDE")]:
+            group = [e for e in resolved if e.get("window_tag") == wt_key]
+            if not group:
+                continue
+            w_t = len(group)
+            w_h15 = sum(1 for e in group if e.get("outcome_15min") == "HIT")
+            w_hf = sum(1 for e in group if e.get("outcome_full") == "HIT")
+            avg_gps = sum(e.get("gps", 0) for e in group) / w_t
+            lines.append(f"  {wt_label}: 15m {w_h15}/{w_t} ({w_h15/w_t*100:.0f}%) | full {w_hf}/{w_t} ({w_hf/w_t*100:.0f}%) | avg GPS {avg_gps:.0f}")
 
         lines.append("")
 
@@ -3268,8 +3297,21 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # only (no player array). Was silently returning empty + costing 1 credit/signal.
         top_sot_str = ""
 
+        # v10.27: Window tag for signal classification analysis
+        # CORE = primary 21-60' window, EARLY_OVERRIDE/LATE_OVERRIDE = edge zones
+        if minute < MINUTE_MIN:
+            window_tag = "EARLY_OVERRIDE"
+            window_label = "⚡ EARLY OVERRIDE"
+        elif minute > MINUTE_MAX - 1:  # MINUTE_MAX=61, so >60'
+            window_tag = "LATE_OVERRIDE"
+            window_label = "⏰ LATE OVERRIDE"
+        else:
+            window_tag = "CORE"
+            window_label = ""
+
         msg = (
-            f"{tier_emoji(tier)} {tier} GOAL PRESSURE ({sig_label})\n\n"
+            f"{tier_emoji(tier)} {tier} GOAL PRESSURE ({sig_label})"
+            f"{f' {window_label}' if window_label else ''}\n\n"
             f"{home['name']}  {sh} - {sa}  {away['name']}\n"
             f"{league} | {minute}'\n\n"
             f"{tname}\n"
@@ -3289,7 +3331,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             log.info(
                 f"  SIGNAL {tier}: {tname} - "
                 f"{sot} SOT, GPS={gps:.0f}, xG={xg_str} (fixture {fid}, "
-                f"{sig_label} signal, {trigger})"
+                f"{sig_label} signal, {window_tag}, {trigger})"
             )
 
         signals_sent.append({
@@ -3298,6 +3340,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "minute": minute, "sot": sot, "xg": xg_str,
             "gps": round(gps, 1),
             "red_cards": red_card_str, "tier": tier,
+            "window_tag": window_tag,  # v10.27
             "trend": trend, "is_new": is_new_team,
         })
 
@@ -3329,6 +3372,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "sustained": sustained,
             "accel_count": accel_count,
             "tier": tier,
+            "window_tag": window_tag,  # v10.27: CORE / EARLY_OVERRIDE / LATE_OVERRIDE
             "goals_at_signal": goals_now,
             "opponent_goals_at_signal": opp_goals,
             "is_home": is_home_sg,
