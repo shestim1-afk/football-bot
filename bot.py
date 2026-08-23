@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import time
 import logging
@@ -181,6 +182,7 @@ todays_tracked_fixtures: list[dict] = []  # populated during schedule fetch
 
 # --- v10.12: End-of-day Telegram summary ---
 eod_summary_sent_date: str = ""  # track if today's EOD summary was sent via Telegram
+eod_report_sent_date: str = ""  # v10.32: track EOD report subprocess (once per day)
 
 
 def _load_eod_sent_date() -> str:
@@ -4375,7 +4377,7 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
 
 def main():
     log.info("=" * 60)
-    log.info("Football Bot v10.31 — Fix 'state' UnboundLocalError + team name mismatch fallback")
+    log.info("Football Bot v10.32 — Auto EOD report (subprocess, zero API cost)")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -4796,7 +4798,18 @@ def main():
                     pending_outcomes = [e for e in signal_outcomes if not e["resolved"]]
                 if resolved_outcomes:
                     log_outcome_summary()
-                    # v10.18: EOD summary removed from auto-send. Use /recap or /stats.
+                    # v10.32: Auto-send EOD report via subprocess (once per day)
+                    today_bg = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+                    if eod_report_sent_date != today_bg:
+                        try:
+                            subprocess.run(
+                                ["python3", "eod_report.py", "--send", "--days", "1", "--quiet"],
+                                cwd="/app", timeout=60,
+                            )
+                            eod_report_sent_date = today_bg
+                            log.info("v10.32: EOD report sent via subprocess")
+                        except Exception as e:
+                            log.warning(f"v10.32: EOD report subprocess failed: {e}")
                     # v10.19.3: Rewrite file before clearing — preserves all resolved data
                     rewrite_outcomes_file()
                     signal_outcomes.clear()
