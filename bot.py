@@ -103,6 +103,12 @@ LOSING_GPS_MIN = 80            # losing teams need GPS >= 80
 LOSING_IB_MIN = 0.65           # losing teams need IB >= 65%
 LOSING_SOT_MIN = 4             # losing teams need SOT >= 4
 
+# v10.36: Post-goal cooldown — suppress signals after team scores.
+# Stats are inflated by the goal itself (the shot that scored counts as SOT).
+# Without cooldown, bot signals "look at this pressure!" after the goal.
+POST_GOAL_COOLDOWN = 5        # hard suppress for 5 min after scoring
+POST_GOAL_RELEVANCE = 20     # 5-20 min: require fresh pressure; 20+: normal logic
+
 # v9.7.1: Night hours — no European tracked leagues play
 # Skip ALL schedule rechecks during this window (saves 2 credits per skipped recheck)
 NIGHT_HOUR_START = 1   # 01:00 Bulgaria — all European leagues finished
@@ -2290,6 +2296,183 @@ def fetch_live_sot_from_events(
         log.warning(f"  EVENT SOT failed for F{fixture_id}: {e}")
         return None
 
+
+# v10.36: Odds capture — passive metadata for EV analysis.
+# Odds NEVER influence signal generation. They are recorded AFTER
+# the signal decision is made, purely for post-hoc profitability analysis.
+ODDS_CAPTURE_ENABLED = os.environ.get("ODDS_CAPTURE_ENABLED", "true").lower() == "true"
+PREFERRED_BOOKMAKER = "Bet365"  # most liquid, widely available
+
+# v10.37: Track odds capture success/failure for visibility
+odds_capture_stats: dict[str, int] = {"live_ok": 0, "live_empty": 0, "prematch_ok": 0, "prematch_fallback": 0, "failed": 0}
+
+
+def _parse_odds_response(bookmakers: list, total_goals: int, source_tag: str) -> dict | None:
+    """v10.37: Shared odds parser for both /odds/live and /odds responses.
+
+    API-Football docs confirm both endpoints return the same structure:
+      response[0].bookmakers[].bets[].values[{value, odd}]
+    """
+    if not bookmakers:
+        return None
+
+    # Prefer Bet365, fall back to first bookmaker with data
+    chosen = None
+    for bm in bookmakers:
+        if bm.get("name") == PREFERRED_BOOKMAKER:
+            chosen = bm
+            break
+    if not chosen:
+        chosen = bookmakers[0]
+
+    bets = chosen.get("bets", [])
+    result = {
+        "bookmaker": chosen.get("name", "?"),
+        "odds_source": source_tag,
+        "total_goals_at_signal": total_goals,
+        "over_line": None,
+        "over_odds": None,
+        "over_implied": None,
+        "btts_yes_odds": None,
+        "btts_implied": None,
+        "match_home_odds": None,
+        "match_away_odds": None,
+        "match_draw_odds": None,
+        "fetched_at": time.time(),
+        "markets_available": [b.get("name", "") for b in bets],
+    }
+
+    # Target: Over (current total + 0.5) goals
+    target_line = total_goals + 0.5
+
+    for bet in bets:
+        bet_name = bet.get("name", "")
+        values = bet.get("values", [])
+
+        # Goals Over/Under
+        if "Over/Under" in bet_name or ("Over" in bet_name and "Under" in bet_name):
+            for v in values:
+                val_str = str(v.get("value", ""))
+                try:
+                    line_str = val_str.split("Over")[-1].strip()
+                    line = float(line_str)
+                    if abs(line - target_line) < 0.01:
+                        odd = safe_float(str(v.get("odd", "")))
+                        if odd and odd > 1.01:
+                            result["over_line"] = target_line
+                            result["over_odds"] = round(odd, 2)
+                            result["over_implied"] = round(1.0 / odd, 3)
+                except (ValueError, IndexError):
+                    pass
+
+        # Both Teams To Score
+        if "Both Teams" in bet_name or "BTTS" in bet_name:
+            for v in values:
+                if "Yes" in str(v.get("value", "")):
+                    odd = safe_float(str(v.get("odd", "")))
+                    if odd and odd > 1.01:
+                        result["btts_yes_odds"] = round(odd, 2)
+                        result["btts_implied"] = round(1.0 / odd, 3)
+
+        # Match Winner (1X2)
+        if "Match Winner" in bet_name or "1X2" in bet_name or "Result" in bet_name:
+            for v in values:
+                label = str(v.get("value", ""))
+                odd = safe_float(str(v.get("odd", "")))
+                if odd and odd > 1.01:
+                    if "Home" in label:
+                        result["match_home_odds"] = round(odd, 2)
+                    elif "Away" in label:
+                        result["match_away_odds"] = round(odd, 2)
+                    elif "Draw" in label:
+                        result["match_draw_odds"] = round(odd, 2)
+
+    has_odds = result["over_odds"] or result["btts_yes_odds"]
+    if not has_odds:
+        return None
+
+    log.info(
+        f"  ODDS {source_tag.upper()}: {result['bookmaker']} — "
+        f"O{result['over_line']} @{result['over_odds']} "
+        f"(impl {result['over_implied']}) "
+        f"BTTS @{result['btts_yes_odds']} "
+        f"[{', '.join(result['markets_available'][:5])}]"
+    )
+    return result
+
+
+def fetch_signal_odds(client: httpx.Client, fixture_id: int,
+                      total_goals: int) -> dict | None:
+    """v10.37: Fetch LIVE IN-PLAY odds at signal time for EV/ROI analysis.
+
+    Captures odds PASSIVELY — the signal decision is already final.
+    Costs 1-2 API credits per call.
+
+    STRATEGY: Try /odds/live first (true in-play odds).
+    If that returns empty (beta gate, no bookmaker data),
+    fall back to /odds (pre-match) tagged as "prematch_fallback"
+    so we have SOME data rather than nothing.
+
+    Why the fallback matters: /odds/live was announced as beta in 2022
+    and may require manual sign-up. Without fallback, a gated key
+    would silently capture zero odds forever.
+    """
+    global odds_capture_stats
+
+    if not ODDS_CAPTURE_ENABLED:
+        return None
+    if quota_remaining is not None and quota_remaining <= 5:
+        log.info(f"  ODDS SKIP: quota low ({quota_remaining}), preserving credits")
+        return None
+    try:
+        # --- Attempt 1: /odds/live (in-play) ---
+        try:
+            data = api_get(client, "/odds/live", {"fixture": fixture_id})
+            response = data.get("response", [])
+
+            if response:
+                bookmakers = response[0].get("bookmakers", [])
+                result = _parse_odds_response(bookmakers, total_goals, "live")
+                if result:
+                    odds_capture_stats["live_ok"] += 1
+                    return result
+            # /odds/live returned data but no usable markets
+            odds_capture_stats["live_empty"] += 1
+            log.info(f"  ODDS LIVE: empty/no markets for F{fixture_id}, trying pre-match fallback")
+        except Exception as e:
+            odds_capture_stats["live_empty"] += 1
+            log.info(f"  ODDS LIVE: endpoint error ({e}), trying pre-match fallback")
+
+        # --- Attempt 2: /odds (pre-match) as fallback ---
+        if quota_remaining is not None and quota_remaining <= 3:
+            log.info(f"  ODDS PREMATCH SKIP: quota too low for fallback ({quota_remaining})")
+            odds_capture_stats["failed"] += 1
+            return None
+
+        try:
+            data = api_get(client, "/odds", {"fixture": fixture_id})
+            response = data.get("response", [])
+
+            if response:
+                bookmakers = response[0].get("bookmakers", [])
+                result = _parse_odds_response(bookmakers, total_goals, "prematch_fallback")
+                if result:
+                    odds_capture_stats["prematch_fallback"] += 1
+                    return result
+            odds_capture_stats["failed"] += 1
+            log.info(f"  ODDS: both live and pre-match returned nothing for F{fixture_id}")
+        except Exception as e:
+            odds_capture_stats["failed"] += 1
+            log.warning(f"  ODDS FETCH FAILED: fixture {fixture_id}: {e}")
+
+        return None
+
+    except Exception as e:
+        odds_capture_stats["failed"] += 1
+        log.warning(f"  ODDS FETCH FAILED: fixture {fixture_id}: {e}")
+        return None
+
+
 def resolve_with_goal_events(
     entry: dict, goal_events: list[dict], home_id: int, away_id: int
 ) -> bool:
@@ -2591,9 +2774,25 @@ def log_outcome_summary() -> None:
     resolved_all = [e for e in signal_outcomes if e["resolved"]]
 
     if not resolved_first and not resolved_all:
+        # v10.37: Still log odds capture stats even with no resolved signals
+        if odds_capture_stats.get("live_ok", 0) + odds_capture_stats.get("prematch_fallback", 0) > 0:
+            log.info(f"")
+            log.info(f"  ODDS CAPTURE: {odds_capture_stats}")
         return
 
     log.info("")
+
+    # v10.37: Log odds capture diagnostics
+    total_odds = (odds_capture_stats.get("live_ok", 0)
+                  + odds_capture_stats.get("prematch_fallback", 0))
+    if total_odds > 0:
+        live_pct = odds_capture_stats.get("live_ok", 0) / total_odds * 100
+        log.info(f"  ODDS CAPTURE: {odds_capture_stats} (live rate: {live_pct:.0f}%)")
+        if odds_capture_stats.get("live_ok", 0) == 0 and odds_capture_stats.get("prematch_fallback", 0) > 0:
+            log.warning(f"  ODDS WARNING: /odds/live returning empty — may need beta access request")
+    elif odds_capture_stats.get("live_empty", 0) > 0:
+        log.info(f"  ODDS CAPTURE: {odds_capture_stats}")
+        log.warning(f"  ODDS WARNING: /odds/live failed {odds_capture_stats['live_empty']}x — beta gate likely active")
 
     if resolved_first:
         _log_outcome_block("SIGNAL OUTCOME SUMMARY (1st signal only)", resolved_first)
@@ -3409,6 +3608,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 "last_shots_off_target": 0, "last_total_shots": 0,
                 "last_shots_inside_box": 0, "last_corners": 0,
                 "last_possession": 0,
+                "last_goals": (sh if is_home_team else sa) or 0,  # v10.36
+                "last_goal_minute": 0,  # v10.36
             }
             continue
 
@@ -3442,6 +3643,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
 
         # === v10.1: Record poll data for backtesting (includes possession) ===
         is_home_team = (tid == home_tid)
+        team_goals = (sh if is_home_team else sa) or 0  # v10.36: moved up for post-goal tracking
         record_pressure_poll(
             fid=fid, tid=tid, tname=tname, league=league,
             minute=minute, sot=sot, total_shots=total_shots,
@@ -3497,6 +3699,20 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 f"  GATE SKIP: {tname} GPS={gps:.0f} SOT={sot} — {', '.join(gate_reason)}"
             )
 
+        # v10.36: POST-GOAL DETECTION — track when team last scored.
+        # Compares current goals with previous poll to detect new goals.
+        # Records the minute for the post-goal cooldown gate.
+        _prev_state = team_state.get((fid, tid))
+        _prev_goals = _prev_state.get("last_goals", None) if _prev_state else None
+        last_goal_minute = _prev_state.get("last_goal_minute", 0) if _prev_state else 0
+
+        if _prev_goals is not None and team_goals > _prev_goals:
+            last_goal_minute = minute
+            log.info(
+                f"  GOAL DETECTED: {tname} {_prev_goals}->{team_goals} at ~{minute}' "
+                f"(post-goal cooldown active for {POST_GOAL_COOLDOWN} min)"
+            )
+
         # Store state AFTER classification (for next comparison)
         team_state[(fid, tid)] = {
             "last_sot": sot,
@@ -3507,6 +3723,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "last_shots_inside_box": shots_inside_box,
             "last_corners": corners,
             "last_possession": possession,
+            "last_goals": team_goals,          # v10.36: for post-goal cooldown
+            "last_goal_minute": last_goal_minute,  # v10.36: minute of most recent goal
         }
 
         # v10.15: Pre-window gate — build baseline but don't signal yet
@@ -3558,6 +3776,56 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     f"\n\u26a0\ufe0f LOSING {team_goals}-{opp_goals} — "
                     f"high bar passed (GPS={gps:.0f} IB={ib_ratio:.0%} SOT={sot})"
                 )
+
+        # v10.36: POST-GOAL COOLDOWN
+        # Suppress signals for 5 min after team scores (stats inflated by the goal).
+        # 5-20 min after: require fresh pressure to re-signal.
+        # 20+ min after: normal signal logic (game state has evolved).
+        # Context: GIL Vicente 2-0 GPS 98 at 46' (just scored), Fulham 2-3 GPS 100 at 56'.
+        if last_goal_minute > 0:
+            _min_since_goal = minute - last_goal_minute
+            if 0 < _min_since_goal <= POST_GOAL_COOLDOWN:
+                log.info(
+                    f"  POST-GOAL COOLDOWN: {tname} {tier} at {minute}' — "
+                    f"scored ~{last_goal_minute}' ({_min_since_goal}m ago), "
+                    f"GPS={gps:.0f} SOT={sot} fresh=false — suppressing"
+                )
+                continue
+            elif _min_since_goal <= POST_GOAL_RELEVANCE:
+                # After hard cooldown: require evidence of fresh pressure.
+                # If the team scored 10 min ago and nothing new happened, the
+                # existing GPS/SOT reflects the pre-goal buildup, not new danger.
+                _prev_sot = (_prev_state.get("last_sot", 0) or 0) if _prev_state else 0
+                _post_goal_fresh = (
+                    sot > _prev_sot             # SOT still rising since last poll
+                    or accel_count >= 1         # any acceleration indicator
+                )
+                if not _post_goal_fresh:
+                    # Context-aware: CRITICAL tagged (SOT>=3 proves danger exists),
+                    # EW blocked (no SOT proof of ongoing danger).
+                    if tier == "CRITICAL":
+                        stale_tag = (
+                            f"\n\u26a0\ufe0f STALE POST-GOAL — scored ~{last_goal_minute}' "
+                            f"({_min_since_goal}m ago) no fresh pressure since "
+                            f"(SOT={sot} vs prev={_prev_sot}, accel={accel_count})"
+                        )
+                        log.info(
+                            f"  POST-GOAL TAG (not block): {tname} CRITICAL at {minute}' — "
+                            f"stale post-goal but SOT={sot} proves danger, tagging"
+                        )
+                    else:
+                        log.info(
+                            f"  POST-GOAL BLOCK: {tname} {tier} at {minute}' — "
+                            f"scored ~{last_goal_minute}' ({_min_since_goal}m ago), "
+                            f"no fresh pressure (SOT={sot} vs prev={_prev_sot}, accel={accel_count})"
+                        )
+                        continue
+                else:
+                    log.info(
+                        f"  POST-GOAL PASS: {tname} {tier} at {minute}' — "
+                        f"scored ~{last_goal_minute}' ({_min_since_goal}m ago) but fresh pressure "
+                        f"(SOT {sot}>{_prev_sot}, accel={accel_count})"
+                    )
 
         # v10.13.2: Extended window — allow early signals (16'-20') if SOT-accelerating
         # v10.19: BUT require CRITICAL GPS (≥75) for EARLY WARNING in early window.
@@ -3896,6 +4164,12 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "trend": trend, "is_new": is_new_team,
         })
 
+        # v10.36: Fetch odds PASSIVELY after signal is sent.
+        # Signal decision is already final — odds never influence it.
+        # Stored as metadata for future EV/ROI analysis.
+        _total_goals_now = (sh or 0) + (sa or 0)
+        _odds_data = fetch_signal_odds(client, fid, _total_goals_now)
+
         # v10.1: Enriched outcome record with all raw indicators
         opp_goals = (sa if is_home_sg else sh)
         signal_outcomes.append({
@@ -3933,7 +4207,21 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "scoreline": "winning" if goals_now > opp_goals else "drawing" if goals_now == opp_goals else "losing",  # v10.34: scoreline context
             "is_losing": is_losing,  # v10.34: for WR analysis
             "is_stale_critical": bool(stale_tag),  # v10.35: track stale CRITICAL outcomes
+            "post_goal_minutes_since": minute - last_goal_minute if last_goal_minute > 0 else None,  # v10.36
             "minutes_remaining": 90 - minute,  # v10.28: natural time ceiling for late signals
+            # v10.37: Odds data (passive, never influences signal logic)
+            "odds_source": _odds_data.get("odds_source") if _odds_data else None,
+            "odds_bookmaker": _odds_data.get("bookmaker") if _odds_data else None,
+            "odds_over_line": _odds_data.get("over_line") if _odds_data else None,
+            "odds_over_odds": _odds_data.get("over_odds") if _odds_data else None,
+            "odds_over_implied": _odds_data.get("over_implied") if _odds_data else None,
+            "odds_btts_yes": _odds_data.get("btts_yes_odds") if _odds_data else None,
+            "odds_btts_implied": _odds_data.get("btts_implied") if _odds_data else None,
+            "odds_match_home": _odds_data.get("match_home_odds") if _odds_data else None,
+            "odds_match_away": _odds_data.get("match_away_odds") if _odds_data else None,
+            "odds_match_draw": _odds_data.get("match_draw_odds") if _odds_data else None,
+            "odds_fetched_at": _odds_data.get("fetched_at") if _odds_data else None,
+            "odds_markets": _odds_data.get("markets_available") if _odds_data else [],
             "outcome_5min": None,   # v10: expanded windows
             "outcome_10min": None,  # v10: expanded windows
             "outcome_15min": None,
@@ -4587,7 +4875,7 @@ def main():
     # v10.35: Load persisted EOD report date — prevents re-send on restart
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
-    log.info("Football Bot v10.36 — Dedup signals + per-day EOD breakdown")
+    log.info("Football Bot v10.37 — Live odds capture + post-goal cooldown + dedup + per-day EOD")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
