@@ -324,6 +324,38 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                           f"avg RR {avg(group, 'recency_ratio'):.2f} "
                           f"GPS {avg(group, 'gps'):.0f}")
 
+    # --- v10.36: Odds / EV analysis ---
+    with_odds = [e for e in resolved if e.get("odds_over_odds") is not None]
+    if len(with_odds) >= 3:
+        lines.append("")
+        lines.append(f"=== ODDS / EV ANALYSIS ({len(with_odds)} signals with odds) ===")
+        avg_over = avg(with_odds, "odds_over_odds")
+        avg_impl = avg(with_odds, "odds_over_implied")
+        hits_odds = [e for e in with_odds if e.get("outcome_full") == "HIT"]
+        empirical_wr = len(hits_odds) / len(with_odds) if with_odds else 0
+        lines.append(f"  Avg Over odds: {avg_over:.2f} | Avg implied: {avg_impl:.1%}")
+        lines.append(f"  Empirical full WR: {empirical_wr:.1%}")
+        edge = empirical_wr - avg_impl
+        lines.append(f"  Edge vs market: {edge:+.1%} ({'+EV' if edge > 0 else '-EV'})")
+        # ROI calculation (flat 1 unit stake)
+        profit = sum(1 if e.get("outcome_full") == "HIT" else -1 for e in with_odds)
+        lines.append(f"  Flat ROI: {profit / len(with_odds) * 100:+.1f}% ({profit:+d} units)")
+
+        # By GPS range with odds
+        for label, lo, hi in [("55-64", 55, 65), ("65-74", 65, 75),
+                               ("75-84", 75, 85), ("85+", 85, 999)]:
+            group = [e for e in with_odds if lo <= e.get("gps", 0) < hi]
+            if len(group) < 2:
+                continue
+            g = len(group)
+            gh = hit_count(group, "outcome_full")
+            go = avg(group, "odds_over_odds")
+            gi = avg(group, "odds_over_implied")
+            ge = gh / g - gi if g else 0
+            gp = (sum(1 if e.get("outcome_full") == "HIT" else -1 for e in group)) / g * 100
+            lines.append(f"  GPS {label}: {gh}/{g} ({gh/g*100:.0f}%) @ {go:.2f} impl {gi:.1%} "
+                          f"edge {ge:+.1%} ROI {gp:+.1f}%")
+
     # --- Individual signal details ---
     lines.append("")
     lines.append("=== SIGNAL DETAILS ===")
@@ -336,11 +368,14 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
         rr_str = f" RR:{rr:.2f}" if rr is not None else ""
         score = f" [{e.get('goals_at_signal', '?')}-{e.get('opponent_goals_at_signal', '?')}]"
         ha = "H" if e.get("is_home") else "A"
+        odds_str = ""
+        if e.get("odds_over_odds"):
+            odds_str = f" O{e.get('odds_over_line')}@{e['odds_over_odds']}"
         lines.append(
             f"  {icon:4s} | {e.get('team_name', '?'):<20s} | {e.get('league', '?'):<25s} | "
             f"{e.get('game_minute', '?'):>2}' {ha} | GPS {e.get('gps', 0):.0f} | SOT {e.get('sot', 0)} | "
             f"{trigger} | {e.get('tier', '?'):<13s} | full:{e.get('outcome_full', '?')} "
-            f"15m:{e.get('outcome_15min', '?')}{gm_str}{rr_str}{score}"
+            f"15m:{e.get('outcome_15min', '?')}{gm_str}{rr_str}{odds_str}{score}"
         )
 
     if pending:
