@@ -556,16 +556,50 @@ def api_get(client: httpx.Client, endpoint: str, params: dict = None) -> dict:
 
 
 def send_telegram(client: httpx.Client, text: str) -> bool:
-    try:
-        resp = client.post(
-            f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        log.error(f"Telegram send failed: {e}")
-        return False
+    """Send message to Telegram, auto-splitting at 4000 chars (Telegram limit: 4096).
+
+    v10.38: Signal messages with losing_tag + stale_tag + recency info
+    can exceed 4096 chars, causing silent truncation. Now splits at 4000
+    char boundaries (96 char safety margin for any Telegram overhead).
+    Splits on newline boundaries when possible to avoid mid-word breaks.
+    """
+    MAX_LEN = 4000
+    if len(text) <= MAX_LEN:
+        try:
+            resp = client.post(
+                f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            log.error(f"Telegram send failed: {e}")
+            return False
+
+    # Split long messages into chunks at newline boundaries
+    chunks = []
+    remaining = text
+    while len(remaining) > MAX_LEN:
+        # Find last newline within the limit
+        split_at = remaining.rfind("\n", 0, MAX_LEN)
+        if split_at <= 0:
+            split_at = MAX_LEN  # fallback: hard split
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    chunks.append(remaining)
+
+    all_ok = True
+    for i, chunk in enumerate(chunks):
+        try:
+            resp = client.post(
+                f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            log.error(f"Telegram send failed (chunk {i+1}/{len(chunks)}): {e}")
+            all_ok = False
+    return all_ok
 
 
 # ============================================================
@@ -806,8 +840,10 @@ def get_stats_interval(budget_mode: str) -> int:
     4 fixtures) but coverage improves dramatically — fixtures now
     get 3-4 polls in the 40-min window instead of 1.
     """
+    # v10.39: NORMAL 90s -> 45s (7500 credits, <4% usage at 45s)
+    # Budget protection modes UNCHANGED.
     if budget_mode == "NORMAL":
-        return 90
+        return 45
     if budget_mode == "CAREFUL":
         return 150
     if budget_mode == "STRICT":
@@ -1896,43 +1932,40 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
                         or best_sot >= 2
                         or get_fixture_max_gps(fid) >= 50)
 
+    # v10.39: Halved all fast intervals (60s->30s, 90s->45s).
+    # With 7500 credits and batching, cost is ~4% of budget.
     # v10: Pressure acceleration — catches pre-SOT pressure build
-    # This is THE key improvement: 60s polling starts when shots, DA,
-    # and xG are ALL rising, even if SOT is still 0 or 1.
     if (fid in pressure_accelerating
             and not both_teams_signaled
             and best_sot < 3
             and edge_allows_fast):
-        interval = 60
-    # v10.17: SOT burst — 2+ SOT jump = extreme urgency, 60s polling
+        interval = 30
+    # v10.17: SOT burst — 2+ SOT jump = extreme urgency
     elif fid in sot_burst_fixtures and not both_teams_signaled and edge_allows_fast:
-        interval = 60
+        interval = 30
     # v9.7: SOT acceleration tier — still top priority
     elif fid in accelerating_fixtures and not both_teams_signaled and edge_allows_fast:
-        interval = 60
-    # v10.21: Second-chance boost — fast poll when SOT=2 and clock
-    # is ticking (past 40'). v10.13 used SOT 1-2 but SOT=1 with GPS<30
-    # is noise (one lucky shot). SOT=2 shows sustained pressure.
+        interval = 30
+    # v10.21: Second-chance boost — fast poll when SOT=2, clock ticking
     elif (SECOND_CHANCE_BOOST
           and best_sot == 2
           and current_minute >= 40
           and not both_teams_signaled
           and edge_allows_fast):
-        interval = 60
+        interval = 30
     elif not has_state:
         interval = base_interval
     elif best_sot >= 3 and not both_teams_signaled:
-        interval = 90
+        interval = 45
     # v10.22: Fast SOT window (FastWin) also gated in edge zones
     elif best_sot >= 1 and not both_teams_signaled and is_fast_sot_active(fid) and edge_allows_fast:
-        interval = 90
+        interval = 45
     elif best_sot >= 2:
-        interval = base_interval  # v10.13: was 180, now 90s NORMAL
+        interval = base_interval
     elif best_sot == 1:
-        interval = max(60, int(base_interval * 0.75))  # v10.13: was base, now 67s NORMAL
+        interval = max(30, int(base_interval * 0.75))  # v10.39: ~34s NORMAL
     else:
-        # v10.21: SOT=0 with state — 1.5x in ALL modes (was 1.0x NORMAL)
-        # If both teams have SOT=0, no signal is possible — slower polling is safe.
+        # v10.21: SOT=0 with state — 1.5x base (no signal possible)
         interval = int(base_interval * 1.5)
 
     # v10.21: Pre-window SOT=0 — can't signal until 21', poll at 2x
@@ -3494,6 +3527,10 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # v10.10: Parse ALL available stats for GPS calculation
         total_shots = safe_int(get_stat(tstats, "total_shots"))
 
+        # v10.38: Compute is_home_team BEFORE any usage (was used at line 3549
+        # before being defined at line 3583, causing NameError or wrong value)
+        is_home_team = (tid == home_tid)
+
         # v10.13.1: Data sanity check — reject clearly corrupted API responses
         # v10.31: Use stats_sot (not effective_sot) — these check the
         # statistics API response quality, not the events supplement.
@@ -3580,7 +3617,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             )
 
         # === v10.1: Record poll data for backtesting (includes possession) ===
-        is_home_team = (tid == home_tid)
+        # v10.38: is_home_team now defined earlier (before _data_incomplete check)
         team_goals = (sh if is_home_team else sa) or 0  # v10.36: moved up for post-goal tracking
         record_pressure_poll(
             fid=fid, tid=tid, tname=tname, league=league,
@@ -3613,10 +3650,55 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # === v10.1: Classify signal with quality gates ===
         ib_ratio = shots_inside_box / total_shots if total_shots > 0 else 0.0
         sustained = components.get("sustained", 0)
+
+        # v10.38: SOT DATA RELIABILITY GUARD
+        # API-Football can report inflated SOT (Celtic CL: 3 SOT vs FotMob's 1).
+        # When SOT>=3, check if the SOT/total_shots ratio is realistic.
+        # Real matches rarely exceed 50% SOT rate; >70% is almost certainly bad data.
+        # Also flag SOT>=3 with <4 total shots (3 on-target from 3 total = 100%).
+        _sot_suspicious = False
+        if sot >= 3 and total_shots > 0:
+            _sot_ratio = sot / total_shots
+            if _sot_ratio > 0.70:
+                _sot_suspicious = True
+                log.warning(
+                    f"  SOT DATA QUALITY: {tname} F{fid} {minute}' — "
+                    f"SOT={sot}/{total_shots} ({_sot_ratio:.0%}) is suspiciously high "
+                    f"(API-Football may be inflating SOT vs real data)"
+                )
+            elif total_shots < 4 and sot >= 3:
+                _sot_suspicious = True
+                log.warning(
+                    f"  SOT DATA QUALITY: {tname} F{fid} {minute}' — "
+                    f"SOT={sot} but only {total_shots} total shots (unrealistic ratio)"
+                )
+
         tier, trend, sot_rate = classify_signal(
             sot, state, minute, gps=gps, accel_count=accel_count,
             inside_box_ratio=ib_ratio, sustained_count=sustained,
         )
+
+        # v10.38: Downgrade suspicious SOT>=3 CRITICAL to GPS-based evaluation.
+        # If SOT>=3 triggered CRITICAL but the SOT data looks inflated,
+        # require GPS>=70 as additional confirmation (same as EARLY WARNING floor
+        # but slightly higher). This prevents sole reliance on bad SOT data.
+        # The Celtic case: SOT=3/3=100% would be caught, and GPS=60 < 70
+        # would block the false CRITICAL.
+        if tier == "CRITICAL" and _sot_suspicious:
+            if gps < 70:
+                log.warning(
+                    f"  SOT GUARD BLOCK: {tname} CRITICAL at {minute}' — "
+                    f"SOT={sot} looks inflated (ratio too high), GPS={gps:.0f} < 70, "
+                    f"downgrading from CRITICAL to blocked"
+                )
+                tier = None
+                trend = ""
+                sot_rate = 0.0
+            else:
+                log.warning(
+                    f"  SOT GUARD PASS: {tname} CRITICAL at {minute}' — "
+                    f"SOT={sot} looks inflated but GPS={gps:.0f} >= 70 confirms real pressure"
+                )
 
         # v10.10: Log WHY GPS was high but signal was blocked (for threshold tuning)
         # Fixed: was producing empty reason strings when no gate condition matched
@@ -4826,10 +4908,24 @@ def main():
     # v10.35: Load persisted EOD report date — prevents re-send on restart
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
-    log.info("Football Bot v10.37 — Post-goal cooldown + dedup + per-day EOD")
+    log.info("Football Bot v10.39 — Post-goal cooldown + dedup + per-day EOD")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
+    log.info("")
+    log.info("v10.39 CHANGES (faster polling):")
+    log.info("  NORMAL base interval: 90s -> 45s (halved detection lag)")
+    log.info("  Fast polling (accel/burst): 60s -> 30s")
+    log.info("  SOT>=3 / fast-SOT window: 90s -> 45s")
+    log.info("  SOT=1: ~67s -> ~34s | SOT=0: ~135s -> ~67s")
+    log.info("  Budget modes (CAREFUL/STRICT/EMERGENCY): UNCHANGED")
+    log.info("  Credit impact: ~4% of 7500 daily budget (was ~1%)")
+    log.info("")
+    log.info("v10.38 CHANGES (3 bug fixes):")
+    log.info("  1. is_home_team BUG FIX: was used before defined (NameError/wrong value)")
+    log.info("  2. TELEGRAM MSG SPLIT: auto-splits at 4000 chars (was truncated at 4096)")
+    log.info("  3. SOT DATA GUARD: flags inflated SOT/total_shots ratio (>70%), requires")
+    log.info("     GPS>=70 as additional confirmation for suspicious SOT>=3 CRITICAL")
     log.info("")
     log.info("v10.37 CHANGES (post-goal cooldown fix):")
     log.info("  SOT>=3 CRITICAL bypasses 5-min hard post-goal suppress.")
