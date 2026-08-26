@@ -109,6 +109,13 @@ LOSING_SOT_MIN = 4             # losing teams need SOT >= 4
 POST_GOAL_COOLDOWN = 5        # hard suppress for 5 min after scoring
 POST_GOAL_RELEVANCE = 20     # 5-20 min: require fresh pressure; 20+: normal logic
 
+# v10.44: Score-state dampener — winning teams generate phantom pressure signals.
+# Evidence: AEK up 4-0 SOT=7 GPS=71 (MISS x2), Viking up 3-1 SOT=5 GPS=73 (MISS x3).
+# A team winning comfortably takes low-urgency shots that inflate SOT/GPS
+# without genuine scoring threat.
+SCORE_DIFF_SUPPRESS = 3    # +3 or more: suppress unless fresh acceleration
+# SCORE_DIFF_GPS_OVERRIDE removed — GPS magnitude alone doesn't prove fresh intent
+
 # v9.7.1: Night hours — no European tracked leagues play
 # Skip ALL schedule rechecks during this window (saves 2 credits per skipped recheck)
 NIGHT_HOUR_START = 1   # 01:00 Bulgaria — all European leagues finished
@@ -3869,6 +3876,49 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     f"high bar passed (GPS={gps:.0f} IB={ib_ratio:.0%} SOT={sot})"
                 )
 
+        # v10.44: SCORE-STATE DAMPENER — winning teams generate phantom pressure.
+        # Evidence: AEK up 4-0 SOT=7 GPS=71 (MISS), Viking up 3-1 SOT=5 GPS=73 (MISS).
+        # A team winning comfortably takes low-urgency shots that inflate SOT/GPS
+        # without genuine scoring threat. Soft approach: suppress +3+ unless
+        # genuinely fresh acceleration. Tag +2 for monitoring.
+        goal_diff = team_goals - opp_goals
+        if goal_diff >= SCORE_DIFF_SUPPRESS:
+            # +3 or more: require genuinely fresh acceleration to signal.
+            # This catches blowout stat-padding while preserving teams that are
+            # genuinely accelerating (e.g. RM up 3-1 but SOT still climbing fast).
+            _sd_state = team_state.get((fid, tid))
+            _sd_prev_sot = _sd_state["last_sot"] if _sd_state else 0
+            # Fresh = SOT actively rising OR acceleration detected.
+            # GPS magnitude alone does NOT override — high GPS in a blowout
+            # IS the phantom pressure pattern (Viking GPS 89 up 3-1).
+            _sd_fresh = (
+                accel_count >= 1
+                or (sot > _sd_prev_sot and _sd_prev_sot > 0)
+            )
+            if not _sd_fresh:
+                log.info(
+                    f"  SCORE DAMPENER: {tname} {tier} at {minute}' — "
+                    f"winning {team_goals}-{opp_goals} (+{goal_diff}), no fresh acceleration, suppressing"
+                )
+                continue
+            # Fresh acceleration present — allow but tag
+            stale_tag += (
+                "\n⚠️ WINNING +" + str(goal_diff) + f" ({team_goals}-{opp_goals}) — "
+                f"fresh accel pass (SOT {_sd_prev_sot}->{sot}, accel={accel_count})"
+            )
+            log.info(
+                f"  SCORE DAMPENER PASS: {tname} {tier} at {minute}' — "
+                f"winning {team_goals}-{opp_goals} (+{goal_diff}) but fresh accel "
+                f"(SOT {_sd_prev_sot}->{sot}, accel={accel_count})"
+            )
+        elif goal_diff == 2:
+            # +2: allow but tag for monitoring. Future data may justify stricter treatment.
+            stale_tag += "\n⚠️ WINNING +2 (" + f"{team_goals}-{opp_goals}) — monitoring"
+            log.info(
+                f"  SCORE DAMPENER TAG: {tname} {tier} at {minute}' — "
+                f"winning {team_goals}-{opp_goals} (+2), allowing with tag"
+            )
+
         # v10.36: POST-GOAL COOLDOWN
         # Suppress signals for 5 min after team scores (stats inflated by the goal).
         # 5-20 min after: require fresh pressure to re-signal.
@@ -4970,15 +5020,15 @@ def main():
     # v10.35: Load persisted EOD report date — prevents re-send on restart
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
-    log.info("Football Bot v10.43 — DEAD grace period: no kill before 15'")
+    log.info("Football Bot v10.44b — score-state dampener (no GPS override)")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
     log.info("")
-    log.info("v10.43 CHANGES:")               
-    log.info("  1) DEAD grace period: no kill before 15' (SOT=0 is normal at kickoff)")               
-    log.info("  2) DEAD revival: every 5min check SOT>=3 or big acceleration")               
-    log.info("  3) SOT>=3 dedup removed: was blocking signals when SOT flat at first poll")               
+    log.info("v10.44b CHANGES (frozen — no further logic changes until 100+ signals):")
+    log.info("  1) SCORE DAMPENER: +3 goal lead suppresses unless SOT rising or accel")
+    log.info("  2) SCORE DAMPENER: +2 goal lead tagged for monitoring (allowed)")
+    log.info("  3) Frozen: no GPS override in +3 dampener (pure freshness test)")
     log.info("")
     log.info("v10.42 CHANGE (adaptive GPS):")               
     log.info("  xG component kept for domestic leagues (PL, Serie A, La Liga, etc.)")               
