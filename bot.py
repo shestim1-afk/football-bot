@@ -3456,6 +3456,7 @@ def check_telegram_commands(client: httpx.Client) -> None:
     /eod3     = full EOD report (past 3 days)
     /eod7     = full EOD report (past 7 days)
     /eodall   = full EOD report (all data YTD)
+    /outcomes = download signal_outcomes.jsonl file
     /today    = match list (no form/scorers, only if <10 games)
     /matches  = alias for /today
     Runs once per main loop iteration (minimal overhead).
@@ -3580,6 +3581,37 @@ def check_telegram_commands(client: httpx.Client) -> None:
                         send_telegram(client, f"EOD report failed (exit code {result.returncode}).")
                 except Exception as e:
                     send_telegram(client, f"EOD report error: {e}")
+
+            elif text == "/outcomes":
+                # v10.44d-patch: Send signal_outcomes.jsonl as a Telegram document
+                import io
+                pending_in_mem = [e for e in signal_outcomes if not e.get("resolved")]
+                if pending_in_mem:
+                    try:
+                        resolve_stale_outcomes(client)
+                    except Exception:
+                        pass
+                if not os.path.exists(OUTCOMES_FILE):
+                    send_telegram(client, "No signal_outcomes.jsonl file found yet.")
+                else:
+                    file_size = os.path.getsize(OUTCOMES_FILE)
+                    line_count = 0
+                    with open(OUTCOMES_FILE, "r") as f:
+                        for _ in f:
+                            line_count += 1
+                    try:
+                        with open(OUTCOMES_FILE, "rb") as f:
+                            client.post(
+                                f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                                data={"chat_id": TELEGRAM_CHAT_ID},
+                                files={"document": ("signal_outcomes.jsonl", f, "application/jsonl")},
+                                timeout=30.0,
+                            )
+                        send_telegram(client, f"sent signal_outcomes.jsonl ({line_count} entries, {file_size / 1024:.1f} KB)")
+                        log.info(f"/outcomes: sent JSONL ({line_count} entries, {file_size / 1024:.1f} KB)")
+                    except Exception as e:
+                        send_telegram(client, f"Failed to send file: {e}")
+                        log.error(f"/outcomes send failed: {e}")
 
             # Acknowledge update to clear from queue
             if update_id:
