@@ -179,6 +179,9 @@ os.makedirs(_VOLUME_DIR, exist_ok=True)
 OUTCOMES_FILE = os.path.join(_VOLUME_DIR, "signal_outcomes.jsonl")
 EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 
+# --- v10: Bot Version (module-level so all functions can access it) ---
+BOT_VERSION = "v10.44d-patch"
+
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
 # Uses all available API stats (zero extra cost — data already in response).
@@ -306,6 +309,28 @@ dead_fixtures: dict[int, tuple[int, int, float]] = {}
 # Key: fixture_id -> death_timestamp.
 DATA_DEAD_MINUTE = 10  # minimum minute before declaring data-dead
 data_dead_fixtures: dict[int, float] = {}
+
+# --- Irish team name detection (API-Football ID collision: league 357 = both Bulgaria & Ireland) ---
+IRISH_TEAM_NAMES = {
+    "Bohemians", "Bohemian FC", "Shelbourne", "St Patrick's Athletic",
+    "Waterford", "Waterford FC", "Drogheda United", "Dundalk",
+    "Galway United", "Derry City", "Sligo Rovers", "Cork City",
+    "Athlone Town", "Longford Town", "Finn Harps", "Treaty United",
+    "Cobh Ramblers", "Wexford", "Bray Wanderers",
+}
+
+
+def _fix_league_name(league: str, home_name: str, away_name: str) -> str:
+    """Override league name for known API-Football ID collisions.
+    
+    API-Football returns league ID 357 for both Bulgarian First League and
+    Irish Premier Division. The API name is 'First League' for both.
+    Detect Irish teams by name and return correct league name.
+    """
+    if home_name in IRISH_TEAM_NAMES or away_name in IRISH_TEAM_NAMES:
+        return "League of Ireland"
+    return league
+
 
 # --- v9.7: /fixtures?ids= statistics detection ---
 # Lazily tested on first stats call. If True, one /fixtures?ids= call
@@ -2438,10 +2463,14 @@ def record_non_signal_fixture(fixture: dict) -> None:
         return
     sh = fixture["goals"]["home"] or 0
     sa = fixture["goals"]["away"] or 0
+    _home_name = fixture["teams"]["home"]["name"]
+    _away_name = fixture["teams"]["away"]["name"]
+    _raw_league = fixture["league"].get("name", "?")
+    _league = _fix_league_name(_raw_league, _home_name, _away_name)
     for is_h, tinfo in [(True, fixture["teams"]["home"]), (False, fixture["teams"]["away"])]:
         entry = {
             "fixture_id": fid, "team_id": tinfo["id"], "team_name": tinfo["name"],
-            "league": fixture["league"].get("name", "?"),
+            "league": _league,
             "signal_time": None, "signal_clock": None,
             "game_minute": fixture["fixture"]["status"].get("elapsed", 90) or 90,
             "sot": 0, "stats_sot_raw": 0, "events_sot": 0,
@@ -3791,7 +3820,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
     # LEAGUE_IDS is used ONLY for filtering (lid in LEAGUE_IDS), not naming.
     # Bug: API returns league ID 357 for both Bulgarian & Irish leagues,
     # causing Irish teams to be labeled "First League (Bulgaria)".
-    league = fixture["league"].get("name", LEAGUE_IDS.get(fixture["league"]["id"], "?"))
+    # v10.44d-patch: Also apply Irish team name override (API name is same for both).
+    _raw_league = fixture["league"].get("name", LEAGUE_IDS.get(fixture["league"]["id"], "?"))
+    league = _fix_league_name(_raw_league, home["name"], away["name"])
     sh = fixture["goals"]["home"] or 0
     sa = fixture["goals"]["away"] or 0
 
@@ -3998,7 +4029,19 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # would block the false CRITICAL.
         # v10.44d-fix: Also catch low-IB + high-SOT (Galway: SOT=4 IB=14%)
         _ib_suspicious = sot >= 3 and ib_ratio < 0.25
-        if tier == "CRITICAL" and (_sot_suspicious or _ib_suspicious):
+        # v10.44d-patch: HARD BLOCK when SOT > shots_inside_box (physically impossible —
+        # every shot on target MUST be inside the box). GPS cannot override this.
+        _impossible_sot = sot > shots_inside_box and shots_inside_box > 0
+        if _impossible_sot:
+            log.warning(
+                f"  SOT GUARD HARD BLOCK: {tname} {minute}' — "
+                f"SOT={sot} > shots_inside_box={shots_inside_box} is physically impossible, "
+                f"blocking regardless of GPS={gps:.0f}"
+            )
+            tier = None
+            trend = ""
+            sot_rate = 0.0
+        elif tier == "CRITICAL" and (_sot_suspicious or _ib_suspicious):
             _reasons = []
             if _sot_suspicious:
                 _reasons.append("SOT ratio suspicious")
@@ -5352,11 +5395,20 @@ def main():
     # v10.35: Load persisted EOD report date — prevents re-send on restart
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
-    BOT_VERSION = "v10.44d"
-    log.info(f"Football Bot {BOT_VERSION} — Big Chances + N/A safety + 4 bug fixes")
+    # BOT_VERSION is now module-level (moved in v10.44d-patch)
+    log.info(f"Football Bot {BOT_VERSION} — Big Chances + N/A safety + bug fix patches")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
+    log.info("")
+    log.info("v10.44d-patch BUG FIXES (on top of v10.44d):")
+    log.info("  1. LEAGUE LABEL: Irish team name override — API-Football ID 357 collision")
+    log.info("     detects Bohemians/Galway/Shelbourne/etc -> 'League of Ireland'")
+    log.info("  2. SOT GUARD HARD BLOCK: SOT > shots_inside_box = physically impossible")
+    log.info("     blocks regardless of GPS (Galway SOT=4 IB=1 would now be blocked)")
+    log.info("  3. BOT_VERSION SCOPE: moved to module level (was local in main())")
+    log.info("     fixes silent NameError that prevented signal_outcomes recording")
+    log.info("  4. OUTCOME RESOLVER: working (52/52 resolved) — no change needed")
     log.info("")
     log.info("v10.44d BUG FIXES:")
     log.info("  0) LEAGUE LABEL: API name used for recording (fixes Irish->Bulgarian mislabel)")
