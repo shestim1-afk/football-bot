@@ -54,6 +54,8 @@ LEAGUE_IDS = {
     88: "Eredivisie", 203: "Super Lig",
     283: "Liga I (Romania)", 210: "HNL (Croatia)", 345: "Czech First League",
     119: "Danish Superliga", 137: "Veikkausliiga (Finland)", 191: "NB I (Hungary)",
+    # v10.44d-fix: League of Ireland (API may return this ID for Irish Prem Div)
+    543: "League of Ireland",
 }
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
@@ -140,6 +142,7 @@ quota_remaining: int | None = None
 quota_limit: int | None = None
 minute_remaining: int | None = None
 minute_limit: int | None = None
+_last_stale_resolve: float = 0.0  # v10.44d-fix: periodic resolution timer
 
 # --- v9.5: Round-robin API key management ---
 # Each key has health state: rate-limited until timestamp, or auth-failed.
@@ -2427,6 +2430,47 @@ def save_outcome(entry: dict) -> None:
         log.warning(f"  Failed to save outcome to file: {e}")
 
 
+# v10.44d-fix: Record non-signal fixtures for ML negative examples
+def record_non_signal_fixture(fixture: dict) -> None:
+    """Record a monitored fixture that never triggered a signal (negative example for ML)."""
+    fid = fixture["fixture"]["id"]
+    if fid in signaled_fixtures:
+        return
+    sh = fixture["goals"]["home"] or 0
+    sa = fixture["goals"]["away"] or 0
+    for is_h, tinfo in [(True, fixture["teams"]["home"]), (False, fixture["teams"]["away"])]:
+        entry = {
+            "fixture_id": fid, "team_id": tinfo["id"], "team_name": tinfo["name"],
+            "league": fixture["league"].get("name", "?"),
+            "signal_time": None, "signal_clock": None,
+            "game_minute": fixture["fixture"]["status"].get("elapsed", 90) or 90,
+            "sot": 0, "stats_sot_raw": 0, "events_sot": 0,
+            "total_shots": 0, "shots_inside_box": 0, "ib_ratio": 0,
+            "shots_off_target": 0, "xg": None, "big_chances": 0,
+            "corners": 0, "possession": 0, "gps": 0,
+            "gps_sot": 0, "gps_ib": 0, "gps_sv": 0,
+            "gps_xg": 0, "gps_bc": 0, "gps_poss": 0, "gps_accel": 0,
+            "sustained": 0, "accel_count": 0,
+            "tier": "NON-SIGNAL", "window_tag": "NON-SIGNAL",
+            "goals_at_signal": sh if is_h else sa,
+            "opponent_goals_at_signal": sa if is_h else sh,
+            "is_home": is_h,
+            "scoreline": "winning" if (sh if is_h else sa) > (sa if is_h else sh) else "drawing" if (sh if is_h else sa) == (sa if is_h else sh) else "losing",
+            "is_losing": (sh if is_h else sa) < (sa if is_h else sh),
+            "is_stale_critical": False, "post_goal_minutes_since": None,
+            "minutes_remaining": 0, "version": BOT_VERSION,
+            "outcome_5min": "N/A", "outcome_10min": "N/A",
+            "outcome_15min": "N/A", "outcome_full": "N/A",
+            "goal_minute_5": None, "goal_minute_10": None,
+            "goal_minute_15": None, "goal_minute_full": None,
+            "sig_num": 0, "gps_triggered": False,
+            "resolved": True, "resolved_via": "non_signal",
+        }
+        signal_outcomes.append(entry)
+        save_outcome(entry)
+    log.info(f"  NON-SIGNAL: Recorded fixture {fid} ({tinfo['name']} & opp) for ML")
+
+
 def rewrite_outcomes_file() -> None:
     """v10.11: Rewrite the entire JSONL file with current in-memory state.
 
@@ -3035,10 +3079,16 @@ def resolve_stale_outcomes(client: httpx.Client) -> int:
     if not pending:
         return 0
 
+    # v10.44d-fix: Log resolution attempt
+    _fids = list(set(e["fixture_id"] for e in pending))
+    log.info(f"  Resolving {len(pending)} pending outcome(s) across {len(_fids)} fixture(s)...")
+
     # Collect unique fixture IDs (batch up to 20 per API call)
     fixture_ids = list(set(e["fixture_id"] for e in pending))
     resolved_count = 0
 
+    # v10.44d-fix: Track which fixture IDs had signals
+    _signaled_fids = set(e["fixture_id"] for e in signal_outcomes if e.get("tier") != "NON-SIGNAL")
     for i in range(0, len(fixture_ids), BATCH_SIZE_LIMIT):
         batch = fixture_ids[i:i + BATCH_SIZE_LIMIT]
         ids_param = "-".join(str(fid) for fid in batch)
@@ -3047,6 +3097,11 @@ def resolve_stale_outcomes(client: httpx.Client) -> int:
             fixtures = data.get("response", [])
             for f in fixtures:
                 check_signal_outcomes(f, client)
+                # v10.44d-fix: Record non-signal fixtures for ML dataset
+                _fid = f["fixture"]["id"]
+                _fstatus = f["fixture"]["status"]["short"]
+                if _fstatus not in LIVE_STATUSES and _fid not in _signaled_fids and _fid not in signaled_fixtures:
+                    record_non_signal_fixture(f)
         except Exception as e:
             log.warning(f"  Stale outcome resolution failed for batch {batch}: {e}")
             continue
@@ -3732,9 +3787,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
     # --- SOT SIGNAL CHECK (per team) ---
     # v10: Calculate GPS for every team on every poll (zero extra API cost).
     # This builds the dataset and drives acceleration-aware polling.
-    league = LEAGUE_IDS.get(
-        fixture["league"]["id"], fixture["league"].get("name", "?")
-    )
+    # v10.44d-fix: Use API league name for recording (avoids ID collisions).
+    # LEAGUE_IDS is used ONLY for filtering (lid in LEAGUE_IDS), not naming.
+    # Bug: API returns league ID 357 for both Bulgarian & Irish leagues,
+    # causing Irish teams to be labeled "First League (Bulgaria)".
+    league = fixture["league"].get("name", LEAGUE_IDS.get(fixture["league"]["id"], "?"))
     sh = fixture["goals"]["home"] or 0
     sa = fixture["goals"]["away"] or 0
 
@@ -3939,11 +3996,18 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # but slightly higher). This prevents sole reliance on bad SOT data.
         # The Celtic case: SOT=3/3=100% would be caught, and GPS=60 < 70
         # would block the false CRITICAL.
-        if tier == "CRITICAL" and _sot_suspicious:
+        # v10.44d-fix: Also catch low-IB + high-SOT (Galway: SOT=4 IB=14%)
+        _ib_suspicious = sot >= 3 and ib_ratio < 0.25
+        if tier == "CRITICAL" and (_sot_suspicious or _ib_suspicious):
+            _reasons = []
+            if _sot_suspicious:
+                _reasons.append("SOT ratio suspicious")
+            if _ib_suspicious:
+                _reasons.append(f"IB={ib_ratio:.0%}<25% with SOT={sot}")
             if gps < 70:
                 log.warning(
                     f"  SOT GUARD BLOCK: {tname} CRITICAL at {minute}' — "
-                    f"SOT={sot} looks inflated (ratio too high), GPS={gps:.0f} < 70, "
+                    f"{', '.join(_reasons)}, GPS={gps:.0f} < 70, "
                     f"downgrading from CRITICAL to blocked"
                 )
                 tier = None
@@ -3952,7 +4016,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             else:
                 log.warning(
                     f"  SOT GUARD PASS: {tname} CRITICAL at {minute}' — "
-                    f"SOT={sot} looks inflated but GPS={gps:.0f} >= 70 confirms real pressure"
+                    f"{', '.join(_reasons)} but GPS={gps:.0f} >= 70 confirms real pressure"
                 )
 
         # v10.10: Log WHY GPS was high but signal was blocked (for threshold tuning)
@@ -4567,6 +4631,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "goal_minute_full": None,
             "sig_num": sig_num,
             "gps_triggered": tier == "EARLY WARNING",
+            "version": BOT_VERSION,  # v10.44d-fix: track version
             "resolved": False,
         })
         # v10.28: Merge enriched recency fields into signal outcome
@@ -5283,14 +5348,22 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
 # ============================================================
 
 def main():
-    global signal_outcomes, eod_report_sent_date
+    global signal_outcomes, eod_report_sent_date, _last_stale_resolve
     # v10.35: Load persisted EOD report date — prevents re-send on restart
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
-    log.info("Football Bot v10.44d — Big Chances + N/A safety + SIG-REVIVE")
+    BOT_VERSION = "v10.44d"
+    log.info(f"Football Bot {BOT_VERSION} — Big Chances + N/A safety + 4 bug fixes")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
+    log.info("")
+    log.info("v10.44d BUG FIXES:")
+    log.info("  0) LEAGUE LABEL: API name used for recording (fixes Irish->Bulgarian mislabel)")
+    log.info("  0b) SOT GUARD: IB<25% + SOT>=3 now triggers guard (catches Galway SOT=4 IB=14%)")
+    log.info("  0c) VERSION FIELD: every signal now records which bot version produced it")
+    log.info("  0d) OUTCOME RESOLVER: periodic resolution every 10min (fixes PENDING stuck)")
+    log.info("  0e) NON-SIGNAL RECORDING: monitored fixtures without signals saved for ML")
     log.info("")
     log.info("v10.44d CHANGES:")
     log.info("  1) BIG CHANCES GPS COMPONENT (0-3 pts): min(BC * 1.5, 3)")
@@ -5493,6 +5566,20 @@ def main():
 
         while True:
             now = time.time()
+
+            # v10.44d-fix: Periodic stale outcome resolution (every 10 min)
+            # Fixes bug where outcomes stay PENDING because EOD clear
+            # never triggers during continuous live match windows.
+            _pending_now = sum(1 for e in signal_outcomes if not e.get("resolved"))
+            if _pending_now > 0 and (now - _last_stale_resolve > 600 or _last_stale_resolve == 0):
+                _last_stale_resolve = now
+                try:
+                    _rc = resolve_stale_outcomes(client)
+                    if _rc > 0:
+                        log.info(f"Periodic resolution: {_rc} outcome(s) resolved")
+                        rewrite_outcomes_file()
+                except Exception as _e:
+                    log.warning(f"Periodic resolution failed: {_e}")
 
             # v10.33: EOD report — MUST be before sleep blocks, not after them.
             # Bug: old position was after stats/sleep, but both sleep paths
