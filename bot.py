@@ -4106,13 +4106,16 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # would block the false CRITICAL.
         # v10.44d-fix: Also catch low-IB + high-SOT (Galway: SOT=4 IB=14%)
         _ib_suspicious = sot >= 3 and ib_ratio < 0.25
-        # v10.44d-patch: HARD BLOCK when SOT > shots_inside_box (physically impossible —
-        # every shot on target MUST be inside the box). GPS cannot override this.
-        _impossible_sot = sot > shots_inside_box and shots_inside_box > 0
+        # v10.44e: HARD BLOCK when SOT >> shots_inside_box (API data corruption).
+        # Original: SOT > IB was too aggressive (blocked Sevilla SOT=4 IB=3).
+        # A shot on target from outside the box IS possible (long-range effort).
+        # But >2 on-target from outside is almost certainly API inflation.
+        _excess_sot = sot - shots_inside_box
+        _impossible_sot = _excess_sot > 2 and shots_inside_box > 0
         if _impossible_sot:
             log.warning(
                 f"  SOT GUARD HARD BLOCK: {tname} {minute}' — "
-                f"SOT={sot} > shots_inside_box={shots_inside_box} is physically impossible, "
+                f"SOT={sot} vs IB={shots_inside_box} (gap={_excess_sot}) is suspicious, "
                 f"blocking regardless of GPS={gps:.0f}"
             )
             tier = None
@@ -5489,7 +5492,7 @@ def main():
     log.info("v10.44d-patch BUG FIXES (on top of v10.44d):")
     log.info("  1. LEAGUE LABEL: Irish team name override — API-Football ID 357 collision")
     log.info("     detects Bohemians/Galway/Shelbourne/etc -> 'League of Ireland'")
-    log.info("  2. SOT GUARD HARD BLOCK: SOT > shots_inside_box = physically impossible")
+    log.info("  2. SOT GUARD HARD BLOCK: SOT - IB > 2 (allows long-range on-target)")
     log.info("     blocks regardless of GPS (Galway SOT=4 IB=1 would now be blocked)")
     log.info("  3. BOT_VERSION SCOPE: moved to module level (was local in main())")
     log.info("     fixes silent NameError that prevented signal_outcomes recording")
