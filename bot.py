@@ -127,6 +127,12 @@ NIGHT_HOUR_END = 10    # 10:00 Bulgaria — earliest possible kickoff (~11:00 Sc
 # limited time.  After the window expires, polling reverts to base rate.
 FAST_SOT_WINDOW = 5 * 60  # 300 seconds
 
+# v10.44f: Signal cooldown — after a team signals, require GPS to drop
+# below signal threshold for 2+ consecutive polls before re-signaling.
+# This prevents re-firing every poll while GPS sustains above threshold.
+SIGNAL_COOLDOWN_POLLS = 2   # consecutive polls below threshold to re-qualify
+SIGNAL_COOLDOWN_GPS_FLOOR = GPS_EARLY_WARNING  # 55 — below this = pressure broken
+
 # Max fixture IDs per batched request (API-Football limit for /fixtures?ids=...)
 BATCH_SIZE_LIMIT = 20
 
@@ -161,6 +167,12 @@ rr_index: int = 0  # round-robin counter
 # v9.7: sot_at_last_signal fixes the bug where jump was measured from last poll's SOT
 # v10.19.3: fast-jump GPS discount for rapid +1 SOT increments
 signaled_teams: dict[tuple[int, int], dict] = {}
+# v10.44f: Per-team signal cooldown tracking.
+# After a team signals, don't re-signal unless GPS dropped below threshold
+# for 2+ consecutive polls (pressure died and rebuilt) OR a goal reset the state.
+# Key: (fid, tid) -> count of consecutive polls with GPS < signal threshold
+# since last signal. When count >= 2, the team is "re-qualified" for a new signal.
+team_cooldown_polls: dict[tuple[int, int], int] = {}
 # Keep fixture-level set for backward compat in logs/cleanup
 signaled_fixtures: set[int] = set()
 
@@ -180,7 +192,7 @@ OUTCOMES_FILE = os.path.join(_VOLUME_DIR, "signal_outcomes.jsonl")
 EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.44e-per-team-first-only"
+BOT_VERSION = "v10.44f-signal-cooldown"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -1839,6 +1851,10 @@ def cleanup_state(live_fixture_ids: set[int]):
     for key in list(signaled_teams):
         if key[0] not in live_fixture_ids:
             signaled_teams.pop(key, None)
+    # v10.44f: Clean cooldown tracking
+    for key in list(team_cooldown_polls):
+        if key[0] not in live_fixture_ids:
+            del team_cooldown_polls[key]
     for fid in list(last_stats_check):
         if fid not in live_fixture_ids:
             del last_stats_check[fid]
@@ -4174,6 +4190,14 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 f"  GOAL DETECTED: {tname} {_prev_goals}->{team_goals} at ~{minute}' "
                 f"(post-goal cooldown active for {POST_GOAL_COOLDOWN} min)"
             )
+            # v10.44f: Goal resets signal cooldown — new game state,
+            # next pressure buildup is genuinely new.
+            if (fid, tid) in team_cooldown_polls:
+                del team_cooldown_polls[(fid, tid)]
+                log.info(
+                    f"  COOLDOWN RESET: {tname} — goal detected, "
+                    f"clearing signal cooldown for (fid={fid}, tid={tid})"
+                )
 
         # Store state AFTER classification (for next comparison)
         team_state[(fid, tid)] = {
@@ -4189,6 +4213,40 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "last_goals": team_goals,          # v10.36: for post-goal cooldown
             "last_goal_minute": last_goal_minute,  # v10.36: minute of most recent goal
         }
+
+        # v10.44f: Update signal cooldown counter.
+        # If this team has signaled before AND GPS is now below the signal
+        # threshold, increment the "below-threshold poll" counter.
+        # If GPS is back above threshold, reset the counter.
+        # This tracks whether pressure genuinely died and rebuilt.
+        _key = (fid, tid)
+        if _key in signaled_teams and _key not in team_cooldown_polls:
+            # Team has signaled, not yet in cooldown tracking.
+            # Start tracking if GPS drops below signal threshold.
+            if gps < SIGNAL_COOLDOWN_GPS_FLOOR:
+                team_cooldown_polls[_key] = 1
+                log.info(
+                    f"  COOLDOWN TRACK: {tname} GPS={gps:.0f} < {SIGNAL_COOLDOWN_GPS_FLOOR} "
+                    f"after signal — below-threshold poll 1/{SIGNAL_COOLDOWN_POLLS}"
+                )
+        elif _key in team_cooldown_polls:
+            if gps < SIGNAL_COOLDOWN_GPS_FLOOR:
+                team_cooldown_polls[_key] += 1
+                _cd_count = team_cooldown_polls[_key]
+                if _cd_count >= SIGNAL_COOLDOWN_POLLS:
+                    log.info(
+                        f"  COOLDOWN READY: {tname} GPS={gps:.0f} below threshold "
+                        f"for {_cd_count} polls — RE-QUALIFIED for new signal"
+                    )
+                else:
+                    log.info(
+                        f"  COOLDOWN TRACK: {tname} GPS={gps:.0f} < {SIGNAL_COOLDOWN_GPS_FLOOR} "
+                        f"— below-threshold poll {_cd_count}/{SIGNAL_COOLDOWN_POLLS}"
+                    )
+            else:
+                # GPS back above threshold before reaching cooldown count —
+                # pressure never fully died, reset counter.
+                del team_cooldown_polls[_key]
 
         # v10.15: Pre-window gate — build baseline but don't signal yet
         # v10.13.1: Data corrupt gate — block signals from bad API data
@@ -4506,6 +4564,35 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 )
                 continue
 
+        # v10.44f: SIGNAL COOLDOWN — prevent re-signaling the same team
+        # in the same fixture unless pressure died and rebuilt.
+        # Data: STALE signals (same team, GPS never dropped) = 25% WR vs
+        # FRESH signals = 50% WR. Zero information gained from repeat signals
+        # when GPS sustains above threshold.
+        # Re-qualify via: (a) GPS dropped below 55 for 2+ consecutive polls,
+        # or (b) team scored a goal (game state reset).
+        if sig_count >= 1:
+            _cd_polls = team_cooldown_polls.get((fid, tid), 0)
+            _cd_qualified = _cd_polls >= SIGNAL_COOLDOWN_POLLS
+            if not _cd_qualified:
+                log.info(
+                    f"  COOLDOWN BLOCK: {tname} {tier} at {minute}' — "
+                    f"GPS={gps:.0f} SOT={sot} sig#{sig_count}, "
+                    f"pressure never dropped below {SIGNAL_COOLDOWN_GPS_FLOOR} "
+                    f"for {SIGNAL_COOLDOWN_POLLS}+ polls (cd={_cd_polls}) "
+                    f"(fixture {fid})"
+                )
+                continue
+            else:
+                log.info(
+                    f"  COOLDOWN PASS: {tname} {tier} at {minute}' — "
+                    f"RE-QUALIFIED after {SIGNAL_COOLDOWN_POLLS}+ polls below threshold "
+                    f"(GPS dropped and rebuilt to {gps:.0f})"
+                )
+                # Clear cooldown — team is now re-qualified, next repeat
+                # will need another drop-rebuild cycle.
+                del team_cooldown_polls[(fid, tid)]
+
         # --- v9.5.8: First-signal-only on busy days ---
         # v10.19.3: Exception override — if pressure is EXPLODING after the 1st signal,
         # allow a 2nd signal even on busy days. Keeps polling for data collection.
@@ -4764,6 +4851,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "gps_triggered": tier == "EARLY WARNING",
             "version": BOT_VERSION,  # v10.44d-fix: track version
             "resolved": False,
+            "cooldown_requalified": sig_count >= 1,  # v10.44f: True if re-qualified after GPS drop
         })
         # v10.28: Merge enriched recency fields into signal outcome
         recency = _build_recency_fields(
@@ -5484,7 +5572,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Per-team FIRST_ONLY fix + IB inference + bug fix patches")
+    log.info(f"Football Bot {BOT_VERSION} — Per-team FIRST_ONLY fix + signal cooldown + 15s polling + PRE/POST-GOAL tagging")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
