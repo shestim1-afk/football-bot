@@ -131,7 +131,7 @@ FAST_SOT_WINDOW = 5 * 60  # 300 seconds
 # below signal threshold for 2+ consecutive polls before re-signaling.
 # This prevents re-firing every poll while GPS sustains above threshold.
 SIGNAL_COOLDOWN_POLLS = 2   # consecutive polls below threshold to re-qualify
-SIGNAL_COOLDOWN_GPS_FLOOR = GPS_EARLY_WARNING  # 55 — below this = pressure broken
+SIGNAL_COOLDOWN_GPS_FLOOR = 55  # GPS_EARLY_WARNING value — below this = pressure broken
 
 # Max fixture IDs per batched request (API-Football limit for /fixtures?ids=...)
 BATCH_SIZE_LIMIT = 20
