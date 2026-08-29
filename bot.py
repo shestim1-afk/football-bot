@@ -2058,8 +2058,24 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
 
     # v10.40: Tightened late-game gates (stale CRITICAL→block, hard stop 80', GPS>=80 floor) (60s->30s, 90s->45s).
     # With 7500 credits and batching, cost is ~4% of budget.
+    # v10.44e: 15s ULTRA-FAST tier for fixtures about to signal.
+    # Targets GPS>=55 + SOT>=2 (one SOT/GPS bump away from threshold).
+    # Credit cost: ~+30 credits/day (batched), well within budget.
+    _max_gps = get_fixture_max_gps(fid)
+    _ultra_fast = (
+        not both_teams_signaled
+        and edge_allows_fast
+        and best_sot >= 2
+        and _max_gps >= 55
+        and (fid in pressure_accelerating
+             or fid in sot_burst_fixtures
+             or fid in accelerating_fixtures
+             or _max_gps >= 65)
+    )
+    if _ultra_fast:
+        interval = 15
     # v10: Pressure acceleration — catches pre-SOT pressure build
-    if (fid in pressure_accelerating
+    elif (fid in pressure_accelerating
             and not both_teams_signaled
             and best_sot < 3
             and edge_allows_fast):
@@ -2503,6 +2519,7 @@ def record_non_signal_fixture(fixture: dict) -> None:
             "scoreline": "winning" if (sh if is_h else sa) > (sa if is_h else sh) else "drawing" if (sh if is_h else sa) == (sa if is_h else sh) else "losing",
             "is_losing": (sh if is_h else sa) < (sa if is_h else sh),
             "is_stale_critical": False, "post_goal_minutes_since": None,
+            "post_goal_tag": "NON-SIGNAL", "goal_detected_this_poll": False,
             "minutes_remaining": 0, "version": BOT_VERSION,
             "outcome_5min": "N/A", "outcome_10min": "N/A",
             "outcome_15min": "N/A", "outcome_full": "N/A",
@@ -4712,6 +4729,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "is_losing": is_losing,  # v10.34: for WR analysis
             "is_stale_critical": bool(stale_tag),  # v10.35: track stale CRITICAL outcomes
             "post_goal_minutes_since": minute - last_goal_minute if last_goal_minute > 0 else None,  # v10.36
+            # v10.44e: PRE/POST-GOAL classification for ML accuracy
+            "post_goal_tag": (
+                "POST_GOAL" if last_goal_minute > 0 and (minute - last_goal_minute) <= 2
+                else "STALE_POST_GOAL" if last_goal_minute > 0 and (minute - last_goal_minute) <= POST_GOAL_RELEVANCE
+                else "PRE_GOAL"
+            ),
+            "goal_detected_this_poll": bool(_prev_goals is not None and team_goals > _prev_goals),
             "minutes_remaining": 90 - minute,  # v10.28: natural time ceiling for late signals
             # v10.36: Odds data (passive, never influences signal logic)
             "odds_bookmaker": _odds_data.get("bookmaker") if _odds_data else None,
