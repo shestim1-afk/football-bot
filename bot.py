@@ -109,7 +109,7 @@ LOSING_SOT_MIN = 4             # losing teams need SOT >= 4
 # v10.36: Post-goal cooldown — suppress signals after team scores.
 # Stats are inflated by the goal itself (the shot that scored counts as SOT).
 # Without cooldown, bot signals "look at this pressure!" after the goal.
-POST_GOAL_COOLDOWN = 5        # hard suppress for 5 min after scoring
+POST_GOAL_COOLDOWN = 5        # hard suppress for 5 min after scoring (unless new SOT)
 POST_GOAL_RELEVANCE = 20     # 5-20 min: require fresh pressure; 20+: normal logic
 
 # v10.44: Score-state dampener — winning teams generate phantom pressure signals.
@@ -193,7 +193,7 @@ OUTCOMES_FILE = os.path.join(_VOLUME_DIR, "signal_outcomes.jsonl")
 EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.44h-goal-proj-scoreline-fix"
+BOT_VERSION = "v10.44h-post-goal-suppress+scoreline-fix"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -4187,6 +4187,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 "last_possession": 0,
                 "last_goals": (sh if is_home_team else sa) or 0,  # v10.36
                 "last_goal_minute": 0,  # v10.36
+                "sot_at_last_goal": 0,  # v10.44h: SOT snapshot when goal scored
             }
             continue
 
@@ -4367,6 +4368,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     f"clearing signal cooldown for (fid={fid}, tid={tid})"
                 )
 
+        # v10.44h: Read SOT at the time of last goal from previous state.
+        # If no previous goal recorded, sot_at_last_goal stays 0.
+        sot_at_last_goal = _prev_state.get("sot_at_last_goal", 0) if _prev_state else 0
+        # Update sot_at_last_goal when a new goal is detected THIS poll.
+        if _prev_goals is not None and team_goals > _prev_goals:
+            sot_at_last_goal = sot  # snapshot SOT at the moment of the goal
+
         # Store state AFTER classification (for next comparison)
         team_state[(fid, tid)] = {
             "last_sot": sot,
@@ -4380,6 +4388,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "last_possession": possession,
             "last_goals": team_goals,          # v10.36: for post-goal cooldown
             "last_goal_minute": last_goal_minute,  # v10.36: minute of most recent goal
+            "sot_at_last_goal": sot_at_last_goal,  # v10.44h: SOT count when goal was scored
         }
 
         # v10.44f: Update signal cooldown counter.
@@ -4528,44 +4537,52 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # Context: GIL Vicente 2-0 GPS 98 at 46' (just scored), Fulham 2-3 GPS 100 at 56'.
         if last_goal_minute > 0:
             _min_since_goal = minute - last_goal_minute
+            # v10.44h: SOT-since-goal check + pressure check.
+            # SOT alone isn't enough — one lucky toe-poke after a goal isn't pressure.
+            # Require: SOT increased since goal AND (GPS still meaningful OR building).
+            _new_sot_since_goal = sot > sot_at_last_goal
+            _post_goal_pressure = gps >= 60 or accel_count >= 1
+            _post_goal_genuine = _new_sot_since_goal and _post_goal_pressure
+
             if 0 < _min_since_goal <= POST_GOAL_COOLDOWN:
-                # v10.37: SOT>=3 CRITICAL bypasses hard suppress.
-                # 3+ SOT after scoring = sustained dominance, not stat inflation.
-                # (Sabah FA CL Qual: scored 38', SOT=3 GPS=75 IB=80% at 39' — suppressed)
-                if tier == "CRITICAL":
+                if _post_goal_genuine:
+                    # Genuine post-goal pressure — SOT rose AND pressure is real.
+                    _pressure_reason = "GPS "+str(int(gps)) if gps >= 60 else f"accel={accel_count}"
                     stale_tag = (
                         f"\n\u26a0\ufe0f POST-GOAL ACTIVE — scored ~{last_goal_minute}' "
-                        f"({_min_since_goal}m ago) but SOT={sot} proves ongoing dominance"
+                        f"({_min_since_goal}m ago) SOT {sot_at_last_goal}->{sot} ({_pressure_reason})"
                     )
                     log.info(
-                        f"  POST-GOAL PASS: {tname} CRITICAL at {minute}' — "
+                        f"  POST-GOAL PASS: {tname} {tier} at {minute}' — "
                         f"scored ~{last_goal_minute}' ({_min_since_goal}m ago), "
-                        f"SOT={sot} overrides hard cooldown"
+                        f"SOT {sot_at_last_goal}->{sot} + {_pressure_reason} — genuine pressure"
                     )
                 else:
+                    # No new SOT since goal, or SOT rose but no real pressure.
+                    _reason = ""
+                    if not _new_sot_since_goal:
+                        _reason = f"SOT still {sot} (was {sot_at_last_goal} at goal)"
+                    else:
+                        _reason = f"SOT {sot_at_last_goal}->{sot} but GPS={gps:.0f} accel={accel_count} — no real pressure"
                     log.info(
-                        f"  POST-GOAL COOLDOWN: {tname} {tier} at {minute}' — "
-                        f"scored ~{last_goal_minute}' ({_min_since_goal}m ago), "
-                        f"GPS={gps:.0f} SOT={sot} fresh=false — suppressing"
+                        f"  POST-GOAL SUPPRESS: {tname} {tier} at {minute}' — "
+                        f"scored ~{last_goal_minute}' ({_min_since_goal}m ago), {_reason}"
                     )
                     continue
             elif _min_since_goal <= POST_GOAL_RELEVANCE:
-                # After hard cooldown: require evidence of fresh pressure.
-                # If the team scored 10 min ago and nothing new happened, the
-                # existing GPS/SOT reflects the pre-goal buildup, not new danger.
+                # After 5 min: require fresh pressure (SOT rising since last poll OR accel).
                 _prev_sot = (_prev_state.get("last_sot", 0) or 0) if _prev_state else 0
                 _post_goal_fresh = (
-                    sot > _prev_sot             # SOT still rising since last poll
-                    or accel_count >= 1         # any acceleration indicator
+                    _new_sot_since_goal       # SOT increased since the goal itself
+                    or sot > _prev_sot         # SOT still rising since last poll
+                    or accel_count >= 1        # any acceleration indicator
                 )
                 if not _post_goal_fresh:
-                    # Context-aware: CRITICAL tagged (SOT>=3 proves danger exists),
-                    # EW blocked (no SOT proof of ongoing danger).
                     if tier == "CRITICAL":
                         stale_tag = (
                             f"\n\u26a0\ufe0f STALE POST-GOAL — scored ~{last_goal_minute}' "
                             f"({_min_since_goal}m ago) no fresh pressure since "
-                            f"(SOT={sot} vs prev={_prev_sot}, accel={accel_count})"
+                            f"(SOT={sot} vs at-goal={sot_at_last_goal}, prev={_prev_sot}, accel={accel_count})"
                         )
                         log.info(
                             f"  POST-GOAL TAG (not block): {tname} CRITICAL at {minute}' — "
@@ -4575,14 +4592,14 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                         log.info(
                             f"  POST-GOAL BLOCK: {tname} {tier} at {minute}' — "
                             f"scored ~{last_goal_minute}' ({_min_since_goal}m ago), "
-                            f"no fresh pressure (SOT={sot} vs prev={_prev_sot}, accel={accel_count})"
+                            f"no fresh pressure (SOT={sot} vs at-goal={sot_at_last_goal}, prev={_prev_sot})"
                         )
                         continue
                 else:
                     log.info(
                         f"  POST-GOAL PASS: {tname} {tier} at {minute}' — "
                         f"scored ~{last_goal_minute}' ({_min_since_goal}m ago) but fresh pressure "
-                        f"(SOT {sot}>{_prev_sot}, accel={accel_count})"
+                        f"(SOT {sot_at_last_goal}->{sot}, prev={_prev_sot}, accel={accel_count})"
                     )
 
         # v10.13.2: Extended window — allow early signals (16'-20') if SOT-accelerating
