@@ -2764,14 +2764,39 @@ def record_non_signal_fixture(fixture: dict) -> None:
 
 
 def rewrite_outcomes_file() -> None:
-    """v10.11: Rewrite the entire JSONL file with current in-memory state.
+    """v10.11: Rewrite the JSONL file, merging disk entries with in-memory state.
 
-    Called after resolving outcomes to replace pending entries with resolved ones.
-    This prevents duplicate entries (pending + resolved) in the file.
+    v10.44m fix: Previously overwrote with only in-memory data, losing all
+    previous days' signals. Now reads existing file, merges with memory
+    (memory takes priority for same key), and writes everything back.
+    This preserves historical signals across daily EOD rewrites.
     """
     try:
+        # 1. Load existing entries from disk
+        disk_entries = {}
+        if os.path.exists(OUTCOMES_FILE):
+            with open(OUTCOMES_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        key = (obj.get("fixture_id"), obj.get("team_id"), obj.get("signal_time"))
+                        if None not in key:
+                            disk_entries[key] = obj
+                    except Exception:
+                        continue
+
+        # 2. Merge: in-memory entries override disk (they have updated resolution status)
+        for entry in signal_outcomes:
+            key = (entry.get("fixture_id"), entry.get("team_id"), entry.get("signal_time"))
+            if None not in key:
+                disk_entries[key] = entry
+
+        # 3. Write merged result
         with open(OUTCOMES_FILE, "w") as f:
-            for entry in signal_outcomes:
+            for entry in disk_entries.values():
                 f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
         log.warning(f"  Failed to rewrite outcomes file: {e}")
@@ -5249,11 +5274,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             if not is_event_burst:
                 log.info(
                     f"  FRESHNESS HARD STOP: {tname} {tier} at {minute}' — "
-                    f"86'+ blocked (SOT={sot} events_sot={events_sot})"
+                    f"{FRESHNESS_HARD_STOP}'+ blocked (SOT={sot} events_sot={events_sot})"
                 )
                 continue
             log.info(
-                f"  FRESHNESS 86'+ EXCEPTION: {tname} {tier} at {minute}' — "
+                f"  FRESHNESS {FRESHNESS_HARD_STOP}'+ EXCEPTION: {tname} {tier} at {minute}' — "
                 f"event-confirmed SOT burst (stats={stats_sot} events={events_sot})"
             )
 
