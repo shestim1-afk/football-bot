@@ -192,7 +192,7 @@ OUTCOMES_FILE = os.path.join(_VOLUME_DIR, "signal_outcomes.jsonl")
 EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.44f-signal-cooldown"
+BOT_VERSION = "v10.44g-dead-probe-revival"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -5086,6 +5086,43 @@ def check_monitored_stats(
     if dd_revived_count:
         log.info(f"  -> {dd_revived_count} data-dead fixture(s) revived via probe")
 
+    # ================================================================
+    # v10.44g: Process pressure-dead probe results
+    # ================================================================
+    pd_revived_count = 0
+    for fid in probe_api_set:
+        if fid not in dead_fixtures:
+            continue  # only process pressure-dead fixtures here
+        rf = refreshed_fixtures.get(fid)
+        if not rf:
+            continue
+        stats_list = rf.get("statistics", [])
+        best_probe_sot = 0
+        if stats_list:
+            for s in stats_list:
+                for stat in s.get("statistics", []):
+                    if stat.get("type", "") == "Shots on Goal":
+                        val = safe_int(stat.get("value", "0"))
+                        if val > best_probe_sot:
+                            best_probe_sot = val
+        # Revive if SOT has risen from 0 (the death condition)
+        if best_probe_sot >= 1:
+            dead_fixtures.pop(fid, None)
+            pd_revived_count += 1
+            f = find_cached_fixture(fid)
+            fname = (f"{f['teams']['home']['name']} vs {f['teams']['away']['name']}" if f else str(fid))
+            log.info(
+                f"  PRESSURE-DEAD REVIVED: {fname} — SOT now {best_probe_sot} "
+                f"via stats probe (was 0 at death)"
+            )
+        else:
+            # Reset 5-min timer for next probe
+            if fid in dead_fixtures:
+                dh, da, _ = dead_fixtures[fid]
+                dead_fixtures[fid] = (dh, da, now)
+    if pd_revived_count:
+        log.info(f"  -> {pd_revived_count} pressure-dead fixture(s) revived via probe")
+
     # Mark probes as checked (prevents discovery from re-probing)
     for fid in probe_api_set:
         last_stats_check[fid] = now
@@ -5572,7 +5609,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Per-team FIRST_ONLY fix + signal cooldown + 15s polling + PRE/POST-GOAL tagging")
+    log.info(f"Football Bot {BOT_VERSION} — Dead fixture probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -5996,6 +6033,30 @@ def main():
                     if len(dd_probes) >= 3:
                         break
 
+            # v10.44g: Also probe pressure-dead fixtures (both teams SOT=0 at 15'+)
+            # Same piggyback as data-dead: inject into stats batch to check
+            # if SOT has risen since death. The discovery-cached revival check
+            # reads from /fixtures?live=all which has NO stats — so revival
+            # via SOT>=3 never worked. This fixes the Juventus 15'->82' gap.
+            dead_probes = []
+            if dead_fixtures and budget != "STOP":
+                for fid, (dh, da, death_ts) in list(dead_fixtures.items()):
+                    if now - death_ts < 300:
+                        continue
+                    f = find_cached_fixture(fid)
+                    if not f:
+                        dead_fixtures.pop(fid, None)
+                        continue
+                    fixture_minute = safe_int(str(f["fixture"].get("elapsed", 0) or 0))
+                    if fixture_minute > EXTENDED_MAX:
+                        dead_fixtures.pop(fid, None)
+                        continue
+                    dead_probes.append(fid)
+                    if len(dead_probes) >= 3:
+                        break
+            if dead_probes:
+                dd_probe_due = True
+
             if any_stats_due and fast_monitored and budget != "STOP":
                 ordered = sorted(
                     fast_monitored,
@@ -6003,15 +6064,16 @@ def main():
                     reverse=True,
                 )
 
-                # v10.44c: Inject data-dead probes into the stats batch.
+                # v10.44c: Inject data-dead + pressure-dead probes into stats batch.
                 # The /fixtures?ids= call includes statistics (unlike /fixtures?live=all
-                # used by discovery). So we piggyback data-dead fixtures here to check
-                # if the API now has stats for them. Zero extra credits — the batch
+                # used by discovery). So we piggyback dead fixtures here to check
+                # if SOT has risen since death. Zero extra credits — the batch
                 # costs 1 credit regardless of how many IDs (up to 20).
                 # This fixes the broken revival that checked cached fixtures
                 # (from /fixtures?live=all) which never include statistics.
-                if dd_probes and len(ordered) + len(dd_probes) <= BATCH_SIZE_LIMIT:
-                    ordered = ordered + dd_probes
+                all_probes = dd_probes + dead_probes
+                if all_probes and len(ordered) + len(all_probes) <= BATCH_SIZE_LIMIT:
+                    ordered = ordered + all_probes
 
                 # v10.23: ALL monitored fixtures polled together (1 credit/batch).
                 # v10.25: But only when at least one is due (credit gate).
@@ -6033,18 +6095,19 @@ def main():
                     )
                     check_monitored_stats(client, ordered, dd_probes=dd_probes)
             elif dd_probe_due and budget != "STOP":
-                # v10.44c: No monitored fixtures but data-dead probes due.
+                # v10.44c/g: No monitored fixtures but dead probes due.
                 # Probe them standalone (1 credit for the batch).
                 if (quota_remaining is not None
                         and quota_remaining <= 2):
                     log.warning(
-                        "Quota nearly exhausted; skipping data-dead probe."
+                        "Quota nearly exhausted; skipping dead probe."
                     )
                 else:
+                    all_probes = dd_probes + dead_probes
                     log.info(
-                        f"  Stats -> {len(dd_probes)} data-dead probe(s): {dd_probes}"
+                        f"  Stats -> {len(all_probes)} dead probe(s) (data-dead={len(dd_probes)}, pressure-dead={len(dead_probes)}): {all_probes}"
                     )
-                    check_monitored_stats(client, dd_probes, dd_probes=dd_probes)
+                    check_monitored_stats(client, all_probes, dd_probes=all_probes)
             elif fast_monitored and not any_stats_due and budget != "STOP":
                 # v10.25: Log when stats are skipped (credit saving)
                 soonest_due = min(
