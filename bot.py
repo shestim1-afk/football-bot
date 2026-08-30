@@ -194,7 +194,7 @@ EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 ML_BACKUP_SENT_FILE = os.path.join(_VOLUME_DIR, "ml_backup_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.44l-ml-backup"
+BOT_VERSION = "v10.44m-restore"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -3806,6 +3806,140 @@ def send_end_of_day_summary(client: httpx.Client, days: int = 1) -> None:
         log.warning("v10.13: End-of-day Telegram send FAILED")
 
 
+def _restore_from_telegram_file(client: httpx.Client, file_id: str, filename: str) -> int | None:
+    """v10.44m: Download a .jsonl file from Telegram and restore into local data.
+
+    Auto-detects whether it's signals or polls data based on filename and content.
+    Deduplicates by entry ID (fixture_id+team_id+signal_time for signals, ts+fid+tid for polls).
+    Returns number of new entries restored, 0 if all duplicates, None if error.
+    """
+    global signal_outcomes
+
+    # 1. Download file from Telegram
+    try:
+        file_resp = client.post(
+            f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            json={"file_id": file_id},
+            timeout=10.0,
+        )
+        if file_resp.status_code != 200 or not file_resp.json().get("ok"):
+            log.warning(f"/restore: getFile failed for {filename}")
+            return None
+        file_path = file_resp.json().get("result", {}).get("file_path", "")
+        if not file_path:
+            log.warning(f"/restore: no file_path for {filename}")
+            return None
+
+        dl_resp = client.get(
+            f"{TELEGRAM_API}/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}",
+            timeout=30.0,
+        )
+        if dl_resp.status_code != 200:
+            log.warning(f"/restore: download failed for {filename}: {dl_resp.status_code}")
+            return None
+        content = dl_resp.text
+    except Exception as e:
+        log.warning(f"/restore: error downloading {filename}: {e}")
+        return None
+
+    # 2. Parse lines
+    lines = [l.strip() for l in content.strip().split("\n") if l.strip()]
+    if not lines:
+        log.info(f"/restore: {filename} is empty")
+        return 0
+
+    # 3. Detect file type from filename, then from content
+    is_signals = "signals" in filename.lower() or "outcome" in filename.lower()
+    is_polls = "polls" in filename.lower()
+
+    if not is_signals and not is_polls:
+        # Auto-detect from first valid line
+        for line in lines[:3]:
+            try:
+                obj = json.loads(line)
+                if "signal_time" in obj or "outcome_full" in obj or "tier" in obj:
+                    is_signals = True
+                    break
+                elif "ts" in obj and "gps" in obj and "fixture_id" in obj:
+                    is_polls = True
+                    break
+            except Exception:
+                continue
+
+    if not is_signals and not is_polls:
+        log.warning(f"/restore: cannot detect type of {filename}")
+        return None
+
+    # 4. Load existing IDs for dedup
+    existing_ids = set()
+    target_file = OUTCOMES_FILE if is_signals else POLL_DATA_FILE
+
+    if os.path.exists(target_file):
+        with open(target_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if is_signals:
+                        # Dedup key: fixture_id + team_id + signal_time
+                        _key = (obj.get("fixture_id"), obj.get("team_id"), obj.get("signal_time"))
+                    else:
+                        # Dedup key: ts + fixture_id + team_id
+                        _key = (obj.get("ts"), obj.get("fixture_id"), obj.get("team_id"))
+                    existing_ids.add(_key)
+                except Exception:
+                    continue
+
+    # 5. Parse and dedup new entries
+    new_entries = []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+            if is_signals:
+                _key = (obj.get("fixture_id"), obj.get("team_id"), obj.get("signal_time"))
+            else:
+                _key = (obj.get("ts"), obj.get("fixture_id"), obj.get("team_id"))
+            if _key not in existing_ids and None not in _key:
+                new_entries.append(line)
+                existing_ids.add(_key)
+        except Exception:
+            continue
+
+    if not new_entries:
+        log.info(f"/restore: {filename} — 0 new entries (all duplicates)")
+        return 0
+
+    # 6. Append to file
+    try:
+        with open(target_file, "a") as f:
+            for entry in new_entries:
+                f.write(entry + "\n")
+    except Exception as e:
+        log.warning(f"/restore: failed to write to {target_file}: {e}")
+        return None
+
+    # 7. If signals, also load into memory
+    if is_signals:
+        _existing_mem_ids = set()
+        for _e in signal_outcomes:
+            _existing_mem_ids.add((_e.get("fixture_id"), _e.get("team_id"), _e.get("signal_time")))
+        for line in new_entries:
+            try:
+                obj = json.loads(line)
+                _key = (obj.get("fixture_id"), obj.get("team_id"), obj.get("signal_time"))
+                if _key not in _existing_mem_ids:
+                    signal_outcomes.append(obj)
+                    _existing_mem_ids.add(_key)
+            except Exception:
+                continue
+
+    _type_label = "signals" if is_signals else "polls"
+    log.info(f"/restore: {filename} -> {len(new_entries)} new {_type_label} appended to {target_file}")
+    return len(new_entries)
+
+
 def check_telegram_commands(client: httpx.Client) -> None:
     """v10.18: Check for Telegram commands.
 
@@ -3822,8 +3956,11 @@ def check_telegram_commands(client: httpx.Client) -> None:
     /polls    = download pressure_polls.jsonl (all poll data for ML)
     /polls_today = today's poll data only
     /count    = signal/poll counts + ML readiness progress
+    /restore  = upload .jsonl backup file to restore ML data
+    /mlstatus = full ML data status with dates
     /today    = match list (no form/scorers, only if <10 games)
     /matches  = alias for /today
+    Also handles .jsonl document uploads for /restore (auto-detect type, dedup).
     Runs once per main loop iteration (minimal overhead).
     """
     try:
@@ -3852,7 +3989,37 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     )
                 continue
 
-            if text == "/stats":
+            if text == "/help":
+                send_telegram(client,
+                    "\U0001f4cb AVAILABLE COMMANDS\n\n"
+                    "\U0001f4ca SIGNALS & STATS\n"
+                    "/stats \u2014 all-time signal win rate stats\n"
+                    "/stats3d \u2014 stats for past 3 days\n"
+                    "/stats7d \u2014 stats for past 7 days\n"
+                    "/recap \u2014 yesterday's signal results\n\n"
+                    "\U0001f4c4 REPORTS\n"
+                    "/eod \u2014 full EOD report (yesterday)\n"
+                    "/eod3 \u2014 EOD report (past 3 days)\n"
+                    "/eod7 \u2014 EOD report (past 7 days)\n"
+                    "/eodall \u2014 EOD report (all data YTD)\n\n"
+                    "\U0001f4c1 ML DATA\n"
+                    "/count \u2014 signal/poll counts + ML readiness\n"
+                    "/mlstatus \u2014 full ML status with dates covered\n"
+                    "/outcomes \u2014 download signal_outcomes.jsonl\n"
+                    "/polls \u2014 download pressure_polls.jsonl (all)\n"
+                    "/polls_today \u2014 download today's polls only\n"
+                    "/restore \u2014 upload .jsonl file to restore data\n"
+                    "  \u2192 Send any ml_signals_*.jsonl or ml_polls_*.jsonl\n"
+                    "  \u2192 Deduplicates automatically, safe to re-upload\n\n"
+                    "\u26bd MATCHES\n"
+                    "/today or /matches \u2014 today's tracked matches\n\n"
+                    "\u2139\ufe0f AUTO BACKUP\n"
+                    "Bot sends ml_signals_YYYY-MM-DD.jsonl +\n"
+                    "ml_polls_YYYY-MM-DD.jsonl to this chat at EOD.\n"
+                    "After a redeploy, upload those files back with /restore."
+                )
+
+            elif text == "/stats":
                 # First resolve any stale outcomes
                 pending_in_mem = [e for e in signal_outcomes if not e.get("resolved")]
                 if pending_in_mem:
@@ -4096,6 +4263,93 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     f"(combines across redeploys via daily files)"
                 )
                 send_telegram(client, msg)
+
+            elif text == "/restore":
+                send_telegram(client,
+                    "\U0001f4c2 RESTORE ML DATA\n\n"
+                    "Upload a .jsonl backup file as a document:\n"
+                    "  \u2022 ml_signals_YYYY-MM-DD.jsonl \u2192 restores signals\n"
+                    "  \u2022 ml_polls_YYYY-MM-DD.jsonl \u2192 restores polls\n"
+                    "  \u2022 Any other .jsonl \u2192 auto-detected by content\n\n"
+                    "Duplicate entries are skipped automatically.\n"
+                    "After restore, /count and /stats will include restored data.\n\n"
+                    "You can re-upload the same file safely — no doubles."
+                )
+
+            elif text == "/mlstatus":
+                # v10.44m: Full ML data status
+                _total_signals = 0
+                _resolved_signals = 0
+                _total_polls = 0
+                _signal_dates = set()
+                _poll_dates = set()
+                if os.path.exists(OUTCOMES_FILE):
+                    with open(OUTCOMES_FILE, "r") as _f:
+                        for _line in _f:
+                            _total_signals += 1
+                            if '\"resolved\": true' in _line or '\"resolved\":True' in _line:
+                                _resolved_signals += 1
+                            try:
+                                _obj = json.loads(_line)
+                                _ts = _obj.get("signal_time")
+                                if _ts and isinstance(_ts, (int, float)) and _ts > 0:
+                                    _signal_dates.add(datetime.fromtimestamp(_ts, BULGARIA_TZ).strftime("%Y-%m-%d"))
+                            except Exception:
+                                pass
+                if os.path.exists(POLL_DATA_FILE):
+                    with open(POLL_DATA_FILE, "r") as _f:
+                        for _line in _f:
+                            _total_polls += 1
+                            try:
+                                _obj = json.loads(_line)
+                                _ts = _obj.get("ts")
+                                if _ts and isinstance(_ts, (int, float)) and _ts > 0:
+                                    _poll_dates.add(datetime.fromtimestamp(_ts, BULGARIA_TZ).strftime("%Y-%m-%d"))
+                            except Exception:
+                                pass
+                _ml_target = 200
+                _pct = min(_resolved_signals / _ml_target * 100, 100) if _ml_target > 0 else 0
+                _bar_len = 10
+                _filled = int(_pct / 100 * _bar_len)
+                _bar = "#" * _filled + "-" * (_bar_len - _filled)
+                _sig_dates_str = ", ".join(sorted(_signal_dates)) if _signal_dates else "none"
+                _poll_dates_str = ", ".join(sorted(_poll_dates)) if _poll_dates else "none"
+                _backup_date = ""
+                try:
+                    if os.path.exists(ML_BACKUP_SENT_FILE):
+                        with open(ML_BACKUP_SENT_FILE, "r") as _f:
+                            _backup_date = _f.read().strip()
+                except Exception:
+                    pass
+                _msg = (
+                    f"\U0001f4ca ML DATA STATUS\n\n"
+                    f"Signals: {_total_signals} total, {_resolved_signals} resolved\n"
+                    f"Polls: {_total_polls} total\n\n"
+                    f"ML readiness ({_ml_target} resolved):\n"
+                    f"[{_bar}] {_pct:.0f}%\n"
+                    f"Need {max(_ml_target - _resolved_signals, 0)} more\n\n"
+                    f"\U0001f4c5 Signal dates:\n  {_sig_dates_str}\n"
+                    f"\U0001f4c5 Poll dates:\n  {_poll_dates_str}\n"
+                )
+                if _backup_date:
+                    _msg += f"\n\U0001f4e5 Last EOD backup: {_backup_date}"
+                else:
+                    _msg += "\n\U0001f4e5 Last EOD backup: none yet"
+                send_telegram(client, _msg)
+
+            else:
+                # v10.44m: Check if user sent a document (file upload for /restore)
+                _doc = msg.get("document")
+                if _doc:
+                    _filename = _doc.get("file_name", "")
+                    _file_id = _doc.get("file_id", "")
+                    if _filename.endswith(".jsonl") and _file_id:
+                        _restore_ok = _restore_from_telegram_file(client, _file_id, _filename)
+                        if _restore_ok is not None:
+                            if _restore_ok:
+                                send_telegram(client, f"\u2705 Restored {_restore_ok} entry/entries from {_filename}")
+                            else:
+                                send_telegram(client, f"\u26a0\ufe0f File {_filename} contained no new entries (all duplicates or invalid).")
 
             # Acknowledge update to clear from queue
             if update_id:
@@ -6231,7 +6485,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram + /restore file upload")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
