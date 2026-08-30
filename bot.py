@@ -4019,6 +4019,7 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     "\U0001f4cb AVAILABLE COMMANDS\n\n"
                     "\U0001f4ca SIGNALS & STATS\n"
                     "/stats \u2014 all-time signal win rate stats\n"
+                    "/stats_today \u2014 today's signal win rate\n"
                     "/stats3d \u2014 stats for past 3 days\n"
                     "/stats7d \u2014 stats for past 7 days\n"
                     "/recap \u2014 yesterday's signal results\n\n"
@@ -4066,6 +4067,21 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     send_telegram(client, f"No signals in the past 3 days (since {cutoff}).")
                 else:
                     header = f"STATS: PAST 3 DAYS ({cutoff} to today)"
+                    stats_text = header + "\n" + format_outcome_stats(filtered)
+                    send_telegram(client, stats_text)
+
+            elif text == "/stats_today":
+                # Today's stats only
+                pending_in_mem = [e for e in signal_outcomes if not e.get("resolved")]
+                if pending_in_mem:
+                    resolve_stale_outcomes(client)
+                all_entries = load_all_outcomes()
+                today_str = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+                filtered = [e for e in all_entries if e.get("signal_clock", "")[:10] == today_str]
+                if not filtered:
+                    send_telegram(client, f"No signals today ({today_str}).")
+                else:
+                    header = f"STATS: TODAY ({today_str})"
                     stats_text = header + "\n" + format_outcome_stats(filtered)
                     send_telegram(client, stats_text)
 
