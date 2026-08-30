@@ -157,7 +157,7 @@ key_health: list[dict] = []
 rr_index: int = 0  # round-robin counter
 
 # --- v9.5.4: Per-team signal limit tracking ---
-# Key: (fixture_id, team_id) -> {"count": N, "goals_at_last_signal": G, "sot_at_last_signal": S, "last_signal_time": T}
+# Key: (fixture_id, team_id) -> {"count": N, "goals_at_last_signal": G, "sot_at_last_signal": S, "xg_at_last_signal": X, "last_signal_time": T}
 # 1st signal: always sent (SOT >= 3 increased -> CRITICAL, or GPS-based EARLY WARNING)
 # 2nd signal: no explicit SOT-jump gate; classify_signal dedup handles it (+1 SOT suffices)
 # 3rd+ signal: SOT-jump gate from LAST SIGNAL (not last poll):
@@ -4498,29 +4498,44 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 gps, accel_count,
             )
             _sd_sot_d5 = _sd_recency.get("sot_delta_5m") or 0
-            # Fresh = SOT actively rising in last 5 game minutes OR since last poll
-            # accel_count alone is NOT sufficient — it can reflect rates computed
-            # over the full match history, not recent acceleration.
+            # v10.44h: xG escape hatch — research shows xG is the #1 predictor
+            # of incoming goals. If xG has risen since last signal, the team is
+            # creating BETTER chances, even if SOT count is stable.
+            _sd_team_sig = signaled_teams.get((fid, tid))
+            _sd_xg_at_sig = _sd_team_sig.get("xg_at_last_signal", None) if _sd_team_sig else None
+            _sd_xg_rising = False
+            _xg_rise_str = ""
+            if _sd_xg_at_sig is not None and xg_value is not None:
+                _xg_val = safe_float(xg_value) if isinstance(xg_value, str) else xg_value
+                if _xg_val is not None and _xg_val > _sd_xg_at_sig + 0.10:
+                    _sd_xg_rising = True
+                    _xg_rise_str = f"xG {_sd_xg_at_sig:.2f}->{_xg_val:.2f}"
+
+            # Fresh = SOT actively rising in last 5 min OR since last poll
+            # OR xG rising since last signal (quality pressure, research-backed)
             _sd_fresh = (
                 _sd_sot_d5 >= 1
                 or (sot > _sd_prev_sot and _sd_prev_sot > 0)
+                or _sd_xg_rising
             )
             if not _sd_fresh:
+                _xg_info = f"xG={xg_value}" if xg_value else "xG=N/A"
                 log.info(
                     f"  SCORE DAMPENER: {tname} {tier} at {minute}' — "
-                    f"winning {team_goals}-{opp_goals} (+{goal_diff}), no fresh acceleration, suppressing"
-                    f" (SOT_5m=+{_sd_sot_d5}, SOT {sot}->{sot}, accel={accel_count})"
+                    f"winning {team_goals}-{opp_goals} (+{goal_diff}), no fresh pressure, suppressing"
+                    f" (SOT_5m=+{_sd_sot_d5}, SOT {sot}->{sot}, {_xg_info})"
                 )
                 continue
-            # Fresh acceleration present — allow but tag
+            # Fresh pressure present — allow but tag
+            _pass_reason = f"SOT_5m=+{_sd_sot_d5}" if _sd_sot_d5 >= 1 else (
+                f"SOT {_sd_prev_sot}->{sot}" if sot > _sd_prev_sot and _sd_prev_sot > 0 else _xg_rise_str)
             stale_tag += (
                 "\n⚠️ WINNING +" + str(goal_diff) + f" ({team_goals}-{opp_goals}) — "
-                f"fresh accel pass (SOT_5m=+{_sd_sot_d5}, SOT {_sd_prev_sot}->{sot})"
+                f"fresh pressure pass ({_pass_reason})"
             )
             log.info(
                 f"  SCORE DAMPENER PASS: {tname} {tier} at {minute}' — "
-                f"winning {team_goals}-{opp_goals} (+{goal_diff}) but fresh accel "
-                f"(SOT_5m=+{_sd_sot_d5}, SOT {_sd_prev_sot}->{sot})"
+                f"winning {team_goals}-{opp_goals} (+{goal_diff}) but fresh pressure ({_pass_reason})"
             )
         elif goal_diff == 2:
             # +2: allow but tag for monitoring. Future data may justify stricter treatment.
@@ -4858,15 +4873,19 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             else fixture["goals"]["away"]
         ) or 0
         if is_new_team:
+            _xg_float = safe_float(xg_value) if isinstance(xg_value, str) else xg_value
             signaled_teams[(fid, tid)] = {
                 "count": 1, "goals_at_last_signal": goals_now,
-                "sot_at_last_signal": sot, "last_signal_time": time.time(),
+                "sot_at_last_signal": sot, "xg_at_last_signal": _xg_float,
+                "last_signal_time": time.time(),
                 "last_ib_ratio": ib_ratio, "last_gps": gps,
             }
         else:
             signaled_teams[(fid, tid)]["count"] = sig_count + 1
             signaled_teams[(fid, tid)]["goals_at_last_signal"] = goals_now
             signaled_teams[(fid, tid)]["sot_at_last_signal"] = sot
+            _xg_float = safe_float(xg_value) if isinstance(xg_value, str) else xg_value
+            signaled_teams[(fid, tid)]["xg_at_last_signal"] = _xg_float
             signaled_teams[(fid, tid)]["last_signal_time"] = time.time()
             signaled_teams[(fid, tid)]["last_ib_ratio"] = ib_ratio
             signaled_teams[(fid, tid)]["last_gps"] = gps
