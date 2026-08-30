@@ -193,7 +193,7 @@ OUTCOMES_FILE = os.path.join(_VOLUME_DIR, "signal_outcomes.jsonl")
 EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.44g-goal-prediction"
+BOT_VERSION = "v10.44h-goal-proj-scoreline-fix"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -1144,6 +1144,19 @@ def _poisson_over(prob_a: float, prob_b: float, threshold: float) -> float:
     return max(0.0, min(1.0, 1.0 - p_under))
 
 
+def _poisson_over_with_scoreline(prob_a: float, prob_b: float, threshold: float, current_goals: int) -> float:
+    """P(final total > threshold) accounting for goals already scored.
+    
+    The Poisson lambdas model FUTURE goals only.
+    So P(final > X.5) = P(current + future > X.5) = P(future > X.5 - current).
+    If current_goals >= threshold + 1, we're already over → return 1.0.
+    """
+    remaining_needed = threshold - current_goals
+    if remaining_needed < 0:
+        return 1.0  # already over
+    return _poisson_over(prob_a, prob_b, remaining_needed)
+
+
 def compute_goal_predictions(
     minute: int,
     signal_team_xg: float | None,
@@ -1210,18 +1223,34 @@ def compute_goal_predictions(
         proj_xg_opponent *= 0.92
     
     # --- Compute over/under probabilities ---
-    p_over_25 = _poisson_over(proj_xg_signal, proj_xg_opponent, 2.5)
-    p_over_35 = _poisson_over(proj_xg_signal, proj_xg_opponent, 3.5)
-    p_over_45 = _poisson_over(proj_xg_signal, proj_xg_opponent, 4.5)
+    # v10.44h: Account for goals already scored!
+    # Poisson lambdas model FUTURE goals only, so shift threshold by current scoreline.
+    current_total_goals = score_home + score_away
+    p_over_25 = _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, 2.5, current_total_goals)
+    p_over_35 = _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, 3.5, current_total_goals)
+    p_over_45 = _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, 4.5, current_total_goals)
     
-    # --- Expected total goals (sum of projected xG) ---
-    expected_total = proj_xg_signal + proj_xg_opponent
+    # --- Expected total goals: projected future + already scored ---
+    expected_total = proj_xg_signal + proj_xg_opponent + current_total_goals
     
     # --- BTTS probability ---
-    # P(BTTS) = 1 - P(A scores 0) - P(B scores 0) + P(both score 0)
-    p_signal_zero = _poisson_pmf(0, proj_xg_signal)
-    p_opponent_zero = _poisson_pmf(0, proj_xg_opponent)
-    p_btts = 1.0 - p_signal_zero - p_opponent_zero + (p_signal_zero * p_opponent_zero)
+    # v10.44h: Account for goals already scored.
+    # BTTS = both teams score in the FULL match.
+    # If a team already scored, they only need the other to score (at least 1 future goal).
+    # If both already scored → BTTS already happened → 100%.
+    if signal_goals > 0 and opp_goals > 0:
+        p_btts = 1.0  # BTTS already achieved
+    elif signal_goals > 0:
+        # Signal team scored, need opponent to score at least 1 in future
+        p_btts = 1.0 - _poisson_pmf(0, proj_xg_opponent)
+    elif opp_goals > 0:
+        # Opponent scored, need signal team to score at least 1 in future
+        p_btts = 1.0 - _poisson_pmf(0, proj_xg_signal)
+    else:
+        # Neither scored yet: both must score in future
+        p_signal_zero = _poisson_pmf(0, proj_xg_signal)
+        p_opponent_zero = _poisson_pmf(0, proj_xg_opponent)
+        p_btts = 1.0 - p_signal_zero - p_opponent_zero + (p_signal_zero * p_opponent_zero)
     
     return {
         "proj_xg_signal": round(proj_xg_signal, 2),
@@ -1234,6 +1263,7 @@ def compute_goal_predictions(
         "xg_source": "api" if (signal_team_xg is not None and signal_team_xg > 0) else "sot_estimate",
         "time_factor": round(time_factor, 2),
         "goal_diff_at_signal": goal_diff,
+        "current_total_goals": current_total_goals,
     }
 
 
@@ -4906,9 +4936,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             score_away=sa or 0,
             is_home_signal=is_home_sg,
         )
+        _current_goals = (sh or 0) + (sa or 0)
+        _score_note = f" ({_current_goals} scored)" if _current_goals > 0 else ""
         msg += (
             f"\n\n\U0001f4c8 Goal Projection (xG {'from API' if _goal_pred['xg_source'] == 'api' else 'est. from SOT'})"
-            f"\nExp. total: {_goal_pred['expected_total_goals']:.1f} goals"
+            f"\nExp. total: {_goal_pred['expected_total_goals']:.1f} goals{_score_note}"
             f" | O2.5: {_goal_pred['p_over_25']:.0%}"
             f" | O3.5: {_goal_pred['p_over_35']:.0%}"
             f" | O4.5: {_goal_pred['p_over_45']:.0%}"
@@ -5021,6 +5053,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "pred_over_45": _goal_pred["p_over_45"],
             "pred_btts": _goal_pred["p_btts"],
             "pred_xg_source": _goal_pred["xg_source"],
+            "pred_current_total_goals": _goal_pred["current_total_goals"],
             "pred_actual_total_goals": None,  # filled on resolution
         })
         # v10.28: Merge enriched recency fields into signal outcome
@@ -5779,7 +5812,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
