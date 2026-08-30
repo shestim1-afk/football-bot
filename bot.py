@@ -191,9 +191,10 @@ _VOLUME_DIR = os.environ.get("VOLUME_DIR", "/data")
 os.makedirs(_VOLUME_DIR, exist_ok=True)
 OUTCOMES_FILE = os.path.join(_VOLUME_DIR, "signal_outcomes.jsonl")
 EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
+ML_BACKUP_SENT_FILE = os.path.join(_VOLUME_DIR, "ml_backup_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.44k-opp-stats-for-ml"
+BOT_VERSION = "v10.44l-ml-backup"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -2414,6 +2415,22 @@ def do_discovery(client: httpx.Client) -> bool:
                 f"({m['fixture']['status']['short']} {minute}')"
             )
 
+    # v10.44l: Log UNTRACKED live fixtures — catches league ID changes
+    # (e.g. API returns different ID for new season of a tracked league).
+    _untracked_live = [f for f in cached_fixtures if not is_tracked_match(f)
+                       and f["fixture"]["status"]["short"] in ("1H", "2H", "HT")]
+    if _untracked_live:
+        _untracked_leagues = {}
+        for _uf in _untracked_live:
+            _ulid = _uf["league"]["id"]
+            if _ulid not in _untracked_leagues:
+                _untracked_leagues[_ulid] = _uf["league"].get("name", "?")
+        _ut_str = ", ".join(f"{lid}:{name}" for lid, name in sorted(_untracked_leagues.items()))
+        log.info(f"  UNTRACKED live: {len(_untracked_live)} fixture(s) in {len(_untracked_leagues)} league(s): {_ut_str}")
+        for _uf in _untracked_live:
+            _umin = _uf["fixture"]["status"].get("elapsed", "?")
+            log.info(f"    UNTRACKED: {_uf['teams']['home']['name']} vs {_uf['teams']['away']['name']} | league {_uf['league']['id']}:{_uf['league'].get('name','?')} | {_uf['fixture']['status']['short']} {_umin}'")
+
     # v10.44b: Log STATUS-DEAD fixtures — API reports BT/NS but other matches
     # are live, suggesting a status data failure. These are tracked but never
     # reach the signal engine. Logged for experiment coverage analysis.
@@ -2758,6 +2775,99 @@ def rewrite_outcomes_file() -> None:
                 f.write(json.dumps(entry, default=str) + "\n")
     except Exception as e:
         log.warning(f"  Failed to rewrite outcomes file: {e}")
+
+
+def _backup_ml_data(client: httpx.Client) -> None:
+    """v10.44l: Auto-backup ML data files to Telegram at end of day.
+
+    Sends signal_outcomes.jsonl and pressure_polls.jsonl as date-stamped
+    documents. After successful backup, truncates the polls file to prevent
+    unbounded growth (signals file is rewritten daily by existing logic).
+
+    Tracks backup date in ML_BACKUP_SENT_FILE to avoid double-sends on restart.
+    """
+    today_str = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+
+    # Check if already backed up today
+    try:
+        if os.path.exists(ML_BACKUP_SENT_FILE):
+            with open(ML_BACKUP_SENT_FILE, "r") as f:
+                if f.read().strip() == today_str:
+                    return  # Already backed up today
+    except Exception:
+        pass
+
+    _sent_files = []
+    _polls_backup_ok = False
+    _MAX_BYTES = 50 * 1024 * 1024  # Telegram 50MB limit
+
+    # --- Backup signal_outcomes.jsonl ---
+    if os.path.exists(OUTCOMES_FILE) and os.path.getsize(OUTCOMES_FILE) > 0:
+        fsize = os.path.getsize(OUTCOMES_FILE)
+        if fsize <= _MAX_BYTES:
+            try:
+                fname = f"ml_signals_{today_str}.jsonl"
+                with open(OUTCOMES_FILE, "rb") as f:
+                    client.post(
+                        f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                        data={"chat_id": TELEGRAM_CHAT_ID},
+                        files={"document": (fname, f, "application/jsonl")},
+                        timeout=60.0,
+                    )
+                _lines = 0
+                with open(OUTCOMES_FILE, "r") as f:
+                    for _ in f:
+                        _lines += 1
+                _sent_files.append(f"{fname} ({_lines} signals, {fsize / 1024:.1f} KB)")
+            except Exception as e:
+                log.warning(f"ML backup: failed to send signals file: {e}")
+        else:
+            log.warning(f"ML backup: signals file too large ({fsize / 1024 / 1024:.1f} MB)")
+
+    # --- Backup pressure_polls.jsonl ---
+    if os.path.exists(POLL_DATA_FILE) and os.path.getsize(POLL_DATA_FILE) > 0:
+        fsize = os.path.getsize(POLL_DATA_FILE)
+        if fsize <= _MAX_BYTES:
+            try:
+                fname = f"ml_polls_{today_str}.jsonl"
+                with open(POLL_DATA_FILE, "rb") as f:
+                    client.post(
+                        f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                        data={"chat_id": TELEGRAM_CHAT_ID},
+                        files={"document": (fname, f, "application/jsonl")},
+                        timeout=60.0,
+                    )
+                _lines = 0
+                with open(POLL_DATA_FILE, "r") as f:
+                    for _ in f:
+                        _lines += 1
+                _sent_files.append(f"{fname} ({_lines} polls, {fsize / 1024:.1f} KB)")
+                _polls_backup_ok = True
+            except Exception as e:
+                log.warning(f"ML backup: failed to send polls file: {e}")
+        else:
+            log.warning(f"ML backup: polls file too large ({fsize / 1024 / 1024:.1f} MB)")
+
+    # --- Truncate polls file only if its backup succeeded ---
+    if _polls_backup_ok and os.path.exists(POLL_DATA_FILE):
+        try:
+            with open(POLL_DATA_FILE, "w") as f:
+                pass  # Truncate to empty
+            log.info("ML backup: truncated polls file after backup")
+        except Exception as e:
+            log.warning(f"ML backup: failed to truncate polls file: {e}")
+
+    # --- Mark backup as sent & notify ---
+    if _sent_files:
+        try:
+            with open(ML_BACKUP_SENT_FILE, "w") as f:
+                f.write(today_str)
+        except Exception:
+            pass
+        _msg = "📦 ML DATA BACKUP\n\n" + "\n".join(f"  ✅ {f}" for f in _sent_files)
+        _msg += "\n\nSaved to Telegram. Polls file truncated for next day."
+        send_telegram(client, _msg)
+        log.info(f"v10.44l: ML data backup sent: {', '.join(_sent_files)}")
 
 
 def load_all_outcomes() -> list[dict]:
@@ -3940,12 +4050,26 @@ def check_telegram_commands(client: httpx.Client) -> None:
                 _total_signals = 0
                 _resolved_signals = 0
                 _total_polls = 0
+                _first_signal_ts = None
+                _last_signal_ts = None
                 if os.path.exists(OUTCOMES_FILE):
                     with open(OUTCOMES_FILE, "r") as _f:
                         for _line in _f:
                             _total_signals += 1
                             if '"resolved": true' in _line or '"resolved":True' in _line:
                                 _resolved_signals += 1
+                            # Extract timestamp for date range
+                            try:
+                                _obj = json.loads(_line)
+                                _ts = _obj.get("signal_time")
+                                if _ts and isinstance(_ts, (int, float)) and _ts > 0:
+                                    _ts_dt = datetime.fromtimestamp(_ts, BULGARIA_TZ)
+                                    _ts_str = _ts_dt.strftime("%Y-%m-%d %H:%M")
+                                    if _first_signal_ts is None:
+                                        _first_signal_ts = _ts_str
+                                    _last_signal_ts = _ts_str
+                            except Exception:
+                                pass
                 if os.path.exists(POLL_DATA_FILE):
                     with open(POLL_DATA_FILE, "r") as _f:
                         for _ in _f:
@@ -3955,13 +4079,21 @@ def check_telegram_commands(client: httpx.Client) -> None:
                 _bar_len = 10
                 _filled = int(_pct / 100 * _bar_len)
                 _bar = "#" * _filled + "-" * (_bar_len - _filled)
+                _date_range = ""
+                if _first_signal_ts:
+                    _date_range = f"\nData from: {_first_signal_ts}"
+                    if _last_signal_ts and _last_signal_ts != _first_signal_ts:
+                        _date_range += f" to {_last_signal_ts}"
                 msg = (
                     f"📊 ML DATA COUNT\n\n"
-                    f"Signals: {_total_signals} total, {_resolved_signals} resolved\n"
+                    f"Signals: {_total_signals} total, {_resolved_signals} resolved"
+                    f"{_date_range}\n"
                     f"Polls: {_total_polls} total\n\n"
                     f"ML readiness ({_ml_target} resolved signals):\n"
                     f"[{_bar}] {_pct:.0f}%\n"
-                    f"\nNeed {max(_ml_target - _resolved_signals, 0)} more resolved signals"
+                    f"\nNeed {max(_ml_target - _resolved_signals, 0)} more resolved signals\n\n"
+                    f"📦 Daily auto-backup to Telegram at EOD\n"
+                    f"(combines across redeploys via daily files)"
                 )
                 send_telegram(client, msg)
 
@@ -4976,46 +5108,59 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # or (c) v10.44i: PRESSURE BUILDUP — SOT rose ≥3 or xG rose ≥0.50
         #     since last signal (genuinely new danger, not same pressure).
         if sig_count >= 1:
-            _cd_polls = team_cooldown_polls.get((fid, tid), 0)
-            _cd_qualified = _cd_polls >= SIGNAL_COOLDOWN_POLLS
-            # v10.44i: Pressure buildup override
-            _cd_sot_at_sig = team_sig.get("sot_at_last_signal", 0) if team_sig else 0
-            _cd_xg_at_sig = team_sig.get("xg_at_last_signal", None) if team_sig else None
-            _cd_sot_rise = sot - _cd_sot_at_sig
-            _cd_xg_val = safe_float(xg_value) if isinstance(xg_value, str) else xg_value
-            _cd_xg_rise = 0.0
-            if _cd_xg_at_sig is not None and _cd_xg_val is not None:
-                _cd_xg_rise = _cd_xg_val - _cd_xg_at_sig
-            _cd_buildup = _cd_sot_rise >= 3 or _cd_xg_rise >= 0.50
-            if _cd_buildup:
-                _buildup_reason = []
-                if _cd_sot_rise >= 3:
-                    _buildup_reason.append(f"SOT {_cd_sot_at_sig}->{sot}")
-                if _cd_xg_rise >= 0.50:
-                    _buildup_reason.append(f"xG {_cd_xg_at_sig:.2f}->{_cd_xg_val:.2f}")
+            # v10.44l: GOAL RESET — if team scored since last signal,
+            # game state changed completely. Cooldown is irrelevant.
+            _cd_goals_at_sig = team_sig.get("goals_at_last_signal", 0) if team_sig else 0
+            _cd_goals_since = team_goals - _cd_goals_at_sig
+            if _cd_goals_since > 0:
                 log.info(
-                    f"  COOLDOWN BUILDUP PASS: {tname} {tier} at {minute}' — "
-                    f"pressure buildup ({', '.join(_buildup_reason)}) overrides cooldown"
+                    f"  COOLDOWN GOAL RESET: {tname} {tier} at {minute}' — "
+                    f"scored {_cd_goals_since} goal(s) since signal ({_cd_goals_at_sig}->{team_goals}), new game state, bypassing cooldown"
                 )
-                # Don't clear cooldown polls — still track, but allow THIS signal
-            elif not _cd_qualified:
-                log.info(
-                    f"  COOLDOWN BLOCK: {tname} {tier} at {minute}' — "
-                    f"GPS={gps:.0f} SOT={sot} sig#{sig_count}, "
-                    f"pressure never dropped below {SIGNAL_COOLDOWN_GPS_FLOOR} "
-                    f"for {SIGNAL_COOLDOWN_POLLS}+ polls (cd={_cd_polls}) "
-                    f"(fixture {fid})"
-                )
-                continue
+                # Clear cooldown tracking — fresh start
+                if (fid, tid) in team_cooldown_polls:
+                    del team_cooldown_polls[(fid, tid)]
             else:
-                log.info(
-                    f"  COOLDOWN PASS: {tname} {tier} at {minute}' — "
-                    f"RE-QUALIFIED after {SIGNAL_COOLDOWN_POLLS}+ polls below threshold "
-                    f"(GPS dropped and rebuilt to {gps:.0f})"
-                )
-                # Clear cooldown — team is now re-qualified, next repeat
-                # will need another drop-rebuild cycle.
-                del team_cooldown_polls[(fid, tid)]
+                _cd_polls = team_cooldown_polls.get((fid, tid), 0)
+                _cd_qualified = _cd_polls >= SIGNAL_COOLDOWN_POLLS
+                # v10.44i: Pressure buildup override
+                _cd_sot_at_sig = team_sig.get("sot_at_last_signal", 0) if team_sig else 0
+                _cd_xg_at_sig = team_sig.get("xg_at_last_signal", None) if team_sig else None
+                _cd_sot_rise = sot - _cd_sot_at_sig
+                _cd_xg_val = safe_float(xg_value) if isinstance(xg_value, str) else xg_value
+                _cd_xg_rise = 0.0
+                if _cd_xg_at_sig is not None and _cd_xg_val is not None:
+                    _cd_xg_rise = _cd_xg_val - _cd_xg_at_sig
+                _cd_buildup = _cd_sot_rise >= 3 or _cd_xg_rise >= 0.50
+                if _cd_buildup:
+                    _buildup_reason = []
+                    if _cd_sot_rise >= 3:
+                        _buildup_reason.append(f"SOT {_cd_sot_at_sig}->{sot}")
+                    if _cd_xg_rise >= 0.50:
+                        _buildup_reason.append(f"xG {_cd_xg_at_sig:.2f}->{_cd_xg_val:.2f}")
+                    log.info(
+                        f"  COOLDOWN BUILDUP PASS: {tname} {tier} at {minute}' — "
+                        f"pressure buildup ({', '.join(_buildup_reason)}) overrides cooldown"
+                    )
+                    # Don't clear cooldown polls — still track, but allow THIS signal
+                elif not _cd_qualified:
+                    log.info(
+                        f"  COOLDOWN BLOCK: {tname} {tier} at {minute}' — "
+                        f"GPS={gps:.0f} SOT={sot} sig#{sig_count}, "
+                        f"pressure never dropped below {SIGNAL_COOLDOWN_GPS_FLOOR} "
+                        f"for {SIGNAL_COOLDOWN_POLLS}+ polls (cd={_cd_polls}) "
+                        f"(fixture {fid})"
+                    )
+                    continue
+                else:
+                    log.info(
+                        f"  COOLDOWN PASS: {tname} {tier} at {minute}' — "
+                        f"RE-QUALIFIED after {SIGNAL_COOLDOWN_POLLS}+ polls below threshold "
+                        f"(GPS dropped and rebuilt to {gps:.0f})"
+                    )
+                    # Clear cooldown — team is now re-qualified, next repeat
+                    # will need another drop-rebuild cycle.
+                    del team_cooldown_polls[(fid, tid)]
 
         # --- v9.5.8: First-signal-only on busy days ---
         # v10.19.3: Exception override — if pressure is EXPLODING after the 1st signal,
@@ -6086,7 +6231,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -6354,6 +6499,11 @@ def main():
                             log.info("v10.35: EOD report sent via subprocess")
                         except Exception as e:
                             log.warning(f"v10.33: EOD report subprocess failed: {e}")
+                    # v10.44l: Auto-backup ML data to Telegram BEFORE rewrite/clear
+                    try:
+                        _backup_ml_data(client)
+                    except Exception as _e:
+                        log.warning(f"ML data backup failed: {_e}")
                     # v10.19.3: Rewrite file before clearing
                     rewrite_outcomes_file()
                     signal_outcomes.clear()
