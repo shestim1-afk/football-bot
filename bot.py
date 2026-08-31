@@ -2008,14 +2008,12 @@ def cleanup_state(live_fixture_ids: set[int]):
     for fid in list(signaled_fixtures):
         if fid not in live_fixture_ids:
             signaled_fixtures.discard(fid)
-    # v9.5.4: Clean per-team signaled dict
-    for key in list(signaled_teams):
-        if key[0] not in live_fixture_ids:
-            signaled_teams.pop(key, None)
-    # v10.44f: Clean cooldown tracking
-    for key in list(team_cooldown_polls):
-        if key[0] not in live_fixture_ids:
-            del team_cooldown_polls[key]
+    # v9.5.4: signaled_teams cleanup moved to EOD clear.
+    # v10.44s: Do NOT delete signaled_teams/team_cooldown_polls here.
+    # A fixture can momentarily drop from /fixtures?live=all (API glitch,
+    # HT status transition, brief timeout). Deleting these entries causes
+    # sig_num to reset to 1 on the next signal, producing ghost first-signals.
+    # These dicts are small; stale entries are cleared at EOD.
     for fid in list(last_stats_check):
         if fid not in live_fixture_ids:
             del last_stats_check[fid]
@@ -3066,14 +3064,16 @@ def rebuild_signaled_teams_from_file() -> None:
                         existing["last_gps"] = e.get("gps", 0)
                         existing["last_ib_ratio"] = e.get("ib_ratio", 0)
 
-        # Initialize cooldown polls to 0 for all known signaled teams
-        # (they start in cooldown state — pressure hasn't dropped yet)
-        for key in signaled_teams:
-            if key not in team_cooldown_polls:
-                team_cooldown_polls[key] = 0
+        # NOTE: Do NOT initialize team_cooldown_polls here.
+        # Setting it to 0 puts the key in the dict, and the next poll
+        # with GPS >= SIGNAL_COOLDOWN_GPS_FLOOR immediately deletes it
+        # (line 5492), making the team instantly re-qualified.
+        # Instead, leave the key OUT of team_cooldown_polls so the
+        # natural "not yet in cooldown tracking" path (line 5466)
+        # starts tracking only when GPS actually drops below 55.
 
         if signaled_teams:
-            log.info(f"v10.44m: Rebuilt signaled_teams for {len(signaled_teams)} team(s) from file (cooldown restored)")
+            log.info(f"v10.44s: Rebuilt signaled_teams for {len(signaled_teams)} team(s) from file (cooldown deferred)")
     except Exception as e:
         log.warning(f"v10.44m: Failed to rebuild signaled_teams: {e}")
 
@@ -3418,10 +3418,16 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
         log.info(f"  ODDS SKIP: quota low ({quota_remaining}), preserving credits")
         return None
     try:
-        data = api_get(client, "/odds", {"fixture": fixture_id})
+        # v10.44s: /odds/live for in-play odds (better proxy for signal-time market).
+        # Falls back to /odds (pre-match) if live returns empty.
+        data = api_get(client, "/odds/live", {"fixture": fixture_id})
         response = data.get("response", [])
         if not response:
-            log.info(f"  ODDS: no response for fixture {fixture_id}")
+            # v10.44s: fallback to pre-match odds
+            data = api_get(client, "/odds", {"fixture": fixture_id})
+            response = data.get("response", [])
+        if not response:
+            log.info(f"  ODDS: no response for fixture {fixture_id} (live+pre-match)")
             return None
 
         bookmakers = response[0].get("bookmakers", [])
@@ -6991,7 +6997,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live odds (/odds/live) with pre-match fallback + bookmaker discovery")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -7037,6 +7043,24 @@ def main():
 
         # v10.18: Morning recap removed from auto-send. Use /recap or /stats in Telegram.
         log.info("v10.18: Morning recap skipped (command-only now). Use /recap for yesterday's stats.")
+
+        # v10.44s: Discover available odds bookmakers (1 credit, once per startup)
+        if ODDS_CAPTURE_ENABLED:
+            try:
+                _bm_data = api_get(client, "/odds/bookmakers")
+                _bm_list = _bm_data.get("response", [])
+                if _bm_list:
+                    _bm_names = [b.get("name", "?") for b in _bm_list]
+                    log.info(f"ODDS: {_bm_list.__len__()} bookmaker(s) available: {_bm_names}")
+                    _bg_books = [n for n in _bm_names if any(kw in n.lower() for kw in ["efbet", "winbet", "palms", "betbulldog", "sesame", "bwin", "eurobet"])]
+                    if _bg_books:
+                        log.info(f"ODDS: Bulgarian-market bookmaker(s) found: {_bg_books}")
+                    if PREFERRED_BOOKMAKER not in _bm_names:
+                        log.warning(f"ODDS: PREFERRED_BOOKMAKER '{PREFERRED_BOOKMAKER}' not in API list, will use first available")
+                else:
+                    log.info("ODDS: /odds/bookmakers returned empty (endpoint may require higher tier)")
+            except Exception as _bm_e:
+                log.warning(f"ODDS: bookmaker discovery failed: {_bm_e}")
 
         while True:
             now = time.time()
