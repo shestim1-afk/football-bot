@@ -883,6 +883,13 @@ def get_discovery_interval(
 
     # Priority 2: When candidates exist, still check schedule for new waves
     # but also allow a longer interval since stats are already running
+    # v10.44s: If last discovery found untracked live fixtures, retry sooner
+    # for the first few cycles. Catches league ID changes (e.g. 357→172)
+    # or newly added leagues. After 5 retries, give up (league IDs won't
+    # change mid-session). Cost: ~5 extra credits.
+    if _last_untracked_live_count > 0 and _untracked_retry_count <= 5:
+        return 120  # check every 2 min for first 5 retries
+
     if has_candidates:
         sched_interval = get_schedule_based_discovery_interval(budget_mode)
         if sched_interval is not None and sched_interval < 300:
@@ -2465,6 +2472,12 @@ def do_discovery(client: httpx.Client) -> bool:
     # (e.g. API returns different ID for new season of a tracked league).
     _untracked_live = [f for f in cached_fixtures if not is_tracked_match(f)
                        and f["fixture"]["status"]["short"] in ("1H", "2H", "HT")]
+    global _last_untracked_live_count, _untracked_retry_count
+    _last_untracked_live_count = len(_untracked_live)
+    if _last_untracked_live_count > 0:
+        _untracked_retry_count += 1
+    else:
+        _untracked_retry_count = 0
     if _untracked_live:
         _untracked_leagues = {}
         for _uf in _untracked_live:
@@ -3106,6 +3119,8 @@ _goal_detect_ts: dict[int, float] = {}     # fid -> discovery timestamp
 _goal_game_minute: dict[int, int] = {}     # fid -> game minute at detection
 _goal_stats_ts: dict[int, float] = {}      # fid -> first stats poll timestamp after goal
 _goal_stats_recorded: set[int] = set()    # fids where stats_ts has been recorded
+_last_untracked_live_count: int = 0  # v10.44s: untracked live fixtures from last discovery
+_untracked_retry_count: int = 0      # v10.44s: consecutive retries with untracked > 0
 
 
 def fetch_goal_events(client: httpx.Client, fixture_id: int) -> list[dict]:
