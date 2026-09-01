@@ -1148,7 +1148,6 @@ def classify_signal(
         # so genuinely rising teams pass; flat-cumulative teams are blocked.
     if accel_count < 1 and gps < GPS_CRITICAL:
             return None, "", 0.0
-
         last_sot = state["last_sot"] if state else 0
         # For SOT=1: allow if GPS is high (acceleration-driven detection)
         # For SOT=2: allow if GPS is high (replaces v9.9 pressure_building gate)
