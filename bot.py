@@ -254,7 +254,7 @@ EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 ML_BACKUP_SENT_FILE = os.path.join(_VOLUME_DIR, "ml_backup_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.46"
+BOT_VERSION = "v10.48"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -1135,13 +1135,24 @@ def classify_signal(
 
         # SUSTAINED GATE: single-poll acceleration spikes need confirmation.
         # Either: sustained over 2+ polls, OR GPS already at CRITICAL level.
-        if sustained_count < 1 and gps < GPS_CRITICAL:
+    if sustained_count < 1 and gps < GPS_CRITICAL:
+            return None, "", 0.0
+
+        # v10.48: ACCELERATION GATE for EARLY WARNING — EW tier fired at
+        # only 29% full WR (2/7). A static profile (SOT/shots/xG/off-target
+        # rates all flat this poll, accel_count=0) means cumulative drift,
+        # not rising danger — that is exactly the junk EW profile.
+        # Require at least ONE accelerating indicator unless GPS is already
+        # at CRITICAL level (strong enough on its own). Note: a SOT rise of
+        # 1+ within ~6 minutes yields accel_count >= 1 (rate >= 0.15/min),
+        # so genuinely rising teams pass; flat-cumulative teams are blocked.
+    if accel_count < 1 and gps < GPS_CRITICAL:
             return None, "", 0.0
 
         last_sot = state["last_sot"] if state else 0
         # For SOT=1: allow if GPS is high (acceleration-driven detection)
         # For SOT=2: allow if GPS is high (replaces v9.9 pressure_building gate)
-        if sot > last_sot or gps >= GPS_CRITICAL:
+    if sot > last_sot or gps >= GPS_CRITICAL:
             return "EARLY WARNING", trend, sot_rate
 
     return None, "", 0.0
@@ -3314,6 +3325,20 @@ def update_event_fast_lane() -> None:
     global _event_fast_lane_fid
     _best_fid = None
     _best_score = -1
+    # v10.48: GPS 85+ LOCK — when any CORE-window team crosses GPS 85
+    # (the strongest winrate bucket in the outcome data: 5/6 first-signal,
+    # 50% all-signals full WR), that fixture takes the event fast lane
+    # unconditionally. Speed at these moments is the whole game: 10s event
+    # polls catch SOT jumps the stats feed lags on, and the v10.46 180s
+    # min-gap guard already blocks the catch-up re-signals this can surface.
+    _gps85_best = None
+    _gps85_val = -1.0
+    for (fid2, _tid2), sinfo2 in team_state.items():
+        if (sinfo2.get("gps", 0) >= 85
+                and 21 <= sinfo2.get("last_minute", 0) <= 61):
+            if sinfo2.get("gps", 0) > _gps85_val:
+                _gps85_val = sinfo2.get("gps", 0)
+                _gps85_best = fid2
     for (fid, tid), sinfo in team_state.items():
         _gps = sinfo.get("gps", 0)
         _sot = sinfo.get("sot", 0)
@@ -3331,6 +3356,14 @@ def update_event_fast_lane() -> None:
             if _score > _best_score:
                 _best_score = _score
                 _best_fid = fid
+    # v10.48: apply the GPS 85+ lock — overrides the score-based pick
+    if _gps85_best is not None:
+        if _gps85_best != _event_fast_lane_fid:
+            log.info(
+                f"  v10.48: GPS85 FAST-LANE LOCK -> F{_gps85_best} "
+                f"(GPS={_gps85_val:.0f}, best winrate bucket, priority event polling)"
+            )
+        _best_fid = _gps85_best
     if _best_fid != _event_fast_lane_fid:
         if _best_fid is not None:
             log.info(f"  v10.44p: Event fast lane -> F{_best_fid} (score={_best_score:.0f})")
@@ -3354,7 +3387,7 @@ def poll_event_fast_lane(client: httpx.Client) -> None:
         return
     if now - _event_fast_lane_last < EVENT_FAST_LANE_INTERVAL:
         return
-    if _event_fast_lane_credits_today >= 1500:
+    if _event_fast_lane_credits_today >= 2500: # v10.48: raised 1500->2500 (GPS85 lock needs headroom; daily usage ~230/7500)
         return
     if _event_fast_lane_fid not in fast_monitored:
         _event_fast_lane_fid = None
@@ -3485,7 +3518,7 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     if not ODDS_CAPTURE_ENABLED:
         return None
     if quota_remaining is not None and quota_remaining <= 5:
-        log.info(f"  ODDS SKIP: quota low ({quota_remaining}), preserving credits")
+        log.info(" MKT SKIP: quota low, preserving credits")
         return None
     try:
         # v10.44s: /odds/live for in-play odds (better proxy for signal-time market).
@@ -3497,12 +3530,12 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
             data = api_get(client, "/odds", {"fixture": fixture_id})
             response = data.get("response", [])
         if not response:
-            log.info(f"  ODDS: no response for fixture {fixture_id} (live+pre-match)")
+            log.info(" MKT: no response for fixture (live+pre-match)")
             return None
 
         bookmakers = response[0].get("bookmakers", [])
         if not bookmakers:
-            log.info(f"  ODDS: no bookmakers for fixture {fixture_id}")
+            log.info(" MKT: no sources for fixture")
             return None
 
         # Prefer Bet365, fall back to first bookmaker with data
@@ -3577,23 +3610,25 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
                         elif "Draw" in label:
                             result["match_draw_odds"] = round(odd, 2)
 
-        has_odds = result["over_odds"] or result["btts_yes_odds"]
+            has_odds = result["over_odds"] or result["btts_yes_odds"]
         if has_odds:
+            # v10.48: chosen source name NOT logged (chat-safe logs);
+            # still stored in the outcome record as odds_bookmaker.
             log.info(
-                f"  ODDS: F{fixture_id} {result['bookmaker']} — "
+                f"  MKT: F{fixture_id} — "
                 f"O{result['over_line']} @{result['over_odds']} "
                 f"(impl {result['over_implied']}) "
                 f"BTTS @{result['btts_yes_odds']} "
                 f"[{', '.join(result['markets_available'][:5])}]"
             )
         else:
-            log.info(f"  ODDS: no relevant markets for F{fixture_id}")
+            log.info(" MKT: no relevant markets for fixture")
             return None
 
         return result
 
     except Exception as e:
-        log.warning(f"  ODDS FETCH FAILED: fixture {fixture_id}: {e}")
+        log.warning(f" MKT FETCH FAILED: fixture {fixture_id}: {e}")
         return None
 
 
@@ -3974,28 +4009,12 @@ def resolve_stale_outcomes(client: httpx.Client) -> int:
     elif still_pending:
         log.info(f"{len(still_pending)} outcome(s) still pending (fixtures may not be finished yet)")
 
-    return resolved_count
+     return resolved_count
 
 
-def load_all_outcomes() -> list[dict]:
-    """v10.11: Load ALL signal outcomes from JSONL (resolved + unresolved).
-
-    Used for /stats command to show historical win rate.
-    """
-    all_entries = []
-    if not os.path.exists(OUTCOMES_FILE):
-        return all_entries
-    try:
-        with open(OUTCOMES_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                entry = json.loads(line)
-                all_entries.append(entry)
-    except Exception as e:
-        log.warning(f"  Failed to load outcomes file: {e}")
-    return all_entries
+# v10.47: duplicate load_all_outcomes() definition removed (was byte-identical
+# to the v10.19.3 definition near module top — Python silently kept whichever
+# came last, making the other dead code and confusing maintenance).
 
 
 def _format_stats_block(entries: list[dict], label: str) -> list[str]:
@@ -4329,7 +4348,7 @@ def _restore_from_telegram_file(client: httpx.Client, file_id: str, filename: st
         if filename.endswith(".gz"):
             try:
                 raw_bytes = gzip.decompress(raw_bytes)
-                log.info(f"/restore: decompressed {filename} ({dl_resp.content.__len__()} -> {raw_bytes.__len__()} bytes)")
+                log.info(f"/restore: decompressed {filename} ({len(dl_resp.content)} -> {len(raw_bytes)} bytes)")
             except Exception as e:
                 log.warning(f"/restore: failed to decompress {filename}: {e}")
                 return None
@@ -5836,6 +5855,17 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
 
         elif minute >= FRESHNESS_MINUTE:
             # 61-85': require evidence of fresh pressure
+            # v10.48: LATE EW FLOOR — EARLY WARNING at 61'+ fired at only
+            # 29% full WR (2/7). GPS 55-74 pressure is too weak to trust
+            # that late in the game. Late window now requires CRITICAL-level
+            # GPS for the EW tier. Tier quality gate — applies regardless of
+            # whether recency history exists (covers the NODATA path too).
+            if tier == "EARLY WARNING" and gps < GPS_CRITICAL:
+                log.info(
+                    f"  LATE EW FLOOR: {tname} EARLY WARNING GPS={gps:.0f} at {minute}' — "
+                    f"late window requires GPS >= {GPS_CRITICAL} for EW tier, blocking"
+                )
+                continue
             # v10.34: If we don't have enough poll history to compute
             # recency (first/second poll for this team), skip the gate.
             # The gate should only block when history EXISTS and shows staleness.
@@ -5852,10 +5882,17 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
 
             if _has_recency_data:
                 # We HAVE history — enforce freshness
+                                # v10.48: LATE_OVERRIDE TRIAGE — late signals hit at only
+                # 27% full WR (6/22). The old OR-chain let ONE weak indicator
+                # (GPS drifting +0.5, or a single accel tick while SOT sat
+                # flat for 10 minutes) qualify a late signal. Late misses
+                # cluster exactly there: avg GPS 84 but SOT not moving.
+                # v10.48 requires REAL current danger at 61'+:
+                #   - SOT actually rose in the last ~5 game minutes, OR
+                #   - overwhelming current dominance (GPS>=85 + IB>=60%)
+                # GPS-drift-only and accel-tick-only qualifiers are gone.
                 _has_fresh_pressure = (
-                    _sot_d5 >= FRESHNESS_SOT_DELTA           # SOT rising in last ~5 min
-                    or (_gps_chg is not None and _gps_chg >= FRESHNESS_GPS_RISING)  # GPS rising
-                    or accel_count >= FRESHNESS_ACCEL_MIN      # acceleration indicators
+                    _sot_d5 >= FRESHNESS_SOT_DELTA           # SOT rising in last ~5 min (required)
                     or (gps >= 85 and ib_ratio >= 0.60)         # very strong current pressure
                 )
 
@@ -7109,7 +7146,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live odds (/odds/live) with pre-match fallback + bookmaker discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s)")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -7156,27 +7193,30 @@ def main():
         # v10.18: Morning recap removed from auto-send. Use /recap or /stats in Telegram.
         log.info("v10.18: Morning recap skipped (command-only now). Use /recap for yesterday's stats.")
 
-        # v10.44s: Discover available odds bookmakers (1 credit, once per startup)
+                # v10.44s: Discover available market-data sources (1 credit, once per startup)
         if ODDS_CAPTURE_ENABLED:
             try:
                 _bm_data = api_get(client, "/odds/bookmakers")
                 _bm_list = _bm_data.get("response", [])
                 if _bm_list:
-                    # v10.44s-fix: some bookmaker entries have name=null (key present,
+                    # v10.44s-fix: some source entries have name=null (key present,
                     # value None), not just a missing key — .get("name","?") only
                     # covers the missing-key case, so a null value passed straight
                     # through as None and crashed the next line's .lower() call.
+                    # v10.48: source names are NOT logged (chat-safe logs) — count
+                    # and preferred-source availability only. Names still stored
+                    # in outcome data files for offline analysis.
                     _bm_names = [b.get("name") or "?" for b in _bm_list]
-                    log.info(f"ODDS: {len(_bm_list)} bookmaker(s) available: {_bm_names}")
+                    log.info(f"MKT: {len(_bm_names)} data source(s) available")
                     _bg_books = [n for n in _bm_names if n and any(kw in n.lower() for kw in ["efbet", "winbet", "palms", "betbulldog", "sesame", "bwin", "eurobet"])]
                     if _bg_books:
-                        log.info(f"ODDS: Bulgarian-market bookmaker(s) found: {_bg_books}")
+                        log.info(f"MKT: {len(_bg_books)} preferred-region source(s) found")
                     if PREFERRED_BOOKMAKER not in _bm_names:
-                        log.warning(f"ODDS: PREFERRED_BOOKMAKER '{PREFERRED_BOOKMAKER}' not in API list, will use first available")
+                        log.warning("MKT: preferred source not in API list, will use first available")
                 else:
-                    log.info("ODDS: /odds/bookmakers returned empty (endpoint may require higher tier)")
+                    log.info("MKT: source list unavailable (endpoint may require higher tier)")
             except Exception as _bm_e:
-                log.warning(f"ODDS: bookmaker discovery failed: {_bm_e}")
+                log.warning(f"MKT: source discovery failed: {_bm_e}")
 
         while True:
             now = time.time()
@@ -7220,7 +7260,7 @@ def main():
                     if _eod_pending:
                         _pending_fids = set(e["fixture_id"] for e in _eod_pending)
                         log.info(
-                            f"v10.44n: {_eod_pending.__len__()} outcome(s) still pending for "
+                            f"v10.44n: {len(_eod_pending)} outcome(s) still pending for "
                             f"fixture(s) {_pending_fids}. Waiting 90s for API to update, then retrying..."
                         )
                         time.sleep(90)
@@ -7232,7 +7272,7 @@ def main():
                         _eod_pending = [e for e in signal_outcomes if not e.get("resolved")]
                         if _eod_pending:
                             log.warning(
-                                f"v10.44n: {_eod_pending.__len__()} outcome(s) STILL pending after retry. "
+                                f"v10.44n: {len(_eod_pending)} outcome(s) STILL pending after retry. "
                                 f"Will resolve on next startup."
                             )
 
