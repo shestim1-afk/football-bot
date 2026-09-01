@@ -7,12 +7,36 @@ import time
 import gzip
 import io
 import logging
+import httpx
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(stream=sys.stdout)],
+    force=True,
+)
+log = logging.getLogger(__name__)
+
+# v10.19: Suppress httpx INFO logs — Telegram getUpdates fires every 2min
+# during dead hours, flooding logs with useless "HTTP/1.1 200 OK" lines.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # v10.45: ML shadow-scoring — loads a trained model (if present) to compute
 # a second, independent pressure score alongside GPS on every poll.
 # IMPORTANT: this ONLY logs a comparison score. It never gates, blocks, or
 # changes which signals get sent — that stays 100% GPS-controlled for now.
 # Wrapped so any failure (missing package, missing/corrupt model file) just
 # disables ML scoring silently — the bot keeps running exactly as before.
+# MUST come after `log` is defined above — an earlier version of this block
+# sat before the logging setup and crashed the whole bot on any load failure
+# (NameError: name 'log' is not defined), which defeated the entire point
+# of wrapping it in try/except. Fixed here.
 ML_MODEL = None
 ML_FEATURES: list[str] = []
 try:
@@ -50,25 +74,6 @@ def calculate_ml_score(feature_values: dict) -> float | None:
         return None
 
 
-import httpx
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# --- Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(stream=sys.stdout)],
-    force=True,
-)
-log = logging.getLogger(__name__)
-
-# v10.19: Suppress httpx INFO logs — Telegram getUpdates fires every 2min
-# during dead hours, flooding logs with useless "HTTP/1.1 200 OK" lines.
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Config from env ---
 missing = []
