@@ -448,16 +448,16 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                           f"avg RR {avg(group, 'recency_ratio'):.2f} "
                           f"GPS {avg(group, 'gps'):.0f}")
 
-    # --- v10.36: Odds / EV analysis ---
+    # --- v10.36: Market / EV analysis (v10.48: chat-safe wording) ---
     with_odds = [e for e in resolved if e.get("odds_over_odds") is not None]
     if len(with_odds) >= 3:
         lines.append("")
-        lines.append(f"=== ODDS / EV ANALYSIS ({len(with_odds)} signals with odds) ===")
+        lines.append(f"=== MARKET / EV ANALYSIS ({len(with_odds)} signals with market data) ===")
         avg_over = avg(with_odds, "odds_over_odds")
         avg_impl = avg(with_odds, "odds_over_implied")
         hits_odds = [e for e in with_odds if e.get("outcome_full") == "HIT"]
         empirical_wr = len(hits_odds) / len(with_odds) if with_odds else 0
-        lines.append(f"  Avg Over odds: {avg_over:.2f} | Avg implied: {avg_impl:.1%}")
+        lines.append(f" Avg Over price: {avg_over:.2f} | Avg implied: {avg_impl:.1%}")
         lines.append(f"  Empirical full WR: {empirical_wr:.1%}")
         edge = empirical_wr - avg_impl
         lines.append(f"  Edge vs market: {edge:+.1%} ({'+EV' if edge > 0 else '-EV'})")
