@@ -184,6 +184,16 @@ FAST_SOT_WINDOW = 5 * 60  # 300 seconds
 SIGNAL_COOLDOWN_POLLS = 2   # consecutive polls below threshold to re-qualify
 SIGNAL_COOLDOWN_GPS_FLOOR = 55  # GPS_EARLY_WARNING value — below this = pressure broken
 
+# v10.46: Minimum wall-clock gap between signals for the SAME team via the
+# pressure-buildup override. Data (Benfica 46'->47', Athletic Club): when the
+# stats API lags then catches up, SOT/xG can jump +3/+0.50 in ONE poll — the
+# buildup override read that as "genuinely new danger" and re-signaled within
+# a minute. Real pressure buildups take 4+ game minutes to add +3 SOT; API
+# catch-ups land within 1-2 poll cycles (<120s). 180s blocks the fake jumps
+# without delaying genuine escalations. GOAL RESET and COOLDOWN RE-QUALIFY
+# paths are exempt — they already represent real state changes / elapsed time.
+SIGNAL_MIN_GAP_SECONDS = 180
+
 # Max fixture IDs per batched request (API-Football limit for /fixtures?ids=...)
 BATCH_SIZE_LIMIT = 20
 
@@ -244,7 +254,7 @@ EOD_SENT_FILE = os.path.join(_VOLUME_DIR, "eod_sent.txt")
 ML_BACKUP_SENT_FILE = os.path.join(_VOLUME_DIR, "ml_backup_sent.txt")
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.44s"
+BOT_VERSION = "v10.46"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -3230,8 +3240,11 @@ def fetch_top_sot_players(
 ) -> list[tuple[str, int]]:
     """v10.44n: Get top SOT players for a team from /fixtures/events.
 
-    Counts shots with detail=='On target' per player, plus goals (non-own-goal).
-    Returns list of (player_name, sot_count) sorted descending, up to max_players.
+    v10.46 ordering: non-goal-scorers by SOT desc FIRST, then goal-scorers
+    by SOT desc. A player who already scored is less likely to be the NEXT
+    scorer — unconverted SOT is the better "scores next" predictor.
+    Goals still count toward a player's SOT total (a goal IS a shot on target).
+    Returns list of (player_name, sot_count), up to max_players.
     Cached per fixture+team to avoid duplicate API calls.
     Each call costs 1 API credit on first fetch per fixture.
     """
@@ -3243,8 +3256,9 @@ def fetch_top_sot_players(
     try:
         data = api_get(client, "/fixtures/events", {"fixture": fixture_id})
         events = data.get("response", [])
-        # Count SOT per (team_id, player_name)
+        # Count SOT per (team_id, player_name); track goals separately (v10.46)
         _sot_by_team_player: dict[int, dict[str, int]] = {}
+        _goals_by_team_player: dict[int, dict[str, int]] = {}
         for ev in events:
             etype = ev.get("type", "")
             detail = ev.get("detail", "")
@@ -3256,11 +3270,19 @@ def fetch_top_sot_players(
             if is_sot:
                 _sot_by_team_player.setdefault(ev_tid, {})
                 _sot_by_team_player[ev_tid][pname] = _sot_by_team_player[ev_tid].get(pname, 0) + 1
+            if etype == "Goal" and detail != "Own Goal":
+                _goals_by_team_player.setdefault(ev_tid, {})
+                _goals_by_team_player[ev_tid][pname] = _goals_by_team_player[ev_tid].get(pname, 0) + 1
 
         # Cache all teams' data for this fixture
+        # v10.46: non-goal-scorers by SOT desc first, then goal-scorers by SOT desc
         _fixture_data: dict[int, list[tuple[str, int]]] = {}
         for tid, players in _sot_by_team_player.items():
-            _fixture_data[tid] = sorted(players.items(), key=lambda x: (-x[1], x[0]))
+            _goals = _goals_by_team_player.get(tid, {})
+            _fixture_data[tid] = sorted(
+                players.items(),
+                key=lambda x: (1 if _goals.get(x[0], 0) > 0 else 0, -x[1], x[0]),
+            )
         _player_sot_cache[fixture_id] = _fixture_data
 
         # v10.44p: Track latest SOT event minute for latency measurement
@@ -5940,7 +5962,20 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 _cd_xg_rise = 0.0
                 if _cd_xg_at_sig is not None and _cd_xg_val is not None:
                     _cd_xg_rise = _cd_xg_val - _cd_xg_at_sig
-                _cd_buildup = _cd_sot_rise >= 3 or _cd_xg_rise >= 0.50
+                # v10.46: Minimum time gap — a SOT/xG jump arriving <180s after
+                # the last signal is almost always a stats-API catch-up
+                # (lagged stats land in one poll), not a real pressure spell.
+                # Benfica 46'->47' re-signal was exactly this failure mode.
+                _cd_seconds_since = (time.time() - (team_sig.get("last_signal_time", 0) or 0)) if team_sig else 999999
+                _cd_gap_ok = _cd_seconds_since >= SIGNAL_MIN_GAP_SECONDS
+                if (_cd_sot_rise >= 3 or _cd_xg_rise >= 0.50) and not _cd_gap_ok:
+                    log.info(
+                        f"  COOLDOWN BUILDUP GAP BLOCK: {tname} {tier} at {minute}' — "
+                        f"jump (SOT +{_cd_sot_rise}, xG +{_cd_xg_rise:.2f}) arrived "
+                        f"{int(_cd_seconds_since)}s after last signal (<{SIGNAL_MIN_GAP_SECONDS}s) "
+                        f"— stats catch-up, not new pressure"
+                    )
+                _cd_buildup = (_cd_sot_rise >= 3 or _cd_xg_rise >= 0.50) and _cd_gap_ok
                 if _cd_buildup:
                     _buildup_reason = []
                     if _cd_sot_rise >= 3:
@@ -7074,7 +7109,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live odds (/odds/live) with pre-match fallback + bookmaker discovery")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live odds (/odds/live) with pre-match fallback + bookmaker discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s)")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -7132,7 +7167,7 @@ def main():
                     # covers the missing-key case, so a null value passed straight
                     # through as None and crashed the next line's .lower() call.
                     _bm_names = [b.get("name") or "?" for b in _bm_list]
-                    log.info(f"ODDS: {_bm_list.__len__()} bookmaker(s) available: {_bm_names}")
+                    log.info(f"ODDS: {len(_bm_list)} bookmaker(s) available: {_bm_names}")
                     _bg_books = [n for n in _bm_names if n and any(kw in n.lower() for kw in ["efbet", "winbet", "palms", "betbulldog", "sesame", "bwin", "eurobet"])]
                     if _bg_books:
                         log.info(f"ODDS: Bulgarian-market bookmaker(s) found: {_bg_books}")
