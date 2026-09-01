@@ -1135,7 +1135,7 @@ def classify_signal(
 
         # SUSTAINED GATE: single-poll acceleration spikes need confirmation.
         # Either: sustained over 2+ polls, OR GPS already at CRITICAL level.
-    if sustained_count < 1 and gps < GPS_CRITICAL:
+        if sustained_count < 1 and gps < GPS_CRITICAL:
             return None, "", 0.0
 
         # v10.48: ACCELERATION GATE for EARLY WARNING — EW tier fired at
@@ -1146,12 +1146,12 @@ def classify_signal(
         # at CRITICAL level (strong enough on its own). Note: a SOT rise of
         # 1+ within ~6 minutes yields accel_count >= 1 (rate >= 0.15/min),
         # so genuinely rising teams pass; flat-cumulative teams are blocked.
-    if accel_count < 1 and gps < GPS_CRITICAL:
+        if accel_count < 1 and gps < GPS_CRITICAL:
             return None, "", 0.0
         last_sot = state["last_sot"] if state else 0
         # For SOT=1: allow if GPS is high (acceleration-driven detection)
         # For SOT=2: allow if GPS is high (replaces v9.9 pressure_building gate)
-    if sot > last_sot or gps >= GPS_CRITICAL:
+        if sot > last_sot or gps >= GPS_CRITICAL:
             return "EARLY WARNING", trend, sot_rate
 
     return None, "", 0.0
@@ -4008,7 +4008,7 @@ def resolve_stale_outcomes(client: httpx.Client) -> int:
     elif still_pending:
         log.info(f"{len(still_pending)} outcome(s) still pending (fixtures may not be finished yet)")
 
-     return resolved_count
+    return resolved_count
 
 
 # v10.47: duplicate load_all_outcomes() definition removed (was byte-identical
