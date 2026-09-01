@@ -7,6 +7,49 @@ import time
 import gzip
 import io
 import logging
+# v10.45: ML shadow-scoring — loads a trained model (if present) to compute
+# a second, independent pressure score alongside GPS on every poll.
+# IMPORTANT: this ONLY logs a comparison score. It never gates, blocks, or
+# changes which signals get sent — that stays 100% GPS-controlled for now.
+# Wrapped so any failure (missing package, missing/corrupt model file) just
+# disables ML scoring silently — the bot keeps running exactly as before.
+ML_MODEL = None
+ML_FEATURES: list[str] = []
+try:
+    import lightgbm as _lgb
+    import numpy as _np
+    _ML_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goal_predictor_v1.txt")
+    _ML_FEATURES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goal_predictor_v1_features.json")
+    if os.path.exists(_ML_MODEL_PATH) and os.path.exists(_ML_FEATURES_PATH):
+        ML_MODEL = _lgb.Booster(model_file=_ML_MODEL_PATH)
+        with open(_ML_FEATURES_PATH) as _f:
+            ML_FEATURES = json.load(_f)
+        log.info(f"v10.45: ML shadow model loaded ({len(ML_FEATURES)} features) — logging only, not gating signals")
+    else:
+        log.info("v10.45: ML model files not found — ML shadow scoring disabled, GPS-only (no change in behavior)")
+except Exception as _ml_load_err:
+    log.warning(f"v10.45: ML shadow model failed to load ({_ml_load_err}) — GPS-only (no change in behavior)")
+
+
+def calculate_ml_score(feature_values: dict) -> float | None:
+    """v10.45: Score one poll with the trained model. Returns 0-100 (same
+    scale as GPS) or None if the model isn't loaded / a value is missing.
+    Never raises — any error just means no ML score for this poll.
+    """
+    if ML_MODEL is None or not ML_FEATURES:
+        return None
+    try:
+        row = [[
+            float("nan") if feature_values.get(f) is None else float(feature_values.get(f))
+            for f in ML_FEATURES
+        ]]
+        x = _np.array(row)
+        proba = ML_MODEL.predict(x)[0]
+        return round(float(proba) * 100, 1)
+    except Exception:
+        return None
+
+
 import httpx
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -5404,6 +5447,35 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         _prev_state = team_state.get((fid, tid))
         _prev_goals = _prev_state.get("last_goals", None) if _prev_state else None
         last_goal_minute = _prev_state.get("last_goal_minute", 0) if _prev_state else 0
+
+        # v10.45: ML SHADOW SCORE — compute the trained model's independent
+        # opinion on this same poll, purely for logging/comparison. This
+        # NEVER affects which signals get sent — that stays 100% GPS-driven.
+        _ml_ib_ratio = shots_inside_box / total_shots if total_shots > 0 else 0.0
+        _ml_recency = _build_recency_fields(
+            fid, tid, minute, sot, total_shots, shots_inside_box,
+            shots_off_target, xg_value, corners, gps, accel_count,
+        )
+        _ml_minutes_since_goal = (minute - last_goal_minute) if last_goal_minute > 0 else None
+        ml_score = calculate_ml_score({
+            "sot": sot, "total_shots": total_shots, "shots_inside_box": shots_inside_box,
+            "ib_ratio": _ml_ib_ratio, "xg": xg_value, "corners": corners,
+            "gps": gps, "gps_sot": components.get("sot", 0), "gps_ib": components.get("inside_box", 0),
+            "gps_sv": components.get("shot_vol", 0), "gps_xg": components.get("xg", 0),
+            "gps_accel": components.get("acceleration", 0), "accel_count": accel_count,
+            "is_home": is_home_team, "score_diff": team_goals - (sa if is_home_team else sh),
+            "team_score": team_goals, "opp_score": (sa if is_home_team else sh),
+            "sot_delta_5m": _ml_recency.get("sot_delta_5m"), "sot_delta_10m": _ml_recency.get("sot_delta_10m"),
+            "xg_delta_5m": _ml_recency.get("xg_delta_5m"), "shots_delta_5m": _ml_recency.get("shots_delta_5m"),
+            "recency_ratio": _ml_recency.get("recency_ratio"),
+            "opp_sot": _opp_sot_int, "opp_total_shots": _opp_total_shots,
+            "opp_shots_inside_box": _opp_shots_inside_box, "opp_xg": _opp_xg_val,
+            "opp_corners": _opp_corners, "opp_gps": _opp_gps,
+            "last_goal_minute": last_goal_minute if last_goal_minute > 0 else None,
+            "minutes_since_last_goal": _ml_minutes_since_goal, "minute": minute,
+        })
+        if ml_score is not None:
+            log.info(f"  ML SHADOW: {tname} | GPS={gps:.0f} vs ML={ml_score:.0f} (comparison only, not gating)")
 
         if _prev_goals is not None and team_goals > _prev_goals:
             last_goal_minute = minute
