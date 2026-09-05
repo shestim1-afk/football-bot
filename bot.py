@@ -305,7 +305,7 @@ _fl_shadow_count_today: int = 0         # v10.50: daily shadow cap counter (400)
 _fl_shadow_count_date: str | None = None
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.68"
+BOT_VERSION = "v10.70"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -1272,6 +1272,21 @@ def tier_emoji(tier: str) -> str:
 # Source: fbref.com 2024-25 season aggregates.
 GOALS_PER_SOT = 0.31  # ~31% of SOT become goals
 
+# v10.69: PROJECTION SANITY — remaining-share projection + late-game blend.
+# The old math multiplied the observed per-minute rate by a 90/minute
+# time_factor and used the FULL-MATCH projection as the REMAINING-goals
+# lambda: the last 20' were priced as if they were 90' at the observed
+# rate (Elversberg 70' GPS-100 frenzy -> "9.0 goals", actual 7). Now the
+# observed rate is projected over the REMAINING minutes only, blended
+# toward the league average after 70', lifted by a GPS hotness factor for
+# the signaling team, and capped.
+PROJECTION_AVG_TOTAL = 2.7        # league-average full-match goals (both teams)
+PROJECTION_LATE_MINUTE = 70       # blend the observed rate toward the average after this minute
+PROJECTION_LATE_W = 0.55          # weight of the team's own observed rate in the late blend
+PROJECTION_HOTGPS_W = 0.8         # signaling-team hotness add: (gps-50)/50 * W (GPS 100 -> +80%)
+PROJECTION_FUTURE_CAP = 2.0       # per-team cap on the remaining-goals lambda
+PROJECTION_OPP_RATE_FLOOR = 0.25  # opponent rate floor as a share of average (0-SOT teams still score)
+
 # xG projection cap: don't extrapolate beyond 90' even if minute < 20.
 # Below 20', cap at 4.5x (20' is 4.5x of 90-minute game).
 MINUTE_FLOOR = 20
@@ -1321,6 +1336,7 @@ def compute_goal_predictions(
     score_home: int,
     score_away: int,
     is_home_signal: bool,
+    gps: float | None = None,
 ) -> dict:
     """Compute over/under goal probabilities for the full match.
     
@@ -1328,6 +1344,12 @@ def compute_goal_predictions(
     - If xG available: project to 90' from current minute
     - If xG N/A (European comps): estimate xG from SOT * GOALS_PER_SOT
     
+    v10.69: REMAINING-SHARE projection. The lambdas model FUTURE goals:
+    the observed per-minute rate is projected over the REMAINING minutes
+    (not a 90/minute full-match projection misused as the future lambda).
+    After PROJECTION_LATE_MINUTE the rate is blended toward the league
+    average (frenzies cool), the signaling team gets a GPS hotness lift,
+    and each team's lambda is capped at PROJECTION_FUTURE_CAP.
     Returns dict with projected xG, over/under probs, and input features
     for future ML training.
     """
@@ -1342,17 +1364,33 @@ def compute_goal_predictions(
     else:
         est_xg_opponent = opponent_sot * GOALS_PER_SOT
     
-    # --- Project to full 90 minutes ---
+    # --- v10.69: project the observed rate over the REMAINING minutes ---
     # Use effective minute (floor at MINUTE_FLOOR to avoid crazy extrapolation)
     eff_minute = max(minute, MINUTE_FLOOR)
-    time_factor = 90.0 / eff_minute
+    remaining = max(90.0 - eff_minute, 5.0)
     
-    # Cap time factor for very early signals (before 20')
-    if minute < MINUTE_FLOOR:
-        time_factor = 90.0 / MINUTE_FLOOR
+    rate_sig = est_xg_signal / eff_minute
+    rate_opp = est_xg_opponent / eff_minute
+    # v10.69: opponent floor — a 0-SOT opponent is not a 0% scorer forever
+    _avg_rate = (PROJECTION_AVG_TOTAL / 2.0) / 90.0
+    rate_opp = max(rate_opp, PROJECTION_OPP_RATE_FLOOR * _avg_rate)
+    # v10.69: late-game blend toward the league average (frenzies cool)
+    if minute >= PROJECTION_LATE_MINUTE:
+        rate_sig = PROJECTION_LATE_W * rate_sig + (1.0 - PROJECTION_LATE_W) * _avg_rate
+        rate_opp = PROJECTION_LATE_W * rate_opp + (1.0 - PROJECTION_LATE_W) * _avg_rate
     
-    proj_xg_signal = est_xg_signal * time_factor
-    proj_xg_opponent = est_xg_opponent * time_factor
+    proj_xg_signal = rate_sig * remaining
+    proj_xg_opponent = rate_opp * remaining
+    
+    # v10.69: GPS hotness lift for the SIGNALING team (live pressure lifts
+    # its own remaining rate; capped, never applied to the opponent)
+    if gps is not None and gps > 50:
+        _hot = min((gps - 50.0) / 50.0 * PROJECTION_HOTGPS_W, PROJECTION_HOTGPS_W)
+        proj_xg_signal *= (1.0 + _hot)
+    
+    # v10.69: sanity caps (the old math could emit 4+ future goals)
+    proj_xg_signal = min(proj_xg_signal, PROJECTION_FUTURE_CAP)
+    proj_xg_opponent = min(proj_xg_opponent, PROJECTION_FUTURE_CAP)
     
     # Scoreline adjustment: teams that are trailing tend to push harder,
     # teams leading tend to sit back. Small adjustments based on evidence.
@@ -1384,6 +1422,16 @@ def compute_goal_predictions(
     p_over_25 = _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, 2.5, current_total_goals)
     p_over_35 = _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, 3.5, current_total_goals)
     p_over_45 = _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, 4.5, current_total_goals)
+    # v10.69: ADAPTIVE LINES — the next three UNDECIDED over lines.
+    # A 2-2 game shows O4.5/O5.5/O6.5, not the already-decided O2.5/O3.5.
+    # The FIRST entry is always the next-goal line (current total + 0.5) —
+    # the exact market the bot's odds capture prices.
+    _base_line = float(int(current_total_goals)) + 0.5
+    over_lines = [
+        (_base_line, _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, _base_line, current_total_goals)),
+        (_base_line + 1.0, _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, _base_line + 1.0, current_total_goals)),
+        (_base_line + 2.0, _poisson_over_with_scoreline(proj_xg_signal, proj_xg_opponent, _base_line + 2.0, current_total_goals)),
+    ]
     
     # --- Expected total goals: projected future + already scored ---
     expected_total = proj_xg_signal + proj_xg_opponent + current_total_goals
@@ -1414,9 +1462,10 @@ def compute_goal_predictions(
         "p_over_25": round(p_over_25, 2),
         "p_over_35": round(p_over_35, 2),
         "p_over_45": round(p_over_45, 2),
+        "over_lines": [(round(l, 1), round(p, 2)) for l, p in over_lines],
         "p_btts": round(p_btts, 2),
         "xg_source": "api" if (signal_team_xg is not None and signal_team_xg > 0) else "sot_estimate",
-        "time_factor": round(time_factor, 2),
+        "remaining_minutes": round(remaining, 0),
         "goal_diff_at_signal": goal_diff,
         "current_total_goals": current_total_goals,
     }
@@ -4878,6 +4927,10 @@ def _build_top_sot_segment(
                 "(feed lag — recovery pending)"
             )
         if _o == "all_scored":
+            # v10.70 (user rule, FINAL): the Top-SOT line only ever names
+            # players who have NOT scored yet — never a scorer, no
+            # "(scored)" tags. When every listed shooter already scored
+            # the line says exactly that (v10.65 wording).
             return "\n\U0001f3af Top SOT: every listed shooter already scored"
         return ""
     except Exception:
@@ -5313,6 +5366,32 @@ def process_top_sot_retries(client: httpx.Client) -> None:
                     )
                 except Exception as e:
                     log.warning(f"  v10.63 TOP-SOT RECOVERED but send failed: {e}")
+            elif (_last_top_sot_info.get("outcome") == "all_scored"
+                    and (_sot_now is None
+                         or _sot_now <= _last_top_sot_info.get("listed_sot", 0))):
+                # v10.70 (user rule, FINAL): the Top-SOT line only ever
+                # names players who have NOT scored. The feed is CURRENT
+                # (stats SOT fully itemized) and every listed shooter has
+                # already scored, so no retry can produce a non-scorer
+                # line — stop the retry chain QUIETLY (saves the remaining
+                # retry credits; there is no eligible name to send).
+                _top_sot_retry_queue.pop((fid, tid), None)
+                log.info(
+                    f"  v10.70 TOP-SOT RECOVERY (all scored): F{fid} T{tid} — feed "
+                    f"current, every listed shooter scored; no non-scorer line "
+                    f"possible, retries stopped (credit saved)"
+                )
+                _update_sot_feed_census(
+                    f.get("league", {}).get("id"),
+                    f.get("league", {}).get("name", "?"),
+                    "all_scored",
+                    listed_sot=_last_top_sot_info.get("listed_sot", 0),
+                    stats_sot=_sot_now or 0,
+                )
+                # NOTE: when the feed still LAGS stats (_sot_now > listed)
+                # the elif above does not fire — the else branch schedules
+                # the next retry, because the unlisted SOT may belong to a
+                # non-scorer (exactly the name the user wants).
             else:
                 # still empty — schedule the next (and final) attempt
                 entry["retry_at"] = _now + TOP_SOT_RETRY_DELAY
@@ -8900,6 +8979,38 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             league_id=fixture["league"]["id"],
         )
 
+        # v10.69: GOAL-SHOT-FREE SAFETY NET (CSKA Sofia post-mortem, Sep 5:
+        # signal arrived ~just after the goal because the shot that SCORED
+        # was the 3rd SOT). The SOT>=3 safety net now counts only NON-goal
+        # shots: effective = sot - (pending + landed goal shots). When the
+        # goal shot(s) are what crossed the threshold and GPS is not itself
+        # CRITICAL-grade, the candidate is re-classified on the effective
+        # count (GPS path can still fire — real pressure passes it).
+        _goal_shots_total = (
+            min(_pending_goal_sot.get((fid, tid), 0), 2)
+            + _goal_sot_landed.get((fid, tid), 0)
+        )
+        if _goal_shots_total > 0 and sot >= 3 and tier == "CRITICAL":
+            _eff_net = sot - _goal_shots_total
+            if _eff_net < 3 and gps < GPS_CRITICAL:
+                tier, trend, sot_rate = classify_signal(
+                    _eff_net, state, minute, gps=gps, accel_count=accel_count,
+                    inside_box_ratio=ib_ratio, sustained_count=sustained,
+                    league_id=fixture["league"]["id"],
+                )
+                log.info(
+                    f"  v10.69 GOAL-SHOT NET: {tname} {minute}' — SOT={sot} includes "
+                    f"{_goal_shots_total} goal shot(s); effective {_eff_net} < 3, "
+                    f"safety net silent, GPS path decides ({tier or 'no signal'})"
+                )
+                if tier != "CRITICAL":
+                    _track_blocked_candidate(
+                        fid, tid, tname, league, minute, "CRITICAL", "GOAL_SHOT_NET",
+                        gps, sot, ib_ratio, sh, sa, is_home_team, ml_score=ml_score,
+                    )
+                    if tier is None:
+                        continue
+
         # v10.38: Downgrade suspicious SOT>=3 CRITICAL to GPS-based evaluation.
         # If SOT>=3 triggered CRITICAL but the SOT data looks inflated,
         # require GPS>=70 as additional confirmation (same as EARLY WARNING floor
@@ -9304,10 +9415,17 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             elif _min_since_goal <= POST_GOAL_RELEVANCE:
                 # After 5 min: require fresh pressure (SOT rising since last poll OR accel).
                 _prev_sot = (_prev_state.get("last_sot", 0) or 0) if _prev_state else 0
+                # v10.69: the raw `sot > _prev_sot` term counted the goal's
+                # OWN shot when it landed late in the SOT counter (1-6 min
+                # after the score updates) — CSKA Sofia Sep 5: goal ~20',
+                # SOT counter 2->3 at 27' -> "fresh pressure" -> signal
+                # 7 min after the goal. The ledger-adjusted genuine rise is
+                # the only honest freshness evidence.
+                _genuine_rise_20m = genuine_poll_rise_by_team.get(tid, 0)
                 _post_goal_fresh = (
                     _new_sot_since_goal       # SOT increased since the goal itself
-                    or sot > _prev_sot         # SOT still rising since last poll
-                    or accel_count >= 1        # any acceleration indicator
+                    or _genuine_rise_20m > 0  # v10.69: was raw sot > _prev_sot
+                    or accel_count >= 1       # any acceleration indicator
                 )
                 if not _post_goal_fresh:
                     if tier == "CRITICAL":
@@ -9775,7 +9893,17 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         if tier == "EARLY WARNING":
             trigger = f"GPS-TRIGGERED (accel{' sustained' if sustained >= 1 else ''}, IB={ib_ratio:.0%})"
         else:
-            trigger = "SOT>=3 CONFIRMED"
+            # v10.69: label the trigger honestly — "SOT>=3 CONFIRMED" only
+            # when 3+ NON-goal shots are on target (goal-shot ledger
+            # subtracted); a GPS-justified CRITICAL says so.
+            _gs_total = (
+                min(_pending_goal_sot.get((fid, tid), 0), 2)
+                + _goal_sot_landed.get((fid, tid), 0)
+            )
+            if sot - _gs_total >= 3:
+                trigger = "SOT>=3 CONFIRMED"
+            else:
+                trigger = f"GPS>={GPS_CRITICAL:.0f} CONFIRMED"
 
         # v10.49 SPEED FIX: fetch_top_sot_players() moved AFTER send_telegram().
         # It is a live /fixtures/events API round-trip (0.5-2s on cold cache)
@@ -9883,16 +10011,24 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             score_home=sh or 0,
             score_away=sa or 0,
             is_home_signal=is_home_sg,
+            gps=gps,  # v10.69: hotness lift + late-game blend
         )
         _current_goals = (sh or 0) + (sa or 0)
         _score_note = f" ({_current_goals} scored)" if _current_goals > 0 else ""
+        # v10.69: ADAPTIVE LINES — only UNDECIDED over lines are shown. A
+        # 2-2 game displays O4.5/O5.5/O6.5; the decided O2.5/O3.5 "100%"
+        # rows carried zero information. BTTS is hidden once decided.
+        _lines_str = " | ".join(
+            f"O{_l:.1f}: {_p:.0%}" for _l, _p in _goal_pred["over_lines"]
+        )
+        _btts_str = (
+            f"\nBTTS: {_goal_pred['p_btts']:.0%}" if _goal_pred["p_btts"] < 1.0 else ""
+        )
         msg += (
             f"\n\n\U0001f4c8 Goal Projection (xG {'from API' if _goal_pred['xg_source'] == 'api' else 'est. from SOT'})"
             f"\nExp. total: {_goal_pred['expected_total_goals']:.1f} goals{_score_note}"
-            f" | O2.5: {_goal_pred['p_over_25']:.0%}"
-            f" | O3.5: {_goal_pred['p_over_35']:.0%}"
-            f" | O4.5: {_goal_pred['p_over_45']:.0%}"
-            f"\nBTTS: {_goal_pred['p_btts']:.0%}"
+            f" | {_lines_str}"
+            f"{_btts_str}"
         )
 
         # v10.49: signal leaves FIRST — full speed to Telegram.
@@ -10871,7 +11007,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap + v10.68: ODDS CAPTURE HARDENING (signal-time market data made P&L-grade: one 3s retry when the odds fetch fails — 15/26 Sep-4 signals recorded NO odds — plus a suspect-price re-fetch and flag for impossible live prices (over-line implied < 12% before 80') and a live vs pre-match-fallback source tag — the stale pre-match totals prices were the Sep-4 garbage class (over 4.5 @ 23.00 etc.) that inflated the paper P&L by ~1,400 EUR; ~20 extra credits/day, retries quota-guarded, zero signal-logic changes")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap + v10.68: ODDS CAPTURE HARDENING (signal-time market data made P&L-grade: one 3s retry when the odds fetch fails — 15/26 Sep-4 signals recorded NO odds — plus a suspect-price re-fetch and flag for impossible live prices (over-line implied < 12% before 80') and a live vs pre-match-fallback source tag — the stale pre-match totals prices were the Sep-4 garbage class (over 4.5 @ 23.00 etc.) that inflated the paper P&L by ~1,400 EUR; ~20 extra credits/day, retries quota-guarded, zero signal-logic changes + v10.69: PROJECTION SANITY + ADAPTIVE LINES + GOAL-SHOT-FREE FIRST SIGNALS (remaining-goals lambda = observed rate x REMAINING minutes, late blend to league average after 70' + GPS hotness lift and caps — the Elversberg 70' GPS-100 'Exp. total 9.0' projected 4 future goals where 2 landed; the projection block now shows only UNDECIDED over lines — at 2-2 the O2.5/O3.5 '100%' rows were pure noise — and BTTS hides once decided; and the CSKA Sofia post-mortem — the goal's own shot can no longer be the 3rd SOT that triggers a first CRITICAL: the SOT>=3 safety net and the 5-20' post-goal freshness check now run on ledger-genuine goal-shot-free counts, so a signal arriving minutes after the goal it announced is gone) + v10.70: TOP-SOT NON-SCORER ONLY (the 'scores next' line ONLY ever names players who have NOT scored yet — never a scorer, no '(scored)' tags, exactly the user's spec; when every listed shooter has already scored the line says exactly that; the deferred recovery stops quietly once the feed is current and all listed shooters scored — no credits on a line that can never exist — while a still-lagging feed keeps retrying because the unlisted SOT may belong to a non-scorer)")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
