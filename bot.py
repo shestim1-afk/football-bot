@@ -305,7 +305,7 @@ _fl_shadow_count_today: int = 0         # v10.50: daily shadow cap counter (400)
 _fl_shadow_count_date: str | None = None
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.67"
+BOT_VERSION = "v10.68"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -6438,10 +6438,105 @@ def fetch_live_sot_from_events(
 # the signal decision is made, purely for post-hoc profitability analysis.
 ODDS_CAPTURE_ENABLED = os.environ.get("ODDS_CAPTURE_ENABLED", "true").lower() == "true"
 PREFERRED_BOOKMAKER = "Bet365"  # most liquid, widely available
+ODDS_RETRY_DELAY = 3            # v10.68: seconds before the single odds retry
+ODDS_SUSPECT_IMPLIED = 0.12     # v10.68: over price implying <12% = stale/garbage class (real live next-goal prices: 17-90%)
+ODDS_SUSPECT_MINUTE_MAX = 80    # v10.68: signals at/after 80' exempt — dying-minute prices legitimately run high
+
+
+def _parse_signal_odds(data: dict, total_goals: int) -> dict | None:
+    """v10.68: Parse ONE /odds/live (or /odds) response into the capture dict.
+
+    Pure parse — no fetching, no logging (the wrapper owns both), so the
+    same parser serves the initial fetch, the failure retry and the
+    suspect-price re-fetch. Returns None when the response carries no
+    usable bookmaker/markets.
+    """
+    response = data.get("response", []) if isinstance(data, dict) else []
+    if not response:
+        return None
+    bookmakers = response[0].get("bookmakers", []) or []
+    if not bookmakers:
+        return None
+
+    # Prefer Bet365, fall back to first bookmaker with data
+    chosen = None
+    for bm in bookmakers:
+        if bm.get("name") == PREFERRED_BOOKMAKER:
+            chosen = bm
+            break
+    if not chosen:
+        chosen = bookmakers[0]
+
+    bets = chosen.get("bets", []) or []
+    result = {
+        "bookmaker": chosen.get("name", "?"),
+        "total_goals_at_signal": total_goals,
+        "over_line": None,
+        "over_odds": None,
+        "over_implied": None,
+        "btts_yes_odds": None,
+        "btts_implied": None,
+        "match_home_odds": None,
+        "match_away_odds": None,
+        "match_draw_odds": None,
+        "fetched_at": time.time(),
+        "markets_available": [b.get("name", "") for b in bets],
+    }
+
+    # Target: Over (current total + 0.5) goals
+    target_line = total_goals + 0.5
+
+    for bet in bets:
+        bet_name = bet.get("name", "")
+        values = bet.get("values", [])
+
+        # Goals Over/Under
+        if "Over/Under" in bet_name or ("Over" in bet_name and "Under" in bet_name):
+            for v in values:
+                val_str = str(v.get("value", ""))
+                try:
+                    # Parse "Over 2.5" -> 2.5
+                    line_str = val_str.split("Over")[-1].strip()
+                    line = float(line_str)
+                    if abs(line - target_line) < 0.01:
+                        odd = safe_float(str(v.get("odd", "")))
+                        if odd and odd > 1.01:
+                            result["over_line"] = target_line
+                            result["over_odds"] = round(odd, 2)
+                            result["over_implied"] = round(1.0 / odd, 3)
+                except (ValueError, IndexError):
+                    pass
+
+        # Both Teams To Score
+        if "Both Teams" in bet_name or "BTTS" in bet_name:
+            for v in values:
+                if "Yes" in str(v.get("value", "")):
+                    odd = safe_float(str(v.get("odd", "")))
+                    if odd and odd > 1.01:
+                        result["btts_yes_odds"] = round(odd, 2)
+                        result["btts_implied"] = round(1.0 / odd, 3)
+
+        # Match Winner (1X2)
+        if "Match Winner" in bet_name or "1X2" in bet_name or "Result" in bet_name:
+            for v in values:
+                label = str(v.get("value", ""))
+                odd = safe_float(str(v.get("odd", "")))
+                if odd and odd > 1.01:
+                    if "Home" in label:
+                        result["match_home_odds"] = round(odd, 2)
+                    elif "Away" in label:
+                        result["match_away_odds"] = round(odd, 2)
+                    elif "Draw" in label:
+                        result["match_draw_odds"] = round(odd, 2)
+
+    has_odds = result["over_odds"] or result["btts_yes_odds"]
+    if not has_odds:
+        return None
+    return result
 
 
 def fetch_signal_odds(client: httpx.Client, fixture_id: int,
-                      total_goals: int) -> dict | None:
+                      total_goals: int, game_minute: int | None = None) -> dict | None:
     """v10.36: Fetch odds at signal time for EV/ROI analysis.
 
     Captures odds PASSIVELY — the signal decision is already final.
@@ -6452,6 +6547,26 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     - BTTS Yes odds — "will both teams score?"
     - Match Winner odds — market view of match outcome
 
+    v10.68: HARDENED CAPTURE. The Sep 4 audit found two data-quality
+    holes: (a) 15/26 signals recorded NO odds at all (transient fetch
+    failures, never retried); (b) 6/72 recorded prices were impossible
+    for a live next-goal market (over 4.5 @ 23.00, over 6.5 @ 21.00 —
+    real prices there are 4-6; all six 'won', inflating the paper P&L
+    by ~1,400 EUR of phantom profit). Now:
+      - ONE retry (ODDS_RETRY_DELAY s) when the first fetch returns
+        nothing (quota-guarded: skipped at <=5 credits remaining);
+      - SUSPECT-PRICE re-fetch: an over line implying <
+        ODDS_SUSPECT_IMPLIED before ODDS_SUSPECT_MINUTE_MAX triggers
+        one fresh /odds/live call — a sane fresh price REPLACES the
+        suspect one; a confirmed suspect price is KEPT but flagged
+        (odds_suspect=True) so P&L analysis can filter it;
+      - source tagging: 'live' vs 'prematch_fallback' (a live-empty
+        response falls back to pre-match /odds — pre-match totals
+        prices are exactly the stale-high class seen Sep 4);
+      - fetch rounds counted (odds_attempts).
+    Extra cost: ~1 credit per failed-or-suspect signal (~20-25/day =
+    0.3% of the 7,500 quota). Zero signal-logic changes.
+
     Returns dict with odds + implied probabilities, or None on failure.
     """
     if not ODDS_CAPTURE_ENABLED:
@@ -6459,116 +6574,113 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     if quota_remaining is not None and quota_remaining <= 5:
         log.info(" MKT SKIP: quota low, preserving credits")
         return None
-    try:
-        # v10.44s: /odds/live for in-play odds (better proxy for signal-time market).
-        # Falls back to /odds (pre-match) if live returns empty.
-        data = api_get(client, "/odds/live", {"fixture": fixture_id})
-        response = data.get("response", [])
-        if not response:
-            # v10.44s: fallback to pre-match odds
-            data = api_get(client, "/odds", {"fixture": fixture_id})
-            response = data.get("response", [])
-        if not response:
-            log.info(" MKT: no response for fixture (live+pre-match)")
-            return None
 
-        bookmakers = response[0].get("bookmakers", [])
-        if not bookmakers:
-            log.info(" MKT: no sources for fixture")
-            return None
+    attempts = 0
+    result = None
+    source = None
+    fail_reason = "unknown"
 
-        # Prefer Bet365, fall back to first bookmaker with data
-        chosen = None
-        for bm in bookmakers:
-            if bm.get("name") == PREFERRED_BOOKMAKER:
-                chosen = bm
-                break
-        if not chosen:
-            chosen = bookmakers[0]
-
-        bets = chosen.get("bets", [])
-        result = {
-            "bookmaker": chosen.get("name", "?"),
-            "total_goals_at_signal": total_goals,
-            "over_line": None,
-            "over_odds": None,
-            "over_implied": None,
-            "btts_yes_odds": None,
-            "btts_implied": None,
-            "match_home_odds": None,
-            "match_away_odds": None,
-            "match_draw_odds": None,
-            "fetched_at": time.time(),
-            "markets_available": [],
-        }
-        result["markets_available"] = [b.get("name", "") for b in bets]
-
-        # Target: Over (current total + 0.5) goals
-        target_line = total_goals + 0.5
-
-        for bet in bets:
-            bet_name = bet.get("name", "")
-            values = bet.get("values", [])
-
-            # Goals Over/Under
-            if "Over/Under" in bet_name or ("Over" in bet_name and "Under" in bet_name):
-                for v in values:
-                    val_str = str(v.get("value", ""))
-                    try:
-                        # Parse "Over 2.5" -> 2.5
-                        line_str = val_str.split("Over")[-1].strip()
-                        line = float(line_str)
-                        if abs(line - target_line) < 0.01:
-                            odd = safe_float(str(v.get("odd", "")))
-                            if odd and odd > 1.01:
-                                result["over_line"] = target_line
-                                result["over_odds"] = round(odd, 2)
-                                result["over_implied"] = round(1.0 / odd, 3)
-                    except (ValueError, IndexError):
-                        pass
-
-            # Both Teams To Score
-            if "Both Teams" in bet_name or "BTTS" in bet_name:
-                for v in values:
-                    if "Yes" in str(v.get("value", "")):
-                        odd = safe_float(str(v.get("odd", "")))
-                        if odd and odd > 1.01:
-                            result["btts_yes_odds"] = round(odd, 2)
-                            result["btts_implied"] = round(1.0 / odd, 3)
-
-            # Match Winner (1X2)
-            if "Match Winner" in bet_name or "1X2" in bet_name or "Result" in bet_name:
-                for v in values:
-                    label = str(v.get("value", ""))
-                    odd = safe_float(str(v.get("odd", "")))
-                    if odd and odd > 1.01:
-                        if "Home" in label:
-                            result["match_home_odds"] = round(odd, 2)
-                        elif "Away" in label:
-                            result["match_away_odds"] = round(odd, 2)
-                        elif "Draw" in label:
-                            result["match_draw_odds"] = round(odd, 2)
-
-            has_odds = result["over_odds"] or result["btts_yes_odds"]
-        if has_odds:
-            # v10.48: chosen source name NOT logged (chat-safe logs);
-            # still stored in the outcome record as odds_bookmaker.
+    while attempts < 2:
+        attempts += 1
+        try:
+            # v10.44s: /odds/live for in-play odds (better proxy for
+            # signal-time market). Falls back to /odds (pre-match).
+            data = api_get(client, "/odds/live", {"fixture": fixture_id})
+            source = "live"
+            result = _parse_signal_odds(data, total_goals)
+            if result is None:
+                data = api_get(client, "/odds", {"fixture": fixture_id})
+                source = "prematch_fallback"
+                result = _parse_signal_odds(data, total_goals)
+                fail_reason = "no-markets" if result is None else None
+            else:
+                fail_reason = None
+        except Exception as e:
+            fail_reason = f"error: {e}"
+            result = None
+            source = None
+        if result is not None:
+            break
+        # v10.68: single retry — only if the quota still allows it
+        if quota_remaining is not None and quota_remaining <= 5:
+            break
+        if attempts < 2:
             log.info(
-                f"  MKT: F{fixture_id} — "
-                f"O{result['over_line']} @{result['over_odds']} "
-                f"(impl {result['over_implied']}) "
-                f"BTTS @{result['btts_yes_odds']} "
-                f"[{', '.join(result['markets_available'][:5])}]"
+                f" MKT RETRY: F{fixture_id} — no odds on attempt 1 "
+                f"({fail_reason}), one retry in {ODDS_RETRY_DELAY}s"
             )
-        else:
-            log.info(" MKT: no relevant markets for fixture")
-            return None
+            time.sleep(ODDS_RETRY_DELAY)
 
-        return result
-
-    except Exception as e:
-        log.warning(f" MKT FETCH FAILED: fixture {fixture_id}: {e}")
+    if result is None:
+        log.warning(
+            f" MKT FETCH FAILED: fixture {fixture_id} after "
+            f"{attempts} attempt(s) ({fail_reason})"
+        )
         return None
+
+    # v10.68: SUSPECT PRICE check on the over line (the P&L market).
+    # A next-goal line priced implied < 12% before 80' is the stale /
+    # pre-match-leftover class — refetch once for a fresh live price.
+    suspect = False
+    if (
+        result.get("over_implied") is not None
+        and result["over_implied"] < ODDS_SUSPECT_IMPLIED
+        and (game_minute is None or game_minute < ODDS_SUSPECT_MINUTE_MAX)
+    ):
+        suspect = True
+        log.warning(
+            f" MKT SUSPECT: F{fixture_id} — O{result['over_line']} "
+            f"@{result['over_odds']} (impl {result['over_implied']}) at "
+            f"{game_minute}' — impossible for a live next-goal market, "
+            f"refetching"
+        )
+        if quota_remaining is None or quota_remaining > 5:
+            time.sleep(ODDS_RETRY_DELAY)
+            try:
+                attempts += 1
+                fresh_data = api_get(client, "/odds/live", {"fixture": fixture_id})
+                fresh = _parse_signal_odds(fresh_data, total_goals)
+                if fresh is not None and fresh.get("over_odds"):
+                    if (
+                        fresh.get("over_implied") is None
+                        or fresh["over_implied"] >= ODDS_SUSPECT_IMPLIED
+                    ):
+                        log.info(
+                            f" MKT SUSPECT REPLACED: F{fixture_id} — fresh "
+                            f"O{fresh['over_line']} @{fresh['over_odds']} "
+                            f"(impl {fresh['over_implied']}) replaces the "
+                            f"suspect price"
+                        )
+                        result = fresh
+                        source = "live"
+                        suspect = False
+                    else:
+                        log.warning(
+                            f" MKT SUSPECT KEPT: F{fixture_id} — fresh "
+                            f"price also suspect (@{fresh['over_odds']}, "
+                            f"impl {fresh['over_implied']}), keeping + "
+                            f"flagging"
+                        )
+                # fresh parse without an over price: keep the original
+                # suspect price + flag
+            except Exception as e:
+                log.warning(f" MKT SUSPECT REFETCH FAILED: F{fixture_id}: {e}")
+
+    result["odds_source"] = source
+    result["suspect"] = suspect
+    result["attempts"] = attempts
+
+    # v10.48: chosen source name NOT logged (chat-safe logs);
+    # still stored in the outcome record as odds_bookmaker.
+    log.info(
+        f"  MKT: F{fixture_id} — "
+        f"O{result['over_line']} @{result['over_odds']} "
+        f"(impl {result['over_implied']}) "
+        f"BTTS @{result['btts_yes_odds']} "
+        f"[{', '.join(result['markets_available'][:5])}] "
+        f"[{source}{' SUSPECT' if suspect else ''}, {attempts} try]"
+    )
+    return result
 
 
 def resolve_with_goal_events(
@@ -9808,8 +9920,10 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # v10.36: Fetch odds PASSIVELY after signal is sent.
         # Signal decision is already final — odds never influence it.
         # Stored as metadata for future EV/ROI analysis.
+        # v10.68: game_minute passed for the suspect-price exemption
+        # (dying-minute prices legitimately run high).
         _total_goals_now = (sh or 0) + (sa or 0)
-        _odds_data = fetch_signal_odds(client, fid, _total_goals_now)
+        _odds_data = fetch_signal_odds(client, fid, _total_goals_now, game_minute=minute)
 
         # v10.1: Enriched outcome record with all raw indicators
         opp_goals = (sa if is_home_sg else sh)
@@ -9886,6 +10000,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "odds_match_away": _odds_data.get("match_away_odds") if _odds_data else None,
             "odds_match_draw": _odds_data.get("match_draw_odds") if _odds_data else None,
             "odds_fetched_at": _odds_data.get("fetched_at") if _odds_data else None,
+            "odds_source": _odds_data.get("odds_source") if _odds_data else None,  # v10.68: live vs prematch_fallback
+            "odds_suspect": _odds_data.get("suspect") if _odds_data else None,  # v10.68: True = impossible price kept + flagged
+            "odds_attempts": _odds_data.get("attempts") if _odds_data else None,  # v10.68: fetch rounds used
             "odds_markets": _odds_data.get("markets_available") if _odds_data else [],
             "outcome_5min": None,   # v10: expanded windows
             "outcome_10min": None,  # v10: expanded windows
@@ -10754,7 +10871,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap + v10.68: ODDS CAPTURE HARDENING (signal-time market data made P&L-grade: one 3s retry when the odds fetch fails — 15/26 Sep-4 signals recorded NO odds — plus a suspect-price re-fetch and flag for impossible live prices (over-line implied < 12% before 80') and a live vs pre-match-fallback source tag — the stale pre-match totals prices were the Sep-4 garbage class (over 4.5 @ 23.00 etc.) that inflated the paper P&L by ~1,400 EUR; ~20 extra credits/day, retries quota-guarded, zero signal-logic changes")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
