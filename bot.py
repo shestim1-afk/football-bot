@@ -305,7 +305,7 @@ _fl_shadow_count_today: int = 0         # v10.50: daily shadow cap counter (400)
 _fl_shadow_count_date: str | None = None
 
 # --- v10: Bot Version (module-level so all functions can access it) ---
-BOT_VERSION = "v10.66"
+BOT_VERSION = "v10.67"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -2351,6 +2351,12 @@ def cleanup_state(live_fixture_ids: set[int]):
     _coldstart_warmed.difference_update(
         {f for f in _coldstart_warmed if f not in live_fixture_ids}
     )
+    # v10.67: Clean late-retained fixtures that finished (belt and
+    # suspenders — poll_goal_watch self-cleans on non-live status too)
+    global _late_retain_fids
+    for fid in list(_late_retain_fids):
+        if fid not in live_fixture_ids:
+            del _late_retain_fids[fid]
     # v10.54: Clean surge-watch state for finished fixtures
     # (alert records persist in surge_watch.jsonl; only in-flight state resets)
     for _k in list(_surge_seen_sot):
@@ -3291,6 +3297,11 @@ def do_discovery(client: httpx.Client) -> bool:
         if not fixture:
             dropped_notes.append(f"F{fid} (no longer in live feed)")
             continue
+        # v10.67: a fixture dropped here while STILL LIVE and 86-90' (any
+        # prune reason: ceiling / 2-2-signaled / out-of-window) keeps its
+        # events-watch eligibility to the final whistle — the helper's own
+        # gates make this a no-op for every other drop.
+        _retain_late_fixture(fid, fixture, "discovery prune")
         _names = (f"{fixture['teams']['home']['name']} vs "
                   f"{fixture['teams']['away']['name']}")
         _st = fixture["fixture"]["status"]["short"]
@@ -4444,6 +4455,9 @@ SURGE_SOT_GUARD = 60             # wall seconds — flood silenced right after a
 SURGE_MAX_PER_FIXTURE = 5        # max alerts per fixture per day
 SURGE_MAX_PER_DAY = 40           # global daily alert cap (spam safety)
 SURGE_STALENESS_TOL = 5          # event minute this far behind fixture minute = stale
+SURGE_LATE_BONUS = 2             # v10.67: extra per-fixture alert budget for 86'+ retained fixtures
+                                 # (they re-enter the lane only at the end of the game; the base
+                                 # 5 cap is usually already burned by then — Vratsa pattern)
 # v10.44n set (mirrors fetch_goal_events): VAR-disallowed goals must never flash
 _GOAL_DISALLOWED_DETAILS = {
     "Missed Penalty", "Goal Disallowed", "Penalty not awarded",
@@ -4481,6 +4495,25 @@ _surge_flood_minute: dict[tuple, int] = {}     # (fid,tid) -> last shot-flood al
 _surge_fixture_alerts: dict[int, int] = {}     # fid -> alerts sent today
 _surge_alerts_today: int = 0                    # daily alert counter (cap SURGE_MAX_PER_DAY)
 _surge_alerts_date: str | None = None
+
+# v10.67: LATE SURGE — close games stay in the events watch lane to the final whistle.
+# Post-mortem (Botev Vratsa 86'/88' vs Septemvri Sofia + Sep 2-4 live data):
+# 13% of tracked full-window HIT goals land at 86'+, where the bot is
+# structurally BLIND — fixtures leave fast_monitored at the 85' ceiling and
+# BOTH event lanes (10s fast lane + 30s watch lane) select from fast_monitored,
+# so surge alarms / goal flashes die with monitoring at 86' even though goal
+# production itself does not fade (~4-5%/min flat through 85'). Fix: fixtures
+# dropped ONLY because of the minute ceiling are retained in _late_retain_fids
+# and stay eligible for the 30s watch lane (minute 60-90, |score diff| <=
+# GOAL_WATCH_MAX_DIFF re-checked on every poll, top GOAL_WATCH_MAX_FIXTURES
+# with late-retained taking pick priority — minutes left, not half-hours)
+# until FT. The stats lane is NOT re-entered: no stats polls, no signal
+# gates, signal_outcomes untouched — surge stays a warning-only lane.
+# Cost: ~10-16 events polls per retained fixture (1 credit each) inside the
+# existing GOAL_WATCH_CREDIT_CAP budget. Blows out or finishes? The per-poll
+# filters / FT cleanup release the fixture; retention itself costs nothing.
+_late_retain_fids: dict[int, float] = {}  # v10.67: fid -> wall ts when retained
+LATE_RETAIN_MAX = 20                      # safety cap on the retain set (oldest evicted)
 
 
 # v10.44r: Goal-triggered priority polling + latency measurement
@@ -5874,8 +5907,12 @@ def _process_surge_watch(
         return _cur_min is not None and (_cur_min - m) <= SURGE_STALENESS_TOL
 
     def _caps_ok() -> bool:
+        # v10.67: retained 86'+ fixtures get a small alert-budget bonus —
+        # the base 5-per-fixture cap is usually already burned by 85' and
+        # the remaining game lifetime is ~5 minutes (no spam risk).
+        _cap = SURGE_MAX_PER_FIXTURE + (SURGE_LATE_BONUS if fid in _late_retain_fids else 0)
         return (_surge_alerts_today < SURGE_MAX_PER_DAY
-                and _surge_fixture_alerts.get(fid, 0) < SURGE_MAX_PER_FIXTURE)
+                and _surge_fixture_alerts.get(fid, 0) < _cap)
 
     # both teams are always iterated (even with zero events so far) so a
     # fixture that enters the lane quiet gets seeded NOW — its first-ever
@@ -6039,8 +6076,45 @@ def _append_surge_alert(entry: dict) -> None:  # kept for symmetry / future use
         log.warning(f"  v10.54: surge_watch.jsonl append failed: {_e}")
 
 
+def _retain_late_fixture(fid: int, fixture: dict, reason: str) -> None:
+    """v10.67: keep a ceiling-dropped LIVE fixture eligible for the events watch lane.
+
+    Called at every site that removes a fixture from fast_monitored. The
+    helper self-gates — retention happens ONLY when the fixture is still
+    live AND its minute is past the 85' ceiling AND not yet over 90' — so
+    drops for other reasons (finished, 2/2-signaled mid-game, data-dead,
+    minute-before-window) are all no-ops. The watch lane re-checks
+    status/minute/|score diff| on every poll, so a retained blowout simply
+    never gets picked: retention itself costs zero credits.
+    """
+    try:
+        status = fixture["fixture"]["status"]["short"]
+        minute = fixture["fixture"]["status"].get("elapsed", 0) or 0
+    except Exception:
+        return
+    if status not in LIVE_STATUSES:
+        return
+    if minute <= EXTENDED_MAX or minute > 90:
+        return
+    if fid in _late_retain_fids:
+        return
+    while len(_late_retain_fids) >= LATE_RETAIN_MAX:
+        _oldest = min(_late_retain_fids, key=lambda f: _late_retain_fids[f])
+        _late_retain_fids.pop(_oldest, None)
+    _late_retain_fids[fid] = time.time()
+    try:
+        _names = (f"{fixture['teams']['home']['name']} vs "
+                  f"{fixture['teams']['away']['name']}")
+    except Exception:
+        _names = f"F{fid}"
+    log.info(
+        f"  v10.67 LATE-RETAIN: {_names} {minute}' ({reason}) — "
+        f"events watch lane extended to final whistle"
+    )
+
+
 def poll_goal_watch(client: httpx.Client) -> None:
-    """v10.53/v10.54: Poll events for close late-game fixtures not in the fast lane.
+    """v10.53/v10.54/v10.67: Poll events for close late-game fixtures not in the fast lane.
 
     Selection: monitored fixtures, minute GOAL_WATCH_MINUTE..90, |score diff|
     <= GOAL_WATCH_MAX_DIFF, not already fast-lane (those react at ~10s).
@@ -6051,6 +6125,16 @@ def poll_goal_watch(client: httpx.Client) -> None:
     v10.54: this lane now ALSO feeds SURGE WATCH (pre-goal pressure alarms)
     whenever either feature is enabled — one events fetch, two detectors,
     zero extra credits.
+
+    v10.67: LATE SURGE — fixtures retained past the 85' ceiling
+    (_late_retain_fids: close games the stats lane dropped only because of
+    the minute ceiling, e.g. Botev Vratsa 86'/88') stay eligible here until
+    FT. Late-retained fixtures take PICK PRIORITY over normal candidates
+    (they have minutes left; normal ones have half-hours) and self-clean:
+    finished / over-90' fixtures are released from the retain set right
+    here. The per-poll |score diff| filter also releases nothing — a blowout
+    simply stops being picked while it stays retained (a 4-1 that becomes
+    4-3 late still counts as close again).
     """
     global _goal_watch_last, _goal_watch_credits_today, _goal_watch_credits_date, _goal_watch_fids
     if not (_goal_watch_enabled or _surge_watch_enabled):  # v10.54: lane serves both features
@@ -6071,28 +6155,50 @@ def poll_goal_watch(client: httpx.Client) -> None:
             _goal_watch_fids = []
         return
 
+    # v10.67: late-retained fixtures join the candidate pool (dict.fromkeys:
+    # a fixture can be in both sets for one tick while the stats lane drops
+    # it and discovery has not pruned yet)
     picks: list[tuple[int, int]] = []
-    for fid in fast_monitored:
+    late_picks: list[tuple[int, int]] = []  # v10.67: retained 86'+ candidates
+    for fid in dict.fromkeys(list(fast_monitored) + list(_late_retain_fids)):
         if fid in _event_fast_lane_fids:
             continue  # fast lane already flashes these at ~10s
         f = find_cached_fixture(fid)
         if not f:
+            if fid in _late_retain_fids:  # v10.67: cache lost -> release
+                _late_retain_fids.pop(fid, None)
             continue
+        if fid in _late_retain_fids:  # v10.67: self-clean on non-live status
+            _st = ((f.get("fixture", {}) or {}).get("status", {}) or {}).get("short")
+            if _st not in LIVE_STATUSES:
+                _late_retain_fids.pop(fid, None)
+                log.info(f"  v10.67: LATE-RETAIN F{fid} ended ({_st}) — released")
+                continue
         _fxs = f.get("fixture", {}) or {}
         _minute = safe_int(str(((_fxs.get("status", {}) or {}).get("elapsed", 0) or 0)))
         if _minute < GOAL_WATCH_MINUTE or _minute > 90:
+            if fid in _late_retain_fids and _minute > 90:  # v10.67: past 90' -> release
+                _late_retain_fids.pop(fid, None)
             continue
         _gh = f.get("goals", {}) or {}
         _hg = _gh.get("home") or 0
         _ag = _gh.get("away") or 0
         if abs(_hg - _ag) > GOAL_WATCH_MAX_DIFF:
             continue
-        picks.append((get_fixture_best_sot(fid), fid))
+        if fid in _late_retain_fids:
+            late_picks.append((get_fixture_best_sot(fid), fid))
+        else:
+            picks.append((get_fixture_best_sot(fid), fid))
+    late_picks.sort(key=lambda kv: (-kv[0], kv[1]))
     picks.sort(key=lambda kv: (-kv[0], kv[1]))
-    _goal_watch_fids = [fid for _, fid in picks[:GOAL_WATCH_MAX_FIXTURES]]
-    if len(picks) > GOAL_WATCH_MAX_FIXTURES:
+    # v10.67: late-retained first (minutes left), then normal candidates
+    _goal_watch_fids = [fid for _, fid in (late_picks + picks)[:GOAL_WATCH_MAX_FIXTURES]]
+    if len(late_picks) + len(picks) > GOAL_WATCH_MAX_FIXTURES:
+        _late_note = (f", incl. {len(late_picks)} late-retained 86'+ (priority)"
+                      if late_picks else "")
         log.info(
-            f"  v10.53: Goal watch -> top {GOAL_WATCH_MAX_FIXTURES} of {len(picks)} close games"
+            f"  v10.53: Goal watch -> top {GOAL_WATCH_MAX_FIXTURES} of "
+            f"{len(late_picks) + len(picks)} close games{_late_note}"
         )
 
     for fid in list(_goal_watch_fids):
@@ -8061,6 +8167,8 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     "second-goal early watch.\n"
                     "Close games from 60'+, checked every ~30s. Zero extra API "
                     "credits \u2014 rides the same event polls as goal watch.\n"
+                    "v10.67: close games now watched TO THE FINAL WHISTLE \u2014 "
+                    "86-90' pressure included (Botev Vratsa 86'/88' class).\n"
                     "These are WATCH alerts, not betting signals."
                 ))
 
@@ -8303,6 +8411,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
     if minute > hard_max:
         fast_monitored.discard(fid)
         expire_fast_sot(fid)
+        _retain_late_fixture(fid, fixture, "stats-lane ceiling")  # v10.67: events watch to FT
         # Clean up event extension when fixture exits
         event_extended_fixtures.discard(fid)
         _event_sot_cache.pop(fid, None)
@@ -10020,6 +10129,7 @@ def check_monitored_stats(
         if not is_fixture_monitorable(fixture):
             fast_monitored.discard(fid)
             expire_fast_sot(fid)
+            _retain_late_fixture(fid, fixture, "monitorable pre-filter")  # v10.67
             continue
         valid_ids.append(fid)
 
@@ -10644,7 +10754,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes)")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -10656,6 +10766,7 @@ def main():
     log.info("v10.64: startup crash hotfix — v10.63 crash-looped (len() of an int) when every pending outcome sat on a live fixture at restart; fixed, all v10.63 behavior now reachable")
     log.info("v10.65: TOP-SOT line embedded in signals + never-silent notes + per-league shot-event feed census (/sotfeed); recovery 3x60s, skipped for NO DATA leagues")
     log.info("v10.66: event-minute correction — live-resolved outcomes re-verified against true FT goal-event minutes (OUTCOME CORRECTED / OUTCOME HELD lines; zero extra credits)")
+    log.info("v10.67: LATE SURGE — close games retained in the events watch lane to the final whistle (LATE-RETAIN lines; surge alarms live 86-90'; zero gate changes)")
     log.info(f"GPS: SOT+IB+ShotVol+xG+BC+Corners+Accel | Adaptive xG for domestic/European")
     log.info(f"Active: DYNAMIC from schedule (fallback {ACTIVE_HOUR_START_FALLBACK}:00-{ACTIVE_HOUR_END_FALLBACK}:00)")
     log.info(f"Team cache: {len(known_league_team_ids)} IDs")
@@ -11200,7 +11311,10 @@ def main():
             now = time.time()
 
             # v10.44p: Event fast lane — update target and poll if due
-            if fast_monitored and budget not in ("STOP", "EMERGENCY"):
+            # v10.67: gate widened — late-retained fixtures keep the event
+            # lanes alive after fast_monitored empties at the 85' ceiling
+            # (end-of-slate scenario: all games 86'+, watch lane must run)
+            if (fast_monitored or _late_retain_fids) and budget not in ("STOP", "EMERGENCY"):
                 update_event_fast_lane()
                 poll_event_fast_lane(client)
                 poll_goal_watch(client)  # v10.53: goal flash alerts (~30s lane)
