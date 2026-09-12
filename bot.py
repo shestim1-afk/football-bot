@@ -175,6 +175,44 @@ MINUTE_ARCHIVE_LEN = 18        # 1-per-game-minute snapshots (>= 10m lookback)
 # 10-minute anti-stack dedup — no Telegram alert when a real signal
 # or live burst alert spoke for the fixture in the last 10m, the
 # shadow record is still written and graded
+# v10.93: LIVE-ODDS TRUTH — the 309-signal export verdict (Aug 30-Sep 11):
+# 189/309 prematch_fallback, 120/309 no odds, ZERO live prices — yet the
+# code has called /odds/live first on every signal since v10.44s. The
+# live-empty response was swallowed silently: no reason recorded, ever.
+# Three additions, ZERO signal-path credit change (diagnostics reuse the
+# response already fetched):
+#   1. odds_live_diag — when /odds/live yields nothing, the raw
+#      results/errors fields land in the ledger record. api-sports answers
+#      a plan-gated or coverage-empty live query with response[] empty +
+#      errors populated — one field finally tells plan-gate vs coverage
+#      from the user's own nightly data (the Sep-4 audit never saw this).
+#   2. Multi-book live capture — live responses now parse EVERY bookmaker
+#      for the Over(total+0.5) line: odds_live_books, odds_over_best,
+#      odds_over_best_book ride the record; the Telegram BET block shows
+#      the best live price when it beats the primary book. Prematch
+#      fallback keeps single-book behavior (display ref, never P&L grade).
+#   3. --odds-test self-test mode: `python bot_v10.93.py --odds-test`
+#      pulls the live board and calls /odds/live on up to 10 fixtures
+#      (~11 credits), printing bookmaker/market tables + a VERDICT that
+#      settles the feed question in one primetime run.
+# v10.92: DUP-SAME-MINUTE GUARD — Marseille 33' post-mortem (Sep 11):
+# the same fixture was evaluated twice inside one poll batch 1s apart;
+# each pass incremented the cooldown tracker, so the team was
+# "re-qualified" (cd_polls 1->2) within one second and a duplicate
+# signal fired — the user bet it twice, lost twice. Fix: a repeat
+# signal inside SIGNAL_MIN_GAP_SECONDS (180s) of the last one, without
+# a goal reset, is NEVER new information (the bot's own v10.46 verdict
+# on catch-up stats) — hard block, logged as DUP_SAME_MINUTE candidate
+# so the class grades itself in the blocked ledger. Genuine repeats
+# are unaffected: goal reset bypasses cooldown, buildup needs the gap
+# anyway, and a real drop-rebuild takes 2+ separate polls.
+# v10.91: BET FLAG — minute-based BET / NO-BET tag on every alert.
+# Evidence (goal-after-signal settlement, ledger Sep 6-11, n=105 in
+# range): 20-49' = 62W-21L (75%, break-even 1.34) vs 50'+ = 22W-33L
+# (40%, needs 2.50 — no real next-goal price gets there). The tag is
+# DISPLAY + LEDGER ONLY — never a gate: late alerts still fire and
+# still grade, the user just gets the staking flag on the message
+# and a bet_flag column in the export to settle the two classes.
 # v10.89: RED-AWARE LOSING RELAXATION — trailing by <= 1 while the
 # opponent is down a NET man passes the losing filter at STANDARD tier
 # bars (Slavia 1-0 Lens class), tagged in message + ledger (red_relax)
@@ -523,7 +561,7 @@ _goalburst_count_date: str | None = None
 # startup (banners were hardcoded per-feature strings), so a fresh
 # deploy could not be verified from logs until the first signal carried
 # its [v10.xx] tag. One f-string line fixes it for every future bump.
-BOT_VERSION = "v10.90"
+BOT_VERSION = "v10.93"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -8565,13 +8603,21 @@ ODDS_SUSPECT_IMPLIED = 0.12     # v10.68: over price implying <12% = stale/garba
 ODDS_SUSPECT_MINUTE_MAX = 80    # v10.68: signals at/after 80' exempt — dying-minute prices legitimately run high
 
 
-def _parse_signal_odds(data: dict, total_goals: int) -> dict | None:
+def _parse_signal_odds(data: dict, total_goals: int,
+                        multi_book: bool = False) -> dict | None:
     """v10.68: Parse ONE /odds/live (or /odds) response into the capture dict.
 
     Pure parse — no fetching, no logging (the wrapper owns both), so the
     same parser serves the initial fetch, the failure retry and the
     suspect-price re-fetch. Returns None when the response carries no
     usable bookmaker/markets.
+
+    v10.93: multi_book=True (LIVE responses only) additionally parses
+    EVERY bookmaker's Over(total+0.5) price -> live_books list +
+    over_best/over_best_book (the line-shop numbers for the ledger and
+    the Telegram BET block). The prematch fallback path stays
+    single-book: pre-match refs are display-only, never P&L grade, so
+    the extra parse there is pure waste.
     """
     response = data.get("response", []) if isinstance(data, dict) else []
     if not response:
@@ -8679,7 +8725,71 @@ def _parse_signal_odds(data: dict, total_goals: int) -> dict | None:
     has_odds = result["over_odds"] or result["btts_yes_odds"]
     if not has_odds:
         return None
+
+    # v10.93: MULTI-BOOK line-shop capture (live responses only). The
+    # O/U-name guard mirrors the single-book parse above — Cards/Corners/
+    # halves bet names also contain "Over"+"Under" and MUST NOT pollute
+    # the next-goal price (the v10.80 contamination class).
+    if multi_book:
+        live_books = []
+        for bm in bookmakers:
+            bm_name = str(bm.get("name", "?"))
+            for bet in bm.get("bets", []) or []:
+                bet_name = bet.get("name", "")
+                if not (
+                    ("Over/Under" in bet_name
+                     or ("Over" in bet_name and "Under" in bet_name))
+                    and not any(
+                        _x93 in bet_name
+                        for _x93 in ("Card", "Corner", "First Half", "Second Half",
+                                     "1st Half", "2nd Half", "Halves", "Team Total")
+                    )
+                ):
+                    continue
+                for v in bet.get("values", []) or []:
+                    try:
+                        line = float(
+                            str(v.get("value", "")).split("Over")[-1].strip()
+                        )
+                        if abs(line - target_line) < 0.01:
+                            odd = safe_float(str(v.get("odd", "")))
+                            if odd and odd > 1.01:
+                                live_books.append({
+                                    "book": bm_name,
+                                    "odds": round(odd, 2),
+                                    "implied": round(1.0 / odd, 3),
+                                })
+                    except (ValueError, IndexError):
+                        pass
+        if live_books:
+            best = max(live_books, key=lambda x: x["odds"])
+            result["live_books"] = live_books
+            result["over_best"] = best["odds"]
+            result["over_best_book"] = best["book"]
     return result
+
+
+def _live_empty_diag(data) -> dict | None:
+    """v10.93: WHY /odds/live produced nothing — plan-gate vs coverage.
+
+    api-sports answers a plan-gated or coverage-empty live query with an
+    EMPTY response[] and (when gated) a populated `errors` object; the
+    v10.92 code swallowed this silently — the 309-signal export recorded
+    ZERO live prices and not one reason. This snapshot rides the ledger
+    record (odds_live_diag) so the nightly export itself settles the
+    "does my plan carry live odds" question. Zero extra credits: the
+    response was already fetched for the price capture.
+    """
+    try:
+        if not isinstance(data, dict):
+            return {"kind": "not-a-dict"}
+        errors = data.get("errors")
+        return {
+            "results": data.get("results"),
+            "errors": errors if errors else None,
+        }
+    except Exception:
+        return None
 
 
 def fetch_signal_odds(client: httpx.Client, fixture_id: int,
@@ -8740,16 +8850,21 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     result = None
     source = None
     fail_reason = "unknown"
+    _live_diag = None  # v10.93: why-empty snapshot from the /odds/live response
 
     while attempts < _max_attempts:
         attempts += 1
         try:
             # v10.44s: /odds/live for in-play odds (better proxy for
             # signal-time market). Falls back to /odds (pre-match).
+            # v10.93: multi_book=True — every bookmaker's Over line parsed;
+            # a live-empty response drops its results/errors snapshot into
+            # _live_diag BEFORE the fallback buries the evidence.
             data = api_get(client, "/odds/live", {"fixture": fixture_id})
             source = "live"
-            result = _parse_signal_odds(data, total_goals)
+            result = _parse_signal_odds(data, total_goals, multi_book=True)
             if result is None:
+                _live_diag = _live_empty_diag(data)
                 data = api_get(client, "/odds", {"fixture": fixture_id})
                 source = "prematch_fallback"
                 result = _parse_signal_odds(data, total_goals)
@@ -8803,7 +8918,7 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
             try:
                 attempts += 1
                 fresh_data = api_get(client, "/odds/live", {"fixture": fixture_id})
-                fresh = _parse_signal_odds(fresh_data, total_goals)
+                fresh = _parse_signal_odds(fresh_data, total_goals, multi_book=True)
                 if fresh is not None and fresh.get("over_odds"):
                     if (
                         fresh.get("over_implied") is None
@@ -8833,6 +8948,12 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     result["odds_source"] = source
     result["suspect"] = suspect
     result["attempts"] = attempts
+    # v10.93: the why-live-was-empty diagnostic + line-shop numbers ride
+    # the capture dict into the outcome record (odds_live_diag,
+    # odds_over_best, odds_live_books). Only set when live came back
+    # empty — a healthy live parse has nothing to explain.
+    if _live_diag is not None:
+        result["live_diag"] = _live_diag
 
     # v10.48: chosen source name NOT logged (chat-safe logs);
     # still stored in the outcome record as odds_bookmaker.
@@ -9384,6 +9505,20 @@ def _build_odds_value_block(
                 else:
                     _mkt += " \u2192 thin edge"
             lines.append(_mkt)
+            # v10.93: line-shop line — best live price across ALL books in
+            # the response (Bet365 stays the primary Book line above).
+            if (
+                _mkt_live
+                and odds_data.get("over_best")
+                and odds_data.get("live_books")
+                and float(odds_data["over_best"]) > float(odds_data["over_odds"])
+            ):
+                lines.append(
+                    f"Best live: O{odds_data['over_line']:.1f} "
+                    f"@{odds_data['over_best']:.2f} "
+                    f"({odds_data.get('over_best_book') or '?'} \u00b7 "
+                    f"{len(odds_data['live_books'])} books)"
+                )
         else:
             lines.append("Book: no price captured (quota/coverage)")
 
@@ -12635,6 +12770,27 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 # Benfica 46'->47' re-signal was exactly this failure mode.
                 _cd_seconds_since = (time.time() - (team_sig.get("last_signal_time", 0) or 0)) if team_sig else 999999
                 _cd_gap_ok = _cd_seconds_since >= SIGNAL_MIN_GAP_SECONDS
+                # v10.92: DUP-SAME-MINUTE HARD GUARD — no goal scored since
+                # the last signal (we're in the non-goal-reset branch), so
+                # any repeat inside 180s is a poll-batch duplicate or a
+                # stats catch-up artifact (Marseille 33' Sep 11: two
+                # signals, same minute, 1s apart, both bet, both lost).
+                # Block it before ANY override can re-qualify the team —
+                # the cd_polls counter can double-increment inside a single
+                # duplicated batch, so it must never be trusted alone at
+                # small elapsed times.
+                if not _cd_gap_ok:
+                    log.info(
+                        f"  v10.92 DUP GUARD: {tname} {tier} at {minute}' — "
+                        f"repeat {int(_cd_seconds_since)}s after signal #" 
+                        f"{sig_count} (<{SIGNAL_MIN_GAP_SECONDS}s), no goal since — "
+                        f"same-batch duplicate / stats catch-up, skipping"
+                    )
+                    _track_blocked_candidate(
+                        fid, tid, tname, league, minute, tier, "DUP_SAME_MINUTE",
+                        gps, sot, ib_ratio, sh, sa, is_home_team, ml_score=ml_score,
+                    )
+                    continue
                 if (_cd_sot_rise_genuine >= 3 or _cd_xg_rise >= 0.50) and not _cd_gap_ok:
                     log.info(
                         f"  COOLDOWN BUILDUP GAP BLOCK: {tname} {tier} at {minute}' — "
@@ -12910,6 +13066,22 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             window_tag = "CORE"
             window_label = ""
 
+        # v10.91: BET FLAG — 6-night ledger verdict (Sep 6-11): pre-50'
+        # signals hit a goal after the signal 75% of the time (62W-21L,
+        # break-even odds 1.34); 50'+ hit only 40% (22W-33L, break-even
+        # 2.50 — unbeatable at any real next-goal price). One line on
+        # the message, one column in the ledger. NEVER a gate: late
+        # alerts still fire, still grade — the flag only tells the user
+        # which side of the minute cliff this signal landed on.
+        bet_flag = "BET" if minute < 50 else "NO_BET"
+        bet_label = (
+            f"\n\u2705 BET WINDOW — pre-50': 75% goal-after-signal "
+            f"(6-night ledger)"
+            if minute < 50 else
+            f"\n\U0001f6ab NO-BET — 50'+ late window: 40% hit, needs "
+            f"2.50+ odds (ledger)"
+        )
+
         # v10.58: FRESH BIG CHANCE warning — a big chance created since the
         # previous poll is the strongest single pre-goal sign on the stats
         # side. Only fires when the previous history entry carried a BC
@@ -12959,6 +13131,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             f"{_rc_block}"
             f"{losing_tag}"
             f"{stale_tag}"
+            f"{bet_label}"
         )
         if trend:
             msg += f"\nTrend: {trend}"
@@ -13227,6 +13400,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "gps": round(gps, 1),
             "red_cards": red_card_str, "tier": tier,
             "window_tag": window_tag,  # v10.27
+            "bet_flag": bet_flag,  # v10.91: BET / NO_BET minute cliff
             "trend": trend, "is_new": is_new_team,
         })
 
@@ -13296,6 +13470,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "accel_count": accel_count,
             "tier": tier,
             "window_tag": window_tag,  # v10.27: CORE / EARLY_OVERRIDE / LATE_OVERRIDE
+            "bet_flag": bet_flag,  # v10.91: BET (<50') / NO_BET (50'+) minute cliff
             "goals_at_signal": goals_now,
             "opponent_goals_at_signal": opp_goals,
             "is_home": is_home_sg,
@@ -13325,6 +13500,15 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "odds_source": _odds_data.get("odds_source") if _odds_data else None,  # v10.68: live vs prematch_fallback
             "odds_suspect": _odds_data.get("suspect") if _odds_data else None,  # v10.68: True = impossible price kept + flagged
             "odds_attempts": _odds_data.get("attempts") if _odds_data else None,  # v10.68: fetch rounds used
+            # v10.93: LIVE-ODDS TRUTH — the why-live-was-empty snapshot
+            # (results + errors straight off the /odds/live response) and
+            # the multi-book line-shop numbers. live_diag is set ONLY when
+            # live came back empty: plan-gate answers appear in errors,
+            # coverage gaps answer with results=0 and no errors.
+            "odds_live_diag": _odds_data.get("live_diag") if _odds_data else None,
+            "odds_over_best": _odds_data.get("over_best") if _odds_data else None,
+            "odds_over_best_book": _odds_data.get("over_best_book") if _odds_data else None,
+            "odds_live_books": _odds_data.get("live_books") if _odds_data else None,
             # v10.77: P&L-GRADE flag — True ONLY for a genuine live price (source='live',
             # not suspect). prematch_fallback prices are the Sep-4/Sep-6 stale class
             # (Marseille O4.5 @ 26.0 with 4 goals already in) that inflated paper P&L
@@ -14229,6 +14413,134 @@ def fetch_daily_active_hours(client: httpx.Client) -> bool:
 
 
 # ============================================================
+# v10.93: LIVE-ODDS SELF-TEST  (python bot_v10.93.py --odds-test)
+# ============================================================
+
+def run_odds_selftest(max_fixtures: int = 10) -> int:
+    """One-shot diagnostic: does THIS api-sports plan/coverage return
+    /odds/live prices at all — for which bookmakers, at which markets?
+
+    The 309-signal export (Aug 30 - Sep 11) recorded ZERO live prices:
+    189 prematch_fallback + 120 no-odds, and not one recorded reason.
+    This mode settles the question for ~11 credits: one
+    /fixtures?live=all + up to `max_fixtures` /odds/live calls, then a
+    per-fixture bookmaker/market table and one of three VERDICTS:
+      LIVE OK  (x/N fixtures)  -> the feed works at signal time; the
+                                  nightly empties were per-fixture gaps.
+      PLAN GATE (errors: ...)  -> the API's own gating message, verbatim.
+      COVERAGE (empty, silent) -> no live odds for these leagues on this
+                                  feed; real prices need a second source
+                                  (bet365 live via The Odds API / BetsAPI)
+                                  or manual entry at bet time.
+    Run at primetime (19:30-21:30) for a full live board. Quota-guarded:
+    skips below 30 remaining credits.
+    """
+    print("=" * 62)
+    print(f"Football Bot {BOT_VERSION} — LIVE-ODDS SELF-TEST")
+    print("=" * 62)
+    if not API_KEYS:
+        print("No API key found (RAPIDAPI_KEY) — cannot test.")
+        return 2
+    if quota_remaining is not None and quota_remaining < 30:
+        print(f"Quota low ({quota_remaining} left) — run earlier in the day.")
+        return 2
+
+    with httpx.Client(timeout=20.0) as client:
+        try:
+            data = api_get(client, "/fixtures", {"live": "all"})
+        except Exception as e:
+            print(f"fixtures?live=all failed: {e}")
+            return 1
+        fixtures = data.get("response", []) if isinstance(data, dict) else []
+        if not fixtures:
+            print("No live fixtures right now — run at primetime (19:30-21:30).")
+            if isinstance(data, dict):
+                print(f"(results={data.get('results')} errors={data.get('errors')})")
+            return 1
+
+        tracked = [
+            f for f in fixtures
+            if (f.get("league") or {}).get("id") in LEAGUE_IDS
+        ]
+        pool = (tracked or fixtures)[:max_fixtures]
+        print(
+            f"{len(fixtures)} live fixtures; testing {len(pool)} "
+            f"({'tracked leagues' if tracked else 'ALL leagues (none tracked are live)'})\n"
+        )
+
+        live_ok = 0
+        empty_n = 0
+        err_msgs = []
+        for f in pool:
+            fid = (f.get("fixture") or {}).get("id")
+            lg = (f.get("league") or {}).get("name", "?")
+            minute = (f.get("fixture", {}).get("status") or {}).get("elapsed")
+            home = ((f.get("teams") or {}).get("home") or {}).get("name", "?")
+            away = ((f.get("teams") or {}).get("away") or {}).get("name", "?")
+            gh = (f.get("goals") or {}).get("home") or 0
+            ga = (f.get("goals") or {}).get("away") or 0
+            total = (gh or 0) + (ga or 0)
+            header = f"{home} {gh}-{ga} {away} | {lg} | {minute}'"
+            try:
+                od = api_get(client, "/odds/live", {"fixture": fid})
+            except Exception as e:
+                print(f"  ERROR   {header}\n          {e}")
+                continue
+            resp = od.get("response", []) if isinstance(od, dict) else []
+            errors = od.get("errors") if isinstance(od, dict) else None
+            if not resp:
+                empty_n += 1
+                note = errors if errors else "(silent empty — coverage gap, not a plan gate)"
+                if errors and str(errors) not in [str(m) for m in err_msgs]:
+                    err_msgs.append(errors)
+                print(f"  EMPTY   {header}\n          {note}")
+                continue
+            bms = resp[0].get("bookmakers", []) or []
+            if not bms:
+                empty_n += 1
+                print(f"  NOBOOKS {header}\n          response present, ZERO bookmakers")
+                continue
+            live_ok += 1
+            parsed = _parse_signal_odds(od, total, multi_book=True)
+            books_line = ", ".join(
+                f"{bm.get('name', '?')}({len(bm.get('bets') or [])})"
+                for bm in bms[:6]
+            )
+            print(f"  LIVE    {header}")
+            print(f"          books: {books_line}")
+            if parsed:
+                books = parsed.get("live_books") or []
+                print(
+                    f"          O{total + 0.5:.1f}: "
+                    f"primary @{parsed.get('over_odds')} | "
+                    f"best @{parsed.get('over_best')} "
+                    f"({parsed.get('over_best_book') or '?'} | {len(books)} books)"
+                )
+            else:
+                print("          (books present but no goals O/U market parsed)")
+
+        print("\n" + "=" * 62)
+        print(f"VERDICT: LIVE on {live_ok}/{len(pool)}, empty on {empty_n}")
+        if live_ok:
+            print(
+                "-> The feed DOES return live odds here: signal-time empties\n"
+                "   were per-fixture coverage gaps (check the leagues above)."
+            )
+        elif err_msgs:
+            print("-> PLAN GATE — the API's own error message(s), verbatim:")
+            for m in err_msgs[:3]:
+                print(f"   {m}")
+        else:
+            print(
+                "-> COVERAGE: live odds return empty WITHOUT errors for these\n"
+                "   leagues. No code can conjure them from this feed — logging\n"
+                "   real prices needs a second odds source (bet365 live via\n"
+                "   The Odds API / BetsAPI) or manual entry at bet time."
+            )
+    return 0
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 
@@ -14315,6 +14627,37 @@ def main():
         "SAME-POLL goal mute + MINUTE-ARCHIVE repair of the 5m/10m window "
         "deltas — the Sep 9-10 post-mortem: SOT freezes when shots go wide "
         "or saved, attempts don't (3.3x lift at d10>=4, 38% episode hit)"
+    )
+    log.info(
+        "v10.85-86: SIMPLIFIED SIGNAL (~45% shorter, display-only) + EMPIRICAL "
+        "LAMBDA CALIBRATION (minute-banded deflate, prediction-only) — "
+        "fair prices honest, bet-only-at-LIVE-odds>=X thresholds stricter"
+    )
+    log.info(
+        "v10.87-90: GOAL-RACE GUARD (feed-ahead-of-score mute) + POST-GOAL "
+        "HONESTY (stale post-goal CRITICALs blocked, (next)-goal headers) + "
+        "RED-AWARE LOSING RELAXATION (red_relax ledger field) + SOT3 SHADOW "
+        "(sot3_relax blocked-tag grading) + G3 LIVE (76% next-goal, "
+        "10-min anti-stack dedup)"
+    )
+    log.info(
+        "v10.91: BET FLAG — every alert tagged BET WINDOW (<50') / NO-BET "
+        "(50'+); bet_flag lands in the ledger so exports auto-split results "
+        "(display/logging only, never a gate — 12-day data: <50' 67% vs "
+        "50'+ 37%, BE 1.49 vs 2.70)"
+    )
+    log.info(
+        "v10.92: DUP-SAME-MINUTE GUARD — 180s hard block on repeat signals "
+        "without a goal reset (the Marseille 33' 1-second double-fire class)"
+    )
+    log.info(
+        "v10.93: LIVE-ODDS TRUTH — odds_live_diag (empty /odds/live responses "
+        "now record their reason: plan-gate vs coverage), MULTI-BOOK live "
+        "capture (every bookmaker on our Over line; odds_live_books / "
+        "odds_over_best / odds_over_best_book in the ledger, best price in "
+        "the Telegram BET block), --odds-test self-test (~11 credits, "
+        "primetime run settles the live-feed verdict); zero signal-path "
+        "credit change"
     )
     # v10.83: unconditional version line — the deploy check. Every boot
     # answers "which version is running?" in the first seconds of log,
@@ -15283,4 +15626,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # v10.93: one-shot live-odds diagnostic — settles the plan/coverage
+    # question in ~11 credits, then exits (never enters the poll loop).
+    if "--odds-test" in sys.argv:
+        raise SystemExit(run_odds_selftest())
     main()
