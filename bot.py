@@ -304,6 +304,15 @@ feed_guard: dict = {
 # many consecutive calls reported the SAME value. Warning is sent from the
 # main loop (needs the httpx client), detection happens in update_quota().
 quota_freeze: dict = {"value": None, "count": 0, "last_warn": 0.0}
+# v10.96: day-level pacing state. _pace_readings is (timestamp,
+# daily-remaining) samples appended by update_quota(); pace_mode_now is
+# recomputed once per main-loop pass by update_pace_mode().
+_pace_readings: list = []             # [(ts, remaining), ...] rolling window
+pace_mode_now: str = ""              # "" | "PACE1" | "PACE2"
+pace_burn_rate: float | None = None  # credits/h over the rolling window
+pace_allowed_rate: float | None = None  # affordable credits/h to midnight UTC
+pace_last_switch: float = 0.0        # dwell hysteresis (anti-flapping)
+pace_last_alert: float = 0.0         # Telegram alert rate-limit
 # v10.71: latest scheduled tracked kickoff today (UTC ts) — gates the EOD
 # block so mid-day monitoring gaps do not fire the EOD report/clear.
 # None = schedule unknown (permissive, legacy behavior). 0.0 = no matches
@@ -506,6 +515,7 @@ _field_census: dict[int, dict[str, bool]] = {}   # league_id -> {field: arrived}
 # duplicates. Promotion to live firing (Phase 2) is a SEPARATE future change
 # gated on the criteria in FASTLANE_PROPOSAL.md.
 FASTLANE_SHADOW_FILE = os.path.join(_VOLUME_DIR, "fastlane_shadow.jsonl")
+LANE_CREDITS_FILE = os.path.join(_VOLUME_DIR, "fastlane_credit.json")  # v10.96: lane cap survives restarts
 GOAL_FLASH_FILE = os.path.join(_VOLUME_DIR, "goal_flash.jsonl")  # v10.53: goal-flash alert log
 SURGE_WATCH_FILE = os.path.join(_VOLUME_DIR, "surge_watch.jsonl")  # v10.54: pre-goal surge alert log
 fastlane_shadow: list[dict] = []        # v10.50: virtual-signal records
@@ -561,7 +571,7 @@ _goalburst_count_date: str | None = None
 # startup (banners were hardcoded per-feature strings), so a fresh
 # deploy could not be verified from logs until the first signal carried
 # its [v10.xx] tag. One f-string line fixes it for every future bump.
-BOT_VERSION = "v10.94"
+BOT_VERSION = "v10.96"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -644,6 +654,47 @@ LEAGUE_CLASS_C = {
 # dogs inside class-A leagues 74% (BE 1.34, n=39) — the market anchors
 # on the prematch favorite while the pressure is on the dog.
 DOG_FLAG_RATIO = 1.15
+
+# v10.95: HIT-GRADE LADDER — the ONE number every signal now leads
+# with (user request Sep 12: 'print the percentage likelihood of the
+# signal to win — far too much text and complexity'). The number is
+# the measured full-match conversion of the EXACT class this signal
+# falls in, from the 309-signal Aug 30 - Sep 11 ledger:
+#   A-GRADE  79%  (44% in 15m, n=78)  pre-50' + not leading 2+ +
+#                                     (class-A league OR dog level/trailing)
+#   BET      58%  (25% in 15m, n=105) pre-50' without the qualifiers
+#                                     (56% n=66 + leading-2+ 62% n=39)
+#   NO-BET   37%  (23% in 15m, n=124) 50'+ late window (minute cliff)
+# The EOD stats block re-grades the ladder nightly so drift is caught
+# live; the grade is display + ledger only, NEVER a gate.
+HIT_LADDER = {
+    "A":   ("A-GRADE", 79, 44),
+    "BET": ("BET", 58, 25),
+    "NO":  ("NO-BET", 37, 23),
+}
+
+
+def signal_hit_grade(minute, deficit, lg_class, dog_flag):
+    """v10.95: (grade_word, hit_pct, pct_15m, stars) for a signal.
+
+    Pure ledger lookup — same inputs the a_grade composite already
+    uses (minute, game-state deficit, league class, dog flag), so the
+    printed number is always consistent with the graded classes. None-
+    safe: missing inputs degrade to the BET tier, never a crash.
+    """
+    try:
+        if minute is None or int(minute) >= 50:
+            g = HIT_LADDER["NO"]
+            return (g[0], g[1], g[2], "\u2b50")
+        _def = deficit or 0
+        if _def >= -1 and (lg_class == "A" or (dog_flag is True and _def >= 0)):
+            g = HIT_LADDER["A"]
+            return (g[0], g[1], g[2], "\u2b50\u2b50\u2b50")
+        g = HIT_LADDER["BET"]
+        return (g[0], g[1], g[2], "\u2b50\u2b50")
+    except (TypeError, ValueError):
+        g = HIT_LADDER["BET"]
+        return (g[0], g[1], g[2], "\u2b50\u2b50")
 
 
 def league_class_of(league_name: str | None) -> str:
@@ -1040,6 +1091,12 @@ def update_quota(resp: httpx.Response):
             else:
                 quota_freeze["value"] = new_remaining
                 quota_freeze["count"] = 1
+                # v10.96: day-level pacing sample — every CHANGED daily-
+                # remaining reading is a (ts, remaining) data point for the
+                # rolling burn-rate estimate. Frozen readings are skipped on
+                # purpose (the v10.71 watchdog owns that failure class; and
+                # an unmetered call is not a spend we can pace against).
+                _pace_readings.append((time.time(), new_remaining))
             quota_remaining = new_remaining
 
         value = resp.headers.get("x-ratelimit-requests-limit")
@@ -1329,6 +1386,143 @@ def get_budget_mode() -> str:
     if quota_remaining <= 50:
         return "CAREFUL"
     return "NORMAL"
+
+
+# ============================================================
+# v10.96: DAY-LEVEL CREDIT PACING
+# ============================================================
+
+def _hours_to_utc_midnight() -> float:
+    """Hours (UTC) until the next 00:00 UTC daily-quota reset."""
+    _now = time.gmtime()
+    _secs_today = _now.tm_hour * 3600 + _now.tm_min * 60 + _now.tm_sec
+    return max((86400 - _secs_today) / 3600.0, 0.25)
+
+
+def update_pace_mode() -> str:
+    """v10.96: recompute the day-level pace mode from live quota telemetry.
+
+    affordable rate = (remaining - PACE_RESERVE) / hours-to-00:00-UTC —
+    the average burn the day can sustain from NOW to the reset. The
+    rolling burn rate comes straight from the quota header samples
+    update_quota() collects, so it is ground truth, not an estimate of
+    our own calls (a restart cannot fool it, and it re-converges within
+    the window after every restart).
+
+    Boot-seed: with fewer than 2 samples the rolling rate is unknown, so
+    a low-remaining heuristic guards the first minutes after a restart
+    (the Sep 12 class: redeploy at 4,900 spent, blind full-speed burn).
+
+    Modes (advisory-lane downshifts only — see the constants block):
+      ""      -> full speed (10s lane, base discovery, 30s/15s hot stats)
+      PACE1   -> lane 20s, discovery x1.5       (signals unchanged)
+      PACE2   -> lane 30s, discovery x2, hot-stats floor 45s
+    Budget modes CAREFUL/STRICT/EMERGENCY/STOP still override at the
+    tank bottom exactly as before; pacing owns the other 7,400 credits.
+    Dwell hysteresis (PACE_DWELL) stops flapping when the ratio sits on
+    a threshold. Returns the (possibly unchanged) mode string.
+    """
+    global pace_mode_now, pace_burn_rate, pace_allowed_rate
+    global pace_last_switch
+
+    if quota_remaining is None:
+        pace_burn_rate = None
+        pace_allowed_rate = None
+        return pace_mode_now
+
+    hours_left = _hours_to_utc_midnight()
+    affordable = max(float(quota_remaining - PACE_RESERVE), 0.0) / hours_left
+    pace_allowed_rate = affordable
+
+    # Rolling burn rate over the trailing window. Rate samples arrive on
+    # every metered API call, so a busy bot fills this in seconds. The
+    # list keeps 2x the window of samples: the reference point is the
+    # NEWEST reading at/older than the window edge, so an edge-exact
+    # sample is never popped prematurely (the epsilon bug the tests
+    # caught: a reading exactly 45:00 old was discarded before it could
+    # serve as the span anchor, silently nulling the burn estimate).
+    burn = None
+    now = time.time()
+    while _pace_readings and now - _pace_readings[0][0] > 2 * PACE_ROLLING_WINDOW:
+        _pace_readings.pop(0)
+    if len(_pace_readings) >= 2:
+        t1, q1 = _pace_readings[-1]
+        # reference = newest reading still at/older than the window edge
+        t0, q0 = _pace_readings[0]
+        for _ts, _q in _pace_readings:
+            if now - _ts >= PACE_ROLLING_WINDOW:
+                t0, q0 = _ts, _q
+            else:
+                break
+        span_h = (t1 - t0) / 3600.0
+        if span_h >= 60.0 / 3600.0:  # >= 1 min of span for a sane rate
+            spent = max(q0 - q1, 0)
+            burn = spent / span_h
+    pace_burn_rate = burn
+
+    # Decide the target mode.
+    target = ""
+    if burn is not None and affordable > 0:
+        ratio = burn / affordable
+        if ratio > PACE2_RATIO:
+            target = "PACE2"
+        elif ratio > PACE1_RATIO:
+            target = "PACE1"
+    if not target and len(_pace_readings) < 2:
+        # boot-seed: no rolling data yet — low-remaining heuristics
+        if quota_remaining < 1500 and hours_left > 3.0:
+            target = "PACE2"
+        elif quota_remaining < 3000 and hours_left > 6.0:
+            target = "PACE1"
+    # Hard floor: even with unknown/low burn, near-tank-bottom pacing
+    # beats the old cliff (budget modes only wake at <=50).
+    if not target and quota_remaining < 800 and hours_left > 1.0:
+        target = "PACE1"
+
+    if target != pace_mode_now:
+        if now - pace_last_switch < PACE_DWELL and pace_last_switch > 0:
+            return pace_mode_now  # dwell: keep the current mode
+        pace_mode_now = target
+        pace_last_switch = now
+    return pace_mode_now
+
+
+def lane_credits_save(credits: int) -> None:
+    """v10.96: persist the event-lane daily credit counter so restarts
+    (the Sep 12 redeploy chain reset it 4x) can no longer bypass the
+    2,500/day lane cap. One tiny JSON write; called per lane call at
+    most every 10-30s — negligible I/O."""
+    try:
+        with open(LANE_CREDITS_FILE, "w") as f:
+            json.dump(
+                {"date": time.strftime("%Y-%m-%d", time.gmtime()),
+                 "credits": int(credits)},
+                f,
+            )
+    except Exception as _e:
+        log.debug(f"  v10.96 lane-credit persist failed: {_e}")
+
+
+def lane_credits_load() -> int:
+    """v10.96: boot-time restore — the counter only survives if the stored
+    date is TODAY (UTC); a stale date means the day flipped while the bot
+    was down, so the lane starts fresh at 0."""
+    try:
+        with open(LANE_CREDITS_FILE) as f:
+            data = json.load(f)
+        if data.get("date") == time.strftime("%Y-%m-%d", time.gmtime()):
+            n = int(data.get("credits") or 0)
+            if n > 0:
+                log.info(
+                    f"  v10.96: event-lane daily counter restored from disk: "
+                    f"{n}/2500 (restart no longer resets the cap)"
+                )
+            return max(n, 0)
+    except FileNotFoundError:
+        pass
+    except Exception as _e:
+        log.debug(f"  v10.96 lane-credit restore failed: {_e}")
+    return 0
 
 
 def get_max_fast_monitored() -> int:
@@ -3503,6 +3697,15 @@ def get_sot_based_interval(fid: int, base_interval: int) -> int:
                     break
         if not _skip_slowdown:
             interval = int(interval * 3.0)
+
+    # v10.96: PACE2 hot-stats floor — the ONLY real-signal concession in
+    # the whole pacing design, and only when the day's budget is genuinely
+    # at risk (burn > 1.5x affordable, or remaining < 1500 with hours to
+    # go). Hot fixtures move 30s -> 45s (the 15s goal-priority tier above
+    # returns early and stays UNTOUCHED — post-goal catching keeps 15s).
+    # +15s worst-case latency beats going dark for the evening slate.
+    if pace_mode_now == "PACE2" and interval < PACE2_HOT_STATS_FLOOR:
+        interval = PACE2_HOT_STATS_FLOOR
 
     return interval
 
@@ -6326,6 +6529,49 @@ EVENT_FAST_LANE_MIN_GPS = 65          # minimum GPS to activate
 EVENT_FAST_LANE_MIN_SOT = 2           # minimum SOT to activate
 FAST_LANE_MAX_FIXTURES = 3            # v10.50: poll events for up to 3 hottest fixtures (was 1)
 
+# v10.96: DAY-LEVEL CREDIT PACING — the Sep 12 post-mortem: burn hit
+# ~1,200 credits/h at midday (66% of it this 10s event lane) while the
+# 7,500/day plan can only sustain ~437/h average over the 21h active day;
+# the old guards (CAREFUL/STRICT/EMERGENCY at <=50/25/10 remaining) are
+# end-of-tank brakes, not pacing — the bot died at 19:15 Sofia, blind for
+# the whole evening slate. Pacing now compares the rolling 45-min burn
+# rate against the AFFORDABLE rate ((remaining - reserve) / hours to the
+# 00:00 UTC reset) and downshifts the ADVISORY lanes only:
+#   PACE1 (burn > 1.15x affordable): event lane 10->20s, discovery x1.5.
+#       Real signals UNCHANGED — stats polling for hot fixtures (30s,
+#       15s ultra-fast tier) is untouched; only shadow detection, surge
+#       alarms and goal flashes ride the lane (+10s advisory latency).
+#   PACE2 (burn > 1.5x affordable, or remaining < 1500 with > 3h left):
+#       event lane 30s, discovery x2, and the ONE real-signal concession:
+#       hot-fixture stats floor 30->45s (goal-priority 15s windows exempt
+#       — post-goal catching stays ultra-fast). Worst case +15s to a
+#       would-be signal; the alternative is going fully dark at 18:00 UTC.
+# The ladder exits by itself: as midnight nears, hours_left shrinks, the
+# affordable rate grows and NORMAL returns for the budget tail. Budget
+# modes (CAREFUL+) still override at the tank bottom as before.
+PACE1_LANE_INTERVAL = 20             # seconds between event-lane polls
+PACE2_LANE_INTERVAL = 30             # seconds between event-lane polls
+PACE1_DISCOVERY_MULT = 1.5
+PACE2_DISCOVERY_MULT = 2.0
+PACE2_HOT_STATS_FLOOR = 45           # seconds; goal-priority 15s exempt
+PACE_RESERVE = 100                   # credits held back for odds + probes
+PACE_ROLLING_WINDOW = 45 * 60       # rolling burn-rate window (seconds)
+PACE1_RATIO = 1.15                   # burn/affordable ratio that trips PACE1
+PACE2_RATIO = 1.50                   # burn/affordable ratio that trips PACE2
+PACE_DWELL = 300.0                   # min seconds between mode switches
+PACE_ALERT_EVERY = 3600.0            # max one pace Telegram alert per hour
+
+
+def effective_event_lane_interval() -> int:
+    """v10.96: the event-lane poll gap for the current pace mode.
+    10s NORMAL / 20s PACE1 / 30s PACE2. Advisory-lane only — the real
+    signal path (stats batch polling) never consults this."""
+    if pace_mode_now == "PACE2":
+        return PACE2_LANE_INTERVAL
+    if pace_mode_now == "PACE1":
+        return PACE1_LANE_INTERVAL
+    return EVENT_FAST_LANE_INTERVAL
+
 # v10.53: GOAL WATCH — instant goal flash alerts for close late games.
 # Rationale: goals cluster. The Levski derby double strike (74' + 75') sent
 # no prediction signal because goal 1 had zero buildup (1 SOT all half) —
@@ -7697,7 +7943,7 @@ def poll_event_fast_lane(client: httpx.Client) -> None:
     now = time.time()
     if not _event_fast_lane_fids:
         return
-    if now - _event_fast_lane_last < EVENT_FAST_LANE_INTERVAL:
+    if now - _event_fast_lane_last < effective_event_lane_interval():
         return
     if _event_fast_lane_credits_today >= 2500:  # v10.48: raised 1500->2500 (GPS85 lock needs headroom; daily usage ~230/7500)
         return
@@ -7712,6 +7958,10 @@ def poll_event_fast_lane(client: httpx.Client) -> None:
             data = api_get(client, "/fixtures/events", {"fixture": fid})
             events = data.get("response", [])
             _event_fast_lane_credits_today += 1
+            # v10.96: persist the cap counter so a redeploy can no longer
+            # reset it (the Sep 12 4x-restart chain spent 4 fresh caps).
+            if _event_fast_lane_credits_today % 10 == 0 or _event_fast_lane_credits_today >= 2500:
+                lane_credits_save(_event_fast_lane_credits_today)
 
             # v10.60: blocked shots / subs / cards from the SAME response
             # (zero extra credits, logging only)
@@ -9229,35 +9479,38 @@ def _build_market_block(
 
     def _compact(emoji: str, label: str, now: int | None,
                  line: float | None, p_over: float | None) -> str:
+        """v10.96: one bit per market WITH the probability —
+        '🟨 Cards 2/4.5 → O 62% @1.61+'.
+
+        The user's Sep 12 ask: percentages for corners and cards, next to
+        the odds. The P(over) was computed and LEDGER-RECORDED since
+        v10.80 — this only surfaces it. Lean side shows its own
+        probability (O = P(over), U = 1 - P(over)) + the break-even
+        price for that side; NEUTRAL shows the raw over-probability as
+        information. Same maths, same inputs, same single render path
+        (byte-stable live edits preserved).
+        """
         if now is None:
-            return f"{emoji} {label}: count n/a on this feed"
+            return f"{emoji} {label}: n/a"
         if line is None:
-            return f"{emoji} {label}: {now} \u00b7 no book line"
+            return f"{emoji} {label}: {now}"
+        _base = f"{emoji} {label} {now}/{line:g}"
         if p_over is None:
-            return f"{emoji} {label}: {now} vs line {line:g} \u00b7 no lean"
+            return _base
         lean = _mkt_lean(p_over)
-        # v10.85: plain language — "need N more" = what the Over still
-        # requires at FT; "max N more" = what the Under can absorb. The
-        # break-even odds stay the actionable number they always were.
-        _need = int(line) + 1 - (now or 0)
-        _max = int(line) - (now or 0)
-        _need_s = "already over" if _need <= 0 else f"need {_need} more"
-        _max_s = "already under" if _max < 0 else f"max {_max} more"
         if lean == "OVER" and p_over > 1e-9:
-            return (f"{emoji} {label}: {now} vs line {line:g} ({_need_s}) "
-                    f"\u2014 bet Over only, odds \u2265 {1.0 / p_over:.2f}")
+            return f"{_base} \u2192 O {p_over * 100:.0f}% @{1.0 / p_over:.2f}+"
         if lean == "UNDER" and p_over < 1.0 - 1e-9:
-            return (f"{emoji} {label}: {now} vs line {line:g} ({_max_s}) "
-                    f"\u2014 bet Under only, odds \u2265 {1.0 / (1.0 - p_over):.2f}")
-        return f"{emoji} {label}: {now} vs line {line:g} \u00b7 no lean, no bet"
+            return (
+                f"{_base} \u2192 U {(1.0 - p_over) * 100:.0f}% "
+                f"@{1.0 / (1.0 - p_over):.2f}+"
+            )
+        return f"{_base} \u00b7 O {p_over * 100:.0f}%"
 
     try:
-        # v10.85: header says what "line" means — the book's pre-match total
-        _bk = book_name or "book"
-        parts = [
-            "",
-            f"\U0001f7e8\U0001f6a9 CARDS & CORNERS \u2014 {_bk} pre-match line, counts auto-update",
-        ]
+        # v10.95: ONE line, both markets — the counts auto-update via the
+        # same live-edit path (single render source, byte-stable edits).
+        parts = []
 
         # --- CARDS: v1 heuristic maths, ledger-identical to v10.80 ---
         lam_c = None
@@ -9296,7 +9549,9 @@ def _build_market_block(
         extras["mkt_corners_lean"] = _mkt_lean(p_n)
         parts.append(_compact("\U0001f6a9", "Corners", corners_now, corners_line, p_n))
 
-        return "\n".join(parts), extras
+        if not parts:
+            return "", extras
+        return "\n" + " \u00b7 ".join(parts), extras
     except Exception:
         return "", {}
 
@@ -9578,74 +9833,38 @@ def _build_odds_value_block(
             and odds_data.get("odds_source") == "live"
             and not odds_data.get("suspect")
         )
-        # v10.85: plain language — the header names the BET, the fair
-        # line carries the rule. Same numbers, same extras, fewer words.
-        lines = [f"\n\U0001f4b0 BET \u2014 Over {any_line:.1f} goals"]
+        # v10.95: ONE line — 'BET Over 1.5 — book 1.12 (Bet365 · pre ref)
+        # → bet only if LIVE ≥ 1.56'. The team-to-score and BTTS fair
+        # prices stay in the ledger (pred_team_scores_cal / p_btts);
+        # the live-value verdict and best-book price ride the same line.
+        _book_bit = "no price captured"
         if odds_data and odds_data.get("over_odds"):
-            _src_tag = "LIVE" if _mkt_live else "pre-match ref"
-            _sus = (
-                " \u26a0\ufe0f impossible price — ignore"
-                if odds_data.get("suspect") else ""
-            )
-            _mkt = (
-                f"Book: O{odds_data['over_line']:.1f} "
-                f"@{odds_data['over_odds']:.2f} "
+            _src_tag = "LIVE" if _mkt_live else "pre ref"
+            _sus = " \u26a0\ufe0f ignore price" if odds_data.get("suspect") else ""
+            _book_bit = (
+                f"book {float(odds_data['over_odds']):.2f} "
                 f"({odds_data.get('bookmaker') or '?'} \u00b7 {_src_tag}{_sus})"
             )
             if _mkt_live:
                 ev_pct = (float(odds_data["over_odds"]) * p_any - 1.0) * 100.0
                 if ev_pct >= 3.0:
-                    _mkt += f" \u2192 VALUE +{ev_pct:.0f}%"
+                    _book_bit += f" \u00b7 VALUE +{ev_pct:.0f}%"
                 elif ev_pct <= -3.0:
-                    _mkt += " \u2192 no edge"
-                else:
-                    _mkt += " \u2192 thin edge"
-            lines.append(_mkt)
-            # v10.93: line-shop line — best live price across ALL books in
-            # the response (Bet365 stays the primary Book line above).
+                    _book_bit += " \u00b7 no edge"
             if (
                 _mkt_live
                 and odds_data.get("over_best")
                 and odds_data.get("live_books")
                 and float(odds_data["over_best"]) > float(odds_data["over_odds"])
             ):
-                lines.append(
-                    f"Best live: O{odds_data['over_line']:.1f} "
-                    f"@{odds_data['over_best']:.2f} "
-                    f"({odds_data.get('over_best_book') or '?'} \u00b7 "
-                    f"{len(odds_data['live_books'])} books)"
+                _book_bit += (
+                    f" \u00b7 best {float(odds_data['over_best']):.2f} "
+                    f"@{odds_data.get('over_best_book') or '?'}"
                 )
-        else:
-            lines.append("Book: no price captured (quota/coverage)")
-
-        # --- fair side (fair = break-even) — the rule rides the number,
-        # one place, always: bet only at LIVE odds >= fair price ---
-        _fair = (
-            f"Fair: {be_any:.2f} \u2014 bet only at LIVE odds \u2265 {be_any:.2f} "
-            f"({p_any:.0%} chance)"
-        )
-        if be_team is not None:
-            _fair += (
-                f"\n{team_name} to score (FT): fair {be_team:.2f} "
-                f"({p_team:.0%})"
-            )
-        lines.append(_fair)
-
-        # BTTS only while undecided AND captured
-        _btts_odds = odds_data.get("btts_yes_odds") if odds_data else None
-        _p_btts = goal_pred.get("p_btts")
-        if (
-            _btts_odds
-            and _p_btts is not None
-            and 0.0 < float(_p_btts) < 0.999
-        ):
-            lines.append(
-                f"BTTS Yes: book @{float(_btts_odds):.2f} \u00b7 "
-                f"fair {1.0 / float(_p_btts):.2f}"
-            )
-
-        # v10.85: the standalone rule footer is gone — the rule now rides
-        # the fair line ("bet only at LIVE odds >= X") above.
+        lines = [
+            f"\n\U0001f4b0 BET Over {any_line:.1f} \u2014 {_book_bit} "
+            f"\u2192 bet only if LIVE \u2265 {be_any:.2f}"
+        ]
 
         extras = {
             "pred_team_scores": round(p_team_model, 3),
@@ -10367,6 +10586,8 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
         # from the live record, not assumed from the Aug 30-Sep 11 backtest.
         # bet_flag (v10.91) rides along so the minute cliff is graded in the
         # same block. Every row: full WR first, then 15m.
+        # v10.95: the hit-ladder rows grade the PRINTED headline % against
+        # reality (A-GRADE says 79 / BET says 58 / NO-BET says 37).
         _flag_groups = [
             ("BET window (<50')", lambda e: e.get("bet_flag") == "BET"),
             ("NO-BET (50'+)", lambda e: e.get("bet_flag") == "NO_BET"),
@@ -10374,6 +10595,11 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
             ("League class C", lambda e: e.get("league_class") == "C"),
             ("DOG flag", lambda e: e.get("dog_flag") is True),
             ("A-GRADE composite", lambda e: bool(e.get("a_grade"))),
+            ("Hit-grade A-GRADE (printed 79%)", lambda e: e.get("hit_grade") == "A-GRADE"),
+            ("Hit-grade BET (printed 58%)", lambda e: e.get("hit_grade") == "BET"),
+            ("Hit-grade NO-BET (printed 37%)", lambda e: e.get("hit_grade") == "NO-BET"),
+            ("DOG winning", lambda e: e.get("dog_state") == "winning"),
+            ("DOG chasing", lambda e: e.get("dog_state") == "chasing"),
         ]
         _flag_rows: list[str] = []
         for _fl_label, _fl_filter in _flag_groups:
@@ -13195,36 +13421,15 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # v10.91: BET FLAG — 6-night ledger verdict (Sep 6-11): pre-50'
         # signals hit a goal after the signal 75% of the time (62W-21L,
         # break-even odds 1.34); 50'+ hit only 40% (22W-33L, break-even
-        # 2.50 — unbeatable at any real next-goal price). One line on
-        # the message, one column in the ledger. NEVER a gate: late
-        # alerts still fire, still grade — the flag only tells the user
-        # which side of the minute cliff this signal landed on.
+        # 2.50 — unbeatable at any real next-goal price). v10.95: the
+        # display line is gone (the hit-% headline carries the minute
+        # cliff now); the flag stays in the ledger + signals_sent.
         bet_flag = "BET" if minute < 50 else "NO_BET"
-        bet_label = (
-            f"\n\u2705 BET WINDOW — pre-50': 75% goal-after-signal "
-            f"(6-night ledger)"
-            if minute < 50 else
-            f"\n\U0001f6ab NO-BET — 50'+ late window: 40% hit, needs "
-            f"2.50+ odds (ledger)"
-        )
 
-        # v10.94: LEAGUE CLASS — the 309-signal ledger says goal-pressure
-        # conversion is 69% in the top-8 tracked leagues vs 42% in the
-        # cold-9 (a 27pp spread the live market does not price). One
-        # compact line after the bet flag for class A / C; class B stays
-        # silent (not enough data to speak). Display + ledger only.
+        # v10.94: LEAGUE CLASS — ledger-graded A/B/C converter tier.
+        # v10.95: display line folded into the flags line; _lg_class
+        # feeds the ledger, the a-grade composite and the hit ladder.
         _lg_class = league_class_of(league)
-        _league_flag_line = ""
-        if _lg_class == "A":
-            _league_flag_line = (
-                f"\n\U0001f3c6 LEAGUE CLASS A — top converter: 68% hit, "
-                f"BE 1.46 (ledger, n=149)"
-            )
-        elif _lg_class == "C":
-            _league_flag_line = (
-                f"\n\U0001f976 LEAGUE CLASS C — cold league: 42% hit, "
-                f"BE 2.36 (ledger, n=158)"
-            )
 
         # v10.58: FRESH BIG CHANCE warning — a big chance created since the
         # previous poll is the strongest single pre-goal sign on the stats
@@ -13255,31 +13460,26 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             (home.get("id"), home["name"]), (away.get("id"), away["name"]),
         )
 
-        # v10.85: SIMPLIFIED SIGNAL — one line per side. Dead display
-        # channels dropped (xG when N/A, Big Chances 0 — never delivered on
-        # this API plan, corners already in the market block); every value
-        # still lands in the ledger outcome record below.
+        # v10.95: SIMPLE SIGNAL — minimal body; the hit-% headline is
+        # PREPENDED after the odds fetch (when the dog flag is known).
+        # The v10.94 league/dog/a-grade explanation lines, GPS/trigger
+        # detail, bet_flag and trend display all fold into ONE ladder
+        # number + one flags line; every dropped value still lands in
+        # the ledger outcome record below (gps, trigger, bet_flag,
+        # league_class, dog_flag, a_grade, trend, projections, FT).
         _xg_bit = f" | xG {xg_str}" if xg_value is not None else ""
         _bc_bit = f" | Big Chances {big_chances}" if (big_chances or 0) > 0 else ""
         _oxg_v = safe_float(opponent_xg) if isinstance(opponent_xg, str) else opponent_xg
         _oxg_bit = f" | xG {_oxg_v:.2f}" if _oxg_v is not None else ""
         msg = (
-            f"{tier_emoji(tier)} {tier} GOAL PRESSURE ({sig_label})"
-            f"{f' {window_label}' if window_label else ''}\n\n"
-            f"{home['name']}  {sh} - {sa}  {away['name']}\n"
-            f"{league} | {minute}'\n\n"
+            f"{home['name']} {sh}-{sa} {away['name']} \u00b7 {league} \u00b7 {minute}'\n\n"
             f"{tname}: SOT {sot} | shots {total_shots} (box {ib_pct})"
-            f" | off-target {shots_off_target}{_xg_bit}{_bc_bit}\n"
-            f"Opp: SOT {opponent_sot}{_oxg_bit}{_bc_fresh}\n\n"
-            f"GPS: {gps:.0f}/100 | Trigger: {trigger}"
+            f"{_xg_bit}{_bc_bit}\n"
+            f"Opp: SOT {opponent_sot}{_oxg_bit}{_bc_fresh}\n"
             f"{_rc_block}"
             f"{losing_tag}"
             f"{stale_tag}"
-            f"{bet_label}"
-            f"{_league_flag_line}"
         )
-        if trend:
-            msg += f"\nTrend: {trend}"
 
         # v10.65: Top SOT line INSIDE the signal. Fetch first (pre-signal,
         # no inline 3s retry), feed the per-league census, then embed the
@@ -13332,30 +13532,10 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             )
             continue
 
-        # v10.28: Show recency info in signal message
-        _recency_preview = _build_recency_fields(
-            fid, tid, minute, sot, total_shots,
-            shots_inside_box, shots_off_target, xg_value, corners,
-            gps, accel_count,
-        )
-        _rr = _recency_preview.get("recency_ratio")
-        _sot_d5 = _recency_preview.get("sot_delta_5m")
-        _sot_d10 = _recency_preview.get("sot_delta_10m")
-        _gps_chg = _recency_preview.get("gps_change")
-        # v10.85: parts join with " | " — no more orphan " | GPS +0"
-        # fragments (a +0.4 change rendered as "+0" on its own line).
-        _rec_bits = []
-        if _rr is not None:
-            _rec_bits.append(f"\U0001f504 Recency: {_rr:.0%}")
-        if _sot_d5 is not None:
-            _rec_bits.append(f"SOT +{_sot_d5} (5m)")
-        if _sot_d10 is not None:
-            _rec_bits.append(f"SOT +{_sot_d10} (10m)")
-        if _gps_chg is not None and abs(_gps_chg) >= 0.5:
-            _rec_bits.append(f"GPS {_gps_chg:+.0f}")
-        if _rec_bits:
-            msg += "\n\n" + " | ".join(_rec_bits)
-
+        # v10.95: recency display dropped (the fields still land in the
+        # outcome record via the _build_recency_fields call below the
+        # record); goal predictions (Poisson) stay — they feed the fair
+        # prices in the bet line and the ledger pred_* fields.
         # v10.44g: Goal predictions (Poisson-based)
         _opp_sot_int = safe_int(opponent_sot) if isinstance(opponent_sot, str) else (opponent_sot or 0)
         _opp_xg_val = safe_float(opponent_xg) if isinstance(opponent_xg, str) else None
@@ -13373,28 +13553,6 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             opp_reds=_rc_opp_count,
         )
         _current_goals = (sh or 0) + (sa or 0)
-        _score_note = f" ({_current_goals} scored)" if _current_goals > 0 else ""
-        # v10.69: ADAPTIVE LINES — only UNDECIDED over lines are shown. A
-        # 2-2 game displays O4.5/O5.5/O6.5; the decided O2.5/O3.5 "100%"
-        # rows carried zero information. BTTS is hidden once decided.
-        # v10.74: the DISPLAYED percentages are the CALIBRATED ones (model
-        # blended 50/50 with the empirical game-state table) — the raw
-        # model was ~20pp overconfident in the Sep 1-7 backtest (74.5%
-        # predicted vs 54.1% landed on undecided O2.5, n=170).
-        _lines_str = " | ".join(
-            f"O{_l:.1f}: {_p:.0%}" for _l, _p in _goal_pred["over_lines_cal"]
-        )
-        _btts_str = (
-            f" | BTTS: {_goal_pred['p_btts']:.0%}" if _goal_pred["p_btts"] < 1.0 else ""
-        )
-        _cal_note = " (calibrated)" if _goal_pred.get("cal_mode") == "blend" else ""
-        # v10.85: one line instead of three — the xG provenance note lives
-        # in the ledger (xg_source); the numbers are what the bet needs.
-        msg += (
-            f"\n\n\U0001f4c8 Projection{_cal_note}: "
-            f"{_goal_pred['expected_total_goals']:.1f} goals total{_score_note}"
-            f" | {_lines_str}{_btts_str}"
-        )
 
         # v10.74: FT 1X2 PREDICTION — win/draw/loss for the SIGNALED team
         # from the live state: current scoreline + the remaining-goals
@@ -13402,43 +13560,25 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # red-card lambda adjustment). Informational ONLY: never a gate,
         # never GPS input, zero extra credits. Recorded as pred_ft_* fields
         # and later compared with the resolved FT result for calibration.
+        # v10.95: display dropped — the FT numbers live in the ledger.
         _sig_goals_ft = (sh or 0) if is_home_sg else (sa or 0)
         _opp_goals_ft = (sa or 0) if is_home_sg else (sh or 0)
         _ft = compute_ft_prediction(_goal_pred, _sig_goals_ft, _opp_goals_ft)
-        if _ft.get("p_team") is not None:
-            _opp_name_ft = away["name"] if is_home_sg else home["name"]
-            _rc_adj_note = " | λ adj: RC" if _goal_pred.get("rc_applied") else ""
-            msg += (
-                f"\n\U0001f3c6 FT: {tname} {_ft['p_team']:.0%} | "
-                f"Draw {_ft['p_draw']:.0%} | {_opp_name_ft} {_ft['p_opp']:.0%}"
-                f"{_rc_adj_note}"
-            )
 
-        # v10.74: PITCH STATE — men on pitch (11 - reds), subs used and
-        # injury-labeled subs from the events the bot already polls. The
-        # whole line is omitted when no events coverage exists (honesty —
-        # never fake zeros). Context for the FT prediction + brain v2.
-        _pitch_parts = []
+        # v10.74: PITCH STATE — subs used and injury-labeled subs from the
+        # events the bot already polls; recorded into the outcome
+        # (opp_subst_count / injury_subs_*) for brain v2. v10.95: display
+        # dropped (the red-card voice _rc_block above still speaks when a
+        # card actually matters).
         _ev_extras_ft = get_event_extras(fid)
         _sub_sig = _sub_opp = None
         _inj_sig = _inj_opp = None
-        if _rc_team_count is not None:
-            _men_sig = max(11 - (_rc_team_count or 0), 7)
-            _men_opp = max(11 - (_rc_opp_count or 0), 7)
-            if _men_sig != _men_opp:
-                _pitch_parts.append(f"On pitch: {_men_sig}v{_men_opp}")
         if _ev_extras_ft is not None:
             _opp_tid_ft = (away.get("id") if is_home_sg else home.get("id"))
             _sub_sig = (_ev_extras_ft.get("subst") or {}).get(tid)
             _sub_opp = (_ev_extras_ft.get("subst") or {}).get(_opp_tid_ft)
-            if _sub_sig is not None or _sub_opp is not None:
-                _pitch_parts.append(f"Subs used: {_sub_sig or 0}+{_sub_opp or 0}")
             _inj_sig = (_ev_extras_ft.get("injury_subst") or {}).get(tid, 0)
             _inj_opp = (_ev_extras_ft.get("injury_subst") or {}).get(_opp_tid_ft, 0)
-            if _inj_sig or _inj_opp:
-                _pitch_parts.append(f"\U0001f915 Injury subs: {_inj_sig}+{_inj_opp}")
-        if _pitch_parts:
-            msg += "\n\U0001f3a4 " + " | ".join(_pitch_parts)
 
         # v10.78: ODDS IN THE SIGNAL — the betting-decision block. ONE fast
         # quota-guarded capture (for_message=True: single pass, no retry
@@ -13473,8 +13613,15 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # goal-after-signal, BE 1.26, 44% within 15m on the 309-signal
         # ledger (n=78) vs 69%/36% for the plain pre-50' base — the
         # betting shortlist. Display + ledger only, NEVER a gate.
+        # v10.95: the two explanation lines fold into ONE flags line
+        # (dog now says winning/chasing — a dog already ahead is the
+        # 79%-quadrant, a dog chasing is the classic repricing lag) and
+        # the HIT-% HEADLINE (the ladder number, first line of the
+        # message). The a_grade boolean itself is unchanged.
         _dog_flag_msg: bool | None = None
         _dog_ratio_msg: float | None = None
+        _dog_state_msg: str | None = None
+        _deficit_now: int | None = None
         _a_grade_msg = False
         try:
             _dog_flag_msg, _dog_ratio_msg = compute_dog_flag(_odds_msg, is_home_sg)
@@ -13489,20 +13636,68 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 )
             )
             if _dog_flag_msg is True:
-                msg += (
-                    f"\n\U0001f415 DOG ({_dog_ratio_msg:.1f}x opp odds) — dog "
-                    f"signals: 57% hit, BE 1.74 (ledger)"
-                )
-            if _a_grade_msg:
-                _ag_bits = ["class A" if _lg_class == "A" else "dog"]
-                if _dog_flag_msg is True and _lg_class == "A":
-                    _ag_bits = ["class A + dog"]
-                msg += (
-                    f"\n\u2b50 A-GRADE ({' & '.join(_ag_bits)}, pre-50') — "
-                    f"79% hit, BE 1.26, 44% in 15m (ledger, n=78)"
-                )
+                _dog_state_msg = "winning" if _deficit_now < 0 else "chasing"
+            # v10.95: one compact flags line — the WHY behind the number
+            _flag_bits_95 = []
+            if _lg_class == "A":
+                _flag_bits_95.append("\U0001f3c6 class-A league")
+            if _dog_state_msg:
+                _flag_bits_95.append(f"\U0001f415 dog ({_dog_state_msg})")
+            if _deficit_now <= -2:
+                _flag_bits_95.append("coasting +2")
+            if _flag_bits_95:
+                msg += "\n" + " \u00b7 ".join(_flag_bits_95)
         except Exception as _de94:
             log.debug(f"  v10.94 dog/a-grade line skipped: {_de94}")
+
+        # v10.96: FT WIN/DRAW/LOSS line (user request, Sep 12: "prediction
+        # if it's going to be a win for either team or a draw with a
+        # percentage"). Surfaced from the v10.74 engine — the independent-
+        # Poisson grid over the remaining-goals lambdas, which already
+        # carry the live scoreline push/sit, the SOT/xG pressure and the
+        # v10.74 red-card adjustment (0.72x down / 1.08x up per net red),
+        # so a 10v11 chase shows it. Display-only: the pred_ft_* values
+        # were already landing in the ledger since v10.74; nothing new is
+        # computed and zero extra credits are spent.
+        try:
+            if _ft and _ft.get("p_team") is not None:
+                _opp_name_ft96 = (
+                    away["name"] if is_home_sg else home["name"]
+                )
+                _ft96_bits = [
+                    f"{tname} {int(round(_ft['p_team'] * 100))}%",
+                    f"draw {int(round(_ft['p_draw'] * 100))}%",
+                    f"{_opp_name_ft96} {int(round(_ft['p_opp'] * 100))}%",
+                ]
+                _ft96_line = (
+                    "\n\U0001f3c1 FT: " + " \u00b7 ".join(_ft96_bits)
+                )
+                # red-card context rides the SAME line (the engine already
+                # priced it — the tag just says so at a glance). Men count
+                # follows the line's team-first order: {team men}v{opp men}.
+                if (_rc_team_count or 0) or (_rc_opp_count or 0):
+                    _ft96_line += (
+                        f" ({11 - (_rc_team_count or 0)}v"
+                        f"{11 - (_rc_opp_count or 0)})"
+                    )
+                msg += _ft96_line
+        except Exception as _ft96e:
+            log.debug(f"  v10.96 FT line skipped: {_ft96e}")
+        # v10.95: HIT-% HEADLINE — the ledger ladder number, PREPENDED so
+        # it is the first thing read (user request: the percentage
+        # likelihood of the signal to win). sig_label keeps the post-goal
+        # 'next' honesty from v10.88 visible in the header.
+        try:
+            _grade_word, _hit_pct, _hit15_pct, _grade_stars = signal_hit_grade(
+                minute, _deficit_now, _lg_class, _dog_flag_msg,
+            )
+            msg = (
+                f"{tier_emoji(tier)} {_grade_word} — {_hit_pct}% goal chance "
+                f"{_grade_stars} ({sig_label})\n\n" + msg
+            )
+        except Exception as _he95:
+            log.debug(f"  v10.95 headline skipped: {_he95}")
+            msg = f"{tier_emoji(tier)} {tier} ({sig_label})\n\n" + msg
 
         # v10.80: CARDS & CORNERS market block — the OVER/UNDER prediction
         # line with odds, built from the SAME odds fetch (zero extra
@@ -13590,6 +13785,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "league_class": _lg_class,  # v10.94: A/B/C converter class
             "dog_flag": _dog_flag_msg,  # v10.94: message-time dog flag (ledger gets the final one)
             "a_grade": _a_grade_msg,  # v10.94: composite betting shortlist
+            "hit_grade": _grade_word,  # v10.95: the ladder word printed in the headline
+            "hit_pct": _hit_pct,  # v10.95: the ledger % printed in the headline
             "trend": trend, "is_new": is_new_team,
         })
 
@@ -13619,6 +13816,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # v10.1: Enriched outcome record with all raw indicators
         opp_goals = (sa if is_home_sg else sh)
         # v10.94: final A-GRADE from the final dog flag (ledger-grade)
+        _deficit_final: int | None = None
         try:
             _deficit_final = (opp_goals or 0) - goals_now
             _a_grade_final = bool(
@@ -13631,6 +13829,17 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             )
         except Exception:
             _a_grade_final = _a_grade_msg
+        # v10.95: ledger-grade hit ladder from the FINAL dog flag — the
+        # EOD nightly rows grade the printed number against reality
+        try:
+            _grade_final_word, _hit_pct_final, _, _ = signal_hit_grade(
+                minute, _deficit_final, _lg_class, _dog_flag_final
+            )
+        except Exception:
+            _grade_final_word, _hit_pct_final = _grade_word, _hit_pct
+        _dog_state_final = None
+        if _dog_flag_final is True and _deficit_final is not None:
+            _dog_state_final = "winning" if _deficit_final < 0 else "chasing"
         # v10.44q: Compute previous signal time for time_since_prev_signal field
         _prev_sig_time = team_sig.get("last_signal_time", 0) if team_sig else 0
         signal_outcomes.append({
@@ -13689,6 +13898,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "dog_flag": _dog_flag_final,  # True/False/None (None = no 1X2 captured)
             "dog_odds_ratio": _dog_ratio_final,  # team match-odds / opp match-odds
             "a_grade": _a_grade_final,  # composite: pre-50' + (class A | dog not winning) + not leading 2+
+            "hit_grade": _grade_final_word,  # v10.95: A-GRADE / BET / NO-BET (ladder word)
+            "hit_pct": _hit_pct_final,  # v10.95: the printed ladder % (ledger-grade)
+            "dog_state": _dog_state_final,  # v10.95: winning / chasing / None
             "goals_at_signal": goals_now,
             "opponent_goals_at_signal": opp_goals,
             "is_home": is_home_sg,
@@ -14772,6 +14984,10 @@ def main():
     # names, so they MUST be declared global here (previously the fast-lane
     # credit reset was a dead local assignment and never actually reset).
     global fastlane_shadow, _event_fast_lane_fids, _event_fast_lane_last, _event_fast_lane_credits_today
+    # v10.96: day-level pacing globals — update_pace_mode() and the main
+    # loop assign these names, so they MUST be declared global here
+    # (same bug class as the v10.50 UnboundLocalError crash).
+    global pace_mode_now, pace_burn_rate, pace_allowed_rate, pace_last_switch, pace_last_alert, _pace_readings
     global _fl_shadow_count_today, _fl_sot_events, _fl_seen_sot_count, _fl_goal_minutes, _fl_seen_goal_count, _fl_shadow_dedupe
     # v10.75: box-burst shadow state — the daily reset block and the startup
     # loader assign these names, so they MUST be declared global here
@@ -14802,7 +15018,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap + v10.68: ODDS CAPTURE HARDENING (signal-time market data made P&L-grade: one 3s retry when the odds fetch fails — 15/26 Sep-4 signals recorded NO odds — plus a suspect-price re-fetch and flag for impossible live prices (over-line implied < 12% before 80') and a live vs pre-match-fallback source tag — the stale pre-match totals prices were the Sep-4 garbage class (over 4.5 @ 23.00 etc.) that inflated the paper P&L by ~1,400 EUR; ~20 extra credits/day, retries quota-guarded, zero signal-logic changes + v10.69: PROJECTION SANITY + ADAPTIVE LINES + GOAL-SHOT-FREE FIRST SIGNALS (remaining-goals lambda = observed rate x REMAINING minutes, late blend to league average after 70' + GPS hotness lift and caps — the Elversberg 70' GPS-100 'Exp. total 9.0' projected 4 future goals where 2 landed; the projection block now shows only UNDECIDED over lines — at 2-2 the O2.5/O3.5 '100%' rows were pure noise — and BTTS hides once decided; and the CSKA Sofia post-mortem — the goal's own shot can no longer be the 3rd SOT that triggers a first CRITICAL: the SOT>=3 safety net and the 5-20' post-goal freshness check now run on ledger-genuine goal-shot-free counts, so a signal arriving minutes after the goal it announced is gone) + v10.70: TOP-SOT NON-SCORER ONLY (the 'scores next' line ONLY ever names players who have NOT scored yet — never a scorer, no '(scored)' tags, exactly the user's spec; when every listed shooter has already scored the line says exactly that; the deferred recovery stops quietly once the feed is current and all listed shooters scored — no credits on a line that can never exist — while a still-lagging feed keeps retrying because the unlisted SOT may belong to a non-scorer + v10.71: FEED-GUARD (silent API feed-death detection — the Sep 5 18:34 UTC incident: /fixtures?live=all returned an empty live set while 7 tracked matches were at 18'-78' and the quota counter froze at 7499 for 60+ min, all HTTP 200; now an all-monitored-vanish below 85' triggers a batched fixture-ID verification, verified-still-live games are HELD in monitoring with a Telegram alarm every 15m and auto-resume when the feed recovers (90m hold cap); a frozen-quota watchdog warns when the daily counter stops decrementing across 45+ calls; AND the pending-outcome orphan fix — signal_outcomes is never cleared while outcomes are pending (the Sep 5 18:42 gap-clear orphaned 9 pendings to disk), the EOD report/backup/clear now fire only at the true end of day (schedule-gated, anti-hammered), and mid-day gaps hold outcomes in memory for the 10-min periodic resolver + v10.72: SHADOW GATES + SELF-HEALING SLEEP (two would-suppress classes from the Sep 4-6 outcome data — DAMP: winning by 2+ with GPS<85, 23% full WR vs 31% baseline, and LATE75: signals at 75'+, 18% full WR — are now TAGGED in the log and every outcome record but sent UNCHANGED; the hard-gate flip is the one-line DAMPENER_HARD_GATE / LATE_HARD_GATE constant, decision after ~1 week of shadow data, ~300 tagged signals; heartbeat shows 'Shadow: DAMP:n+LATE75:n'; COLD-START LEDGER SEEDING: pre-restart goals seed the landed goal-shot ledger on a team's first poll, so the goal's own shot can never trigger a false first signal after a mid-match restart — Benfica 16' class, zero credits; STOP-MODE RENEWAL PROBE: one direct /status call per 30-min STOP wake re-reads the live quota header, so quota exhaustion self-heals at the 03:00 Sofia renewal instead of looping forever — api_get's pre-flight raise used to hide the renewal completely; MIDNIGHT LIVE-GAME GUARD: a live monitored match at the active-window rollover keeps being watched to FT (2h cap, freshness-gated so a stale cache can never fake it) — the GIL Vicente 71'-abandoned-at-00:00 class — and verified-FT guard releases + a heartbeat purge kill the frozen 'FastWin 0s' zombie + v10.73: RED-CARD VOICE + PLAYERS-STATS TOP-SOT FALLBACK (red cards now speak in every signal: the events feed the bot already polls yields player + minute + kind — Dunav-Slavia class: two reds, 10’ and 76’, previously invisible — with a NEW RED CARD warning inside 10 game minutes, man-up / man-down context, and red_cards_team / red_cards_opp / red_card_events recorded into every signal outcome and every poll for brain v2, zero extra credits, zero gate changes; AND when the events feed has no per-player shots at signal time — Serie A 0/16, Bundesliga 0/14, Eredivisie 0/9, Premier League 1/10, Ligue 1 1/13 in the Sep 1-5 audit — one /fixtures/players call delivers the Top SOT names from the stats pipeline: 1 credit, daily-capped (60), per-league censused (players_feed_census.json, visible in /sotfeed), same never-a-scorer ladder, merged into the player cache so repeat signals are free + v10.74: BOOT-PATH MIDNIGHT GUARD + CALIBRATED OVER PROJECTION + FT 1X2 PREDICTION (a restart at ~00:00 local no longer sleeps through live pending-outcome fixtures — the resolver's 'pendings on LIVE fixtures' knowledge feeds the v10.72 hold with a 25m freshness anchor and the same 2h cap, so the Sep 8 00:01-boot class is dead; the goal projection's GPS hotness lift is shrunk 0.8->0.2 after the Sep 1-7 backtest proved it pure bias — 74.5% predicted vs 54.1% landed on undecided O2.5 (n=170) and a naive no-pressure Poisson scored the better Brier 0.207 vs 0.301 — and the DISPLAYED over lines are now calibrated 50/50 against an empirical game-state table P(>=k more goals | current total x minute band) measured from the 229 resolved signals, with pred_over_*_cal + cal_mode recorded beside the raw model values for the next-week comparison; red cards now move the remaining-goals lambdas inside the same Poisson engine (0.72x down / 1.08x up per net red, events-based None-safe) so overs and FT odds both see 10v11; every signal carries a full-time 1X2 PREDICTION line — win/draw/loss for the signaled team from the live scoreline + adjusted lambdas, informational only, zero extra credits — plus a pitch-state line (men on pitch 11-Reds, subs used, injury-labeled subs from Subst detail='Injury') and pred_ft_sig/draw/opp outcome fields, with pred_ft_actual filled from the true FT result at resolution for later calibration; zero signal-gate changes, zero extra credits + v10.75: BOX-BURST SHADOW (the low-SOT box-volume class — SOT 1-2 while shots-inside-box>=8 within 21-61' — now records a VIRTUAL signal at the first crossing, never sent, never gating, zero extra credits; the Sep 2-8 backtest says 64.3% scored later / 35.7% within 15m plain (n=14) and 69.2%/38.5% with ib rising (n=13) vs a 48% base — the go-live rule after ~2 weeks of boxburst_shadow.jsonl records is >=60% later AND >=40% <=15m, then the one-line BOXBURST_LIVE flip adds a compact Telegram alert; records carry sot/ib/total_shots/ib_rising/gps/red-cards/real_signal_before and resolve EXACTLY like real signals through check_fastlane_shadow, which now walks BOTH shadow stores; own 2-poll ib history kept by the evaluator because the poll recency fields ib_5m_ago/ib_10m_ago are never populated; dedupe survives restarts (today's fired keys reloaded at boot), runtime state resets daily and purges with finished fixtures; heartbeat shows Shadow: ...+BOX:n; the redeploy guard verifies the new file and reports its count + v10.76: GOAL-BURST — THE TOTALS PATH (the Lille 2-3 Betis post-mortem: 5 goals by 53', ZERO signals — Betis' 3 SOT WERE the 3 goals so GOAL-SHOT NET left effective pressure 0, and GPS 52/65 never lit; the system only certifies sustained NON-goal pressure, so goal-burst games are structurally invisible; the Sep 2-8 backtest on 63,489 polls adds that 69% of FIRST goals land while the scorer's SOT is still <=2 — the SOT>=3 net is late by design; three banked-goals cells now record virtual MATCH-LEVEL signals at first crossing — G1 first-goal-by-25' (62% reach 3+, n=32), G2 two-goals-by-40' (84% next goal, 48% <=15m, n=44; GPS-blind subset 79%, no-signal-before 87% = the exact blind spot), G3 three-goals-by-55' (76%, n=37) — resolved with ANY-goal semantics (own goals count, Over-lines settlement) through check_fastlane_shadow which now walks THREE shadow stores; zero gate changes, zero extra credits; G2 already clears the box-burst go-live bar so its compact alert is ON by default (GOALBURST_LIVE) while G3/G1 stay shadow behind their own flags; ft_total + bet_hit stamped at resolution so the totals bets grade honestly; heartbeat shows Shadow: ...+GB:n; the redeploy guard verifies goalburst_shadow.jsonl and reports its count + v10.77: P&L-GRADE ODDS FILTER (the honest ledger: every signal outcome now carries odds_pnl_grade, True ONLY when odds_source='live' AND not odds_suspect — the Sep-6 post-mortem found 100% of recorded prices were prematch_fallback stale pre-match totals (Marseille O4.5 @ 26.0 with 4 goals already in at 54', AC Horsens O3.5 @ 11.0 with 3 in at 45', 22/58 prices >= 3.00) and the paper P&L of +1,900 EUR / ROI +164% on Sep 6 was the same garbage class as Sep 4's +1,400 EUR — at realistic live prices the day was break-even; the EOD report's MARKET / EV / Flat-ROI block now grades ONLY P&L-grade prices and SAYS how many stale prices were excluded, with backward-compatible derivation for old records (no field -> source/suspect fallback), while all prices remain in the file for research; zero gate changes, zero extra credits + v10.78: ODDS IN THE SIGNAL (the user's betting-decision block: every Telegram signal and every live G2 goal-burst alert now carries the MARKET PRICE captured at signal time — source-labeled LIVE vs 'PRE ref' with suspect prices flagged, the v10.77 ledger honesty moved into the chat — beside the CALIBRATED fair prices and break-evens for the next-goal over line and the team-to-score bet, so the 'do I bet?' call is: open your book, compare the live price against the printed break-even, done; one fast single-pass odds fetch (for_message mode: no retry sleep, no suspect re-fetch, quota-guarded) runs AFTER all gates pass and BEFORE the send (~1s later, same normal-path credit count, odds never influence the signal), the same data feeds the outcome record, a failed fast pass falls back to the full v10.68 hardened capture post-send; team-to-score fair = Poisson marginal blended 50/50 with the minute-banded landed rate from the user's own Sep 6-8 ledger (61%/65%/46%/35% bands), capped at the any-goal line; G2 alerts price the exact one-more-goal market and print the class break-even (84% -> 1.19); pred_team_scores/_cal + odds_ev_pct + odds_in_msg recorded for the next calibration pass; zero gate changes + v10.85: SIMPLIFIED SIGNAL (display-only, message cut ~45%: one-line stats per side with dead xG/BigChances/corners display channels dropped, one-line calibrated projection + FT prediction, plain-language bet block where the fair line says bet-only-at-LIVE-odds>=X, cards & corners lines say need-N-more and bet-Over-only-odds>=X, the Red Cards None line is gone, the orphan GPS +0 fragment fixed; the LEDGER, every recorded field, every gate and threshold UNCHANGED + v10.86: EMPIRICAL LAMBDA CALIBRATION — minute-banded deflate of the final remaining-goals lambdas (signal team 0.85/0.80/0.45, opponent 0.70/0.60/0.30 for <=45/<=60/61+; measured on the settled ledger Sep 2-9: opponent lambda 1.5x hot in both regimes, late-game collapse) — prediction-only, never a gate; fair prices + projections honest, bet-only-at-LIVE-odds>=X threshold stricter; 61+ signals stay full alerts (user decision) + v10.87: GOAL-RACE GUARD (feed-ahead-of-score mute — the PSV-Shakhtar 45' class: signal composed on a 0-0 stats batch while the events feed already knew the goal; the pre-send Top-SOT fetch's valid-goal count vs the message scoreline, feed-ahead -> mute + blocked-candidate record GOAL_RACE_FEED_AHEAD, the post-goal gates re-decide on the next poll; the POST-GOAL tag now says it watches the NEXT goal — the Fenerbahce 53' class was a genuine second-goal watch, only the wording hid it; v10.88: POST-GOAL HONESTY (the Man Utd 33' class — a stale 5-20m post-goal CRITICAL whose GPS>=75 trigger was completed by the goal's own shot — is now BLOCKED like every other tier, with POST_GOAL_STALE blocked records; the Como 28' class — a genuine attempt-burst next-goal watch that passed the 5-20m freshness gate in silence — now carries the same this-watches-the-NEXT-goal annotation; and the header ordinal becomes (next) once the signaling team has scored, so no post-goal signal can read as a first-goal warning + v10.89: RED-AWARE LOSING RELAXATION (a losing team with the opponent down a NET man and deficit <= 1 — the Slavia 1-0 Lens class, Lens blocked at 64' while chasing 10 men — now passes at STANDARD tier bars with a man-advantage message tag and a red_relax ledger field so the class grades itself; 11v11 losing, deficit >= 2, and missing-events cases keep the strict v10.34 gate — fail-closed) + v10.90: SOT3 SHADOW + G3 LIVE (blocked losing CRITICALs whose only failing criterion is SOT - GPS>=80, IB>=65, SOT==3, the Leipzig 54'/Galatasaray 75' class, 4/4 any-goal within 15m on the Sep 9-10 sample - are tagged sot3_relax on the blocked record for false-negative grading, promote at n>=15 with any-15m>=45%; G3 goes LIVE - 76% next-goal by FT, n=37 plus 3/4 on the fresh check - with a 10-minute anti-stack dedup so no Telegram alert stacks on a real signal or a recent burst alert; the shadow record is always written and graded + v10.94: LEDGER-GRADED SIGNAL FLAGS (the 309-signal Aug 30-Sep 11 ledger split: goal-pressure conversion is 68% (BE 1.46) in the top-9 tracked names - Ireland 80% (incl. 'Premier Division' alt name), 2.Bundesliga 79%, Bundesliga 75%, Süper Lig 71%, Superliga 65%, Coppa Italia 64%, UCL 63%, Czech Liga 62% - vs 42% (BE 2.36) in the cold-9 - PL 23%, First League 33%, La Liga 38%, HNL 40%, Ligue 1 42%, Liga I 47%, Serie A/Eredivisie/Primeira 50% - a 26pp spread the live market does not price because books grade pressure by game state, not league; every signal now carries a LEAGUE CLASS A/B/C line + ledger field, a DOG flag (team 1X2 >= 1.15x opponent, from the SAME signal-time odds fetch, zero extra credits - dogs convert 57% BE 1.74 n=68, dogs in class-A leagues 74% BE 1.34 n=39: the market anchors on the prematch favorite while the pressure is on the dog), and an A-GRADE composite line (pre-50' + not leading 2+ (anti-DAMP) + class-A-or-dog: 79% BE 1.26, 44% within 15m, n=78, vs 69%/36% for the plain pre-50' base - the betting shortlist); shots-inside-box was checked and deliberately NOT flagged on existing signals (flat once minute-controlled: 69/67/67/65% across ib buckets pre-50' - the raw ib split was minute confound, ib 10+ median 64' vs ib 0-3 median 36'; the box leverage stays where it belongs, the BOX-BURST shadow class); the EOD stats block grades every flag nightly (bet_flag, class A/C, DOG, A-GRADE) so class drift is caught live; ledger fields league_class/dog_flag/dog_odds_ratio/a_grade land in every outcome record; display + ledger ONLY, NEVER a gate, zero gate changes, zero extra credits)")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap + v10.68: ODDS CAPTURE HARDENING (signal-time market data made P&L-grade: one 3s retry when the odds fetch fails — 15/26 Sep-4 signals recorded NO odds — plus a suspect-price re-fetch and flag for impossible live prices (over-line implied < 12% before 80') and a live vs pre-match-fallback source tag — the stale pre-match totals prices were the Sep-4 garbage class (over 4.5 @ 23.00 etc.) that inflated the paper P&L by ~1,400 EUR; ~20 extra credits/day, retries quota-guarded, zero signal-logic changes + v10.69: PROJECTION SANITY + ADAPTIVE LINES + GOAL-SHOT-FREE FIRST SIGNALS (remaining-goals lambda = observed rate x REMAINING minutes, late blend to league average after 70' + GPS hotness lift and caps — the Elversberg 70' GPS-100 'Exp. total 9.0' projected 4 future goals where 2 landed; the projection block now shows only UNDECIDED over lines — at 2-2 the O2.5/O3.5 '100%' rows were pure noise — and BTTS hides once decided; and the CSKA Sofia post-mortem — the goal's own shot can no longer be the 3rd SOT that triggers a first CRITICAL: the SOT>=3 safety net and the 5-20' post-goal freshness check now run on ledger-genuine goal-shot-free counts, so a signal arriving minutes after the goal it announced is gone) + v10.70: TOP-SOT NON-SCORER ONLY (the 'scores next' line ONLY ever names players who have NOT scored yet — never a scorer, no '(scored)' tags, exactly the user's spec; when every listed shooter has already scored the line says exactly that; the deferred recovery stops quietly once the feed is current and all listed shooters scored — no credits on a line that can never exist — while a still-lagging feed keeps retrying because the unlisted SOT may belong to a non-scorer + v10.71: FEED-GUARD (silent API feed-death detection — the Sep 5 18:34 UTC incident: /fixtures?live=all returned an empty live set while 7 tracked matches were at 18'-78' and the quota counter froze at 7499 for 60+ min, all HTTP 200; now an all-monitored-vanish below 85' triggers a batched fixture-ID verification, verified-still-live games are HELD in monitoring with a Telegram alarm every 15m and auto-resume when the feed recovers (90m hold cap); a frozen-quota watchdog warns when the daily counter stops decrementing across 45+ calls; AND the pending-outcome orphan fix — signal_outcomes is never cleared while outcomes are pending (the Sep 5 18:42 gap-clear orphaned 9 pendings to disk), the EOD report/backup/clear now fire only at the true end of day (schedule-gated, anti-hammered), and mid-day gaps hold outcomes in memory for the 10-min periodic resolver + v10.72: SHADOW GATES + SELF-HEALING SLEEP (two would-suppress classes from the Sep 4-6 outcome data — DAMP: winning by 2+ with GPS<85, 23% full WR vs 31% baseline, and LATE75: signals at 75'+, 18% full WR — are now TAGGED in the log and every outcome record but sent UNCHANGED; the hard-gate flip is the one-line DAMPENER_HARD_GATE / LATE_HARD_GATE constant, decision after ~1 week of shadow data, ~300 tagged signals; heartbeat shows 'Shadow: DAMP:n+LATE75:n'; COLD-START LEDGER SEEDING: pre-restart goals seed the landed goal-shot ledger on a team's first poll, so the goal's own shot can never trigger a false first signal after a mid-match restart — Benfica 16' class, zero credits; STOP-MODE RENEWAL PROBE: one direct /status call per 30-min STOP wake re-reads the live quota header, so quota exhaustion self-heals at the 03:00 Sofia renewal instead of looping forever — api_get's pre-flight raise used to hide the renewal completely; MIDNIGHT LIVE-GAME GUARD: a live monitored match at the active-window rollover keeps being watched to FT (2h cap, freshness-gated so a stale cache can never fake it) — the GIL Vicente 71'-abandoned-at-00:00 class — and verified-FT guard releases + a heartbeat purge kill the frozen 'FastWin 0s' zombie + v10.73: RED-CARD VOICE + PLAYERS-STATS TOP-SOT FALLBACK (red cards now speak in every signal: the events feed the bot already polls yields player + minute + kind — Dunav-Slavia class: two reds, 10’ and 76’, previously invisible — with a NEW RED CARD warning inside 10 game minutes, man-up / man-down context, and red_cards_team / red_cards_opp / red_card_events recorded into every signal outcome and every poll for brain v2, zero extra credits, zero gate changes; AND when the events feed has no per-player shots at signal time — Serie A 0/16, Bundesliga 0/14, Eredivisie 0/9, Premier League 1/10, Ligue 1 1/13 in the Sep 1-5 audit — one /fixtures/players call delivers the Top SOT names from the stats pipeline: 1 credit, daily-capped (60), per-league censused (players_feed_census.json, visible in /sotfeed), same never-a-scorer ladder, merged into the player cache so repeat signals are free + v10.74: BOOT-PATH MIDNIGHT GUARD + CALIBRATED OVER PROJECTION + FT 1X2 PREDICTION (a restart at ~00:00 local no longer sleeps through live pending-outcome fixtures — the resolver's 'pendings on LIVE fixtures' knowledge feeds the v10.72 hold with a 25m freshness anchor and the same 2h cap, so the Sep 8 00:01-boot class is dead; the goal projection's GPS hotness lift is shrunk 0.8->0.2 after the Sep 1-7 backtest proved it pure bias — 74.5% predicted vs 54.1% landed on undecided O2.5 (n=170) and a naive no-pressure Poisson scored the better Brier 0.207 vs 0.301 — and the DISPLAYED over lines are now calibrated 50/50 against an empirical game-state table P(>=k more goals | current total x minute band) measured from the 229 resolved signals, with pred_over_*_cal + cal_mode recorded beside the raw model values for the next-week comparison; red cards now move the remaining-goals lambdas inside the same Poisson engine (0.72x down / 1.08x up per net red, events-based None-safe) so overs and FT odds both see 10v11; every signal carries a full-time 1X2 PREDICTION line — win/draw/loss for the signaled team from the live scoreline + adjusted lambdas, informational only, zero extra credits — plus a pitch-state line (men on pitch 11-Reds, subs used, injury-labeled subs from Subst detail='Injury') and pred_ft_sig/draw/opp outcome fields, with pred_ft_actual filled from the true FT result at resolution for later calibration; zero signal-gate changes, zero extra credits + v10.75: BOX-BURST SHADOW (the low-SOT box-volume class — SOT 1-2 while shots-inside-box>=8 within 21-61' — now records a VIRTUAL signal at the first crossing, never sent, never gating, zero extra credits; the Sep 2-8 backtest says 64.3% scored later / 35.7% within 15m plain (n=14) and 69.2%/38.5% with ib rising (n=13) vs a 48% base — the go-live rule after ~2 weeks of boxburst_shadow.jsonl records is >=60% later AND >=40% <=15m, then the one-line BOXBURST_LIVE flip adds a compact Telegram alert; records carry sot/ib/total_shots/ib_rising/gps/red-cards/real_signal_before and resolve EXACTLY like real signals through check_fastlane_shadow, which now walks BOTH shadow stores; own 2-poll ib history kept by the evaluator because the poll recency fields ib_5m_ago/ib_10m_ago are never populated; dedupe survives restarts (today's fired keys reloaded at boot), runtime state resets daily and purges with finished fixtures; heartbeat shows Shadow: ...+BOX:n; the redeploy guard verifies the new file and reports its count + v10.76: GOAL-BURST — THE TOTALS PATH (the Lille 2-3 Betis post-mortem: 5 goals by 53', ZERO signals — Betis' 3 SOT WERE the 3 goals so GOAL-SHOT NET left effective pressure 0, and GPS 52/65 never lit; the system only certifies sustained NON-goal pressure, so goal-burst games are structurally invisible; the Sep 2-8 backtest on 63,489 polls adds that 69% of FIRST goals land while the scorer's SOT is still <=2 — the SOT>=3 net is late by design; three banked-goals cells now record virtual MATCH-LEVEL signals at first crossing — G1 first-goal-by-25' (62% reach 3+, n=32), G2 two-goals-by-40' (84% next goal, 48% <=15m, n=44; GPS-blind subset 79%, no-signal-before 87% = the exact blind spot), G3 three-goals-by-55' (76%, n=37) — resolved with ANY-goal semantics (own goals count, Over-lines settlement) through check_fastlane_shadow which now walks THREE shadow stores; zero gate changes, zero extra credits; G2 already clears the box-burst go-live bar so its compact alert is ON by default (GOALBURST_LIVE) while G3/G1 stay shadow behind their own flags; ft_total + bet_hit stamped at resolution so the totals bets grade honestly; heartbeat shows Shadow: ...+GB:n; the redeploy guard verifies goalburst_shadow.jsonl and reports its count + v10.77: P&L-GRADE ODDS FILTER (the honest ledger: every signal outcome now carries odds_pnl_grade, True ONLY when odds_source='live' AND not odds_suspect — the Sep-6 post-mortem found 100% of recorded prices were prematch_fallback stale pre-match totals (Marseille O4.5 @ 26.0 with 4 goals already in at 54', AC Horsens O3.5 @ 11.0 with 3 in at 45', 22/58 prices >= 3.00) and the paper P&L of +1,900 EUR / ROI +164% on Sep 6 was the same garbage class as Sep 4's +1,400 EUR — at realistic live prices the day was break-even; the EOD report's MARKET / EV / Flat-ROI block now grades ONLY P&L-grade prices and SAYS how many stale prices were excluded, with backward-compatible derivation for old records (no field -> source/suspect fallback), while all prices remain in the file for research; zero gate changes, zero extra credits + v10.78: ODDS IN THE SIGNAL (the user's betting-decision block: every Telegram signal and every live G2 goal-burst alert now carries the MARKET PRICE captured at signal time — source-labeled LIVE vs 'PRE ref' with suspect prices flagged, the v10.77 ledger honesty moved into the chat — beside the CALIBRATED fair prices and break-evens for the next-goal over line and the team-to-score bet, so the 'do I bet?' call is: open your book, compare the live price against the printed break-even, done; one fast single-pass odds fetch (for_message mode: no retry sleep, no suspect re-fetch, quota-guarded) runs AFTER all gates pass and BEFORE the send (~1s later, same normal-path credit count, odds never influence the signal), the same data feeds the outcome record, a failed fast pass falls back to the full v10.68 hardened capture post-send; team-to-score fair = Poisson marginal blended 50/50 with the minute-banded landed rate from the user's own Sep 6-8 ledger (61%/65%/46%/35% bands), capped at the any-goal line; G2 alerts price the exact one-more-goal market and print the class break-even (84% -> 1.19); pred_team_scores/_cal + odds_ev_pct + odds_in_msg recorded for the next calibration pass; zero gate changes + v10.85: SIMPLIFIED SIGNAL (display-only, message cut ~45%: one-line stats per side with dead xG/BigChances/corners display channels dropped, one-line calibrated projection + FT prediction, plain-language bet block where the fair line says bet-only-at-LIVE-odds>=X, cards & corners lines say need-N-more and bet-Over-only-odds>=X, the Red Cards None line is gone, the orphan GPS +0 fragment fixed; the LEDGER, every recorded field, every gate and threshold UNCHANGED + v10.86: EMPIRICAL LAMBDA CALIBRATION — minute-banded deflate of the final remaining-goals lambdas (signal team 0.85/0.80/0.45, opponent 0.70/0.60/0.30 for <=45/<=60/61+; measured on the settled ledger Sep 2-9: opponent lambda 1.5x hot in both regimes, late-game collapse) — prediction-only, never a gate; fair prices + projections honest, bet-only-at-LIVE-odds>=X threshold stricter; 61+ signals stay full alerts (user decision) + v10.87: GOAL-RACE GUARD (feed-ahead-of-score mute — the PSV-Shakhtar 45' class: signal composed on a 0-0 stats batch while the events feed already knew the goal; the pre-send Top-SOT fetch's valid-goal count vs the message scoreline, feed-ahead -> mute + blocked-candidate record GOAL_RACE_FEED_AHEAD, the post-goal gates re-decide on the next poll; the POST-GOAL tag now says it watches the NEXT goal — the Fenerbahce 53' class was a genuine second-goal watch, only the wording hid it; v10.88: POST-GOAL HONESTY (the Man Utd 33' class — a stale 5-20m post-goal CRITICAL whose GPS>=75 trigger was completed by the goal's own shot — is now BLOCKED like every other tier, with POST_GOAL_STALE blocked records; the Como 28' class — a genuine attempt-burst next-goal watch that passed the 5-20m freshness gate in silence — now carries the same this-watches-the-NEXT-goal annotation; and the header ordinal becomes (next) once the signaling team has scored, so no post-goal signal can read as a first-goal warning + v10.89: RED-AWARE LOSING RELAXATION (a losing team with the opponent down a NET man and deficit <= 1 — the Slavia 1-0 Lens class, Lens blocked at 64' while chasing 10 men — now passes at STANDARD tier bars with a man-advantage message tag and a red_relax ledger field so the class grades itself; 11v11 losing, deficit >= 2, and missing-events cases keep the strict v10.34 gate — fail-closed) + v10.90: SOT3 SHADOW + G3 LIVE (blocked losing CRITICALs whose only failing criterion is SOT - GPS>=80, IB>=65, SOT==3, the Leipzig 54'/Galatasaray 75' class, 4/4 any-goal within 15m on the Sep 9-10 sample - are tagged sot3_relax on the blocked record for false-negative grading, promote at n>=15 with any-15m>=45%; G3 goes LIVE - 76% next-goal by FT, n=37 plus 3/4 on the fresh check - with a 10-minute anti-stack dedup so no Telegram alert stacks on a real signal or a recent burst alert; the shadow record is always written and graded + v10.94: LEDGER-GRADED SIGNAL FLAGS (the 309-signal Aug 30-Sep 11 ledger split: goal-pressure conversion is 68% (BE 1.46) in the top-9 tracked names - Ireland 80% (incl. 'Premier Division' alt name), 2.Bundesliga 79%, Bundesliga 75%, Süper Lig 71%, Superliga 65%, Coppa Italia 64%, UCL 63%, Czech Liga 62% - vs 42% (BE 2.36) in the cold-9 - PL 23%, First League 33%, La Liga 38%, HNL 40%, Ligue 1 42%, Liga I 47%, Serie A/Eredivisie/Primeira 50% - a 26pp spread the live market does not price because books grade pressure by game state, not league; every signal now carries a LEAGUE CLASS A/B/C line + ledger field, a DOG flag (team 1X2 >= 1.15x opponent, from the SAME signal-time odds fetch, zero extra credits - dogs convert 57% BE 1.74 n=68, dogs in class-A leagues 74% BE 1.34 n=39: the market anchors on the prematch favorite while the pressure is on the dog), and an A-GRADE composite line (pre-50' + not leading 2+ (anti-DAMP) + class-A-or-dog: 79% BE 1.26, 44% within 15m, n=78, vs 69%/36% for the plain pre-50' base - the betting shortlist); shots-inside-box was checked and deliberately NOT flagged on existing signals (flat once minute-controlled: 69/67/67/65% across ib buckets pre-50' - the raw ib split was minute confound, ib 10+ median 64' vs ib 0-3 median 36'; the box leverage stays where it belongs, the BOX-BURST shadow class); the EOD stats block grades every flag nightly (bet_flag, class A/C, DOG, A-GRADE) so class drift is caught live; ledger fields league_class/dog_flag/dog_odds_ratio/a_grade land in every outcome record; display + ledger ONLY, NEVER a gate, zero gate changes, zero extra credits + v10.95: SIMPLE SIGNAL + HIT-% LADDER (user request Sep 12: too much text and complexity - print the percentage likelihood of the signal to win): every signal now LEADS with the ledger hit-grade number - A-GRADE 79% (pre-50' + not leading 2+ + class-A-or-dog, n=78, 44% in 15m), BET 58% (pre-50' without qualifiers, n=105), NO-BET 37% (50'+, n=124) - stars carry the tier, the (next) post-goal ordinal stays in the header; the v10.94 league/dog/a-grade explanation lines, GPS/trigger detail, bet_flag, trend, recency, projection, FT prediction and pitch-state DISPLAY lines are all folded away (every value still lands in the ledger outcome record); the odds block is ONE line (book price + fair break-even + the bet-only-if-LIVE rule), cards & corners is ONE line with lean break-evens (same single render path, live edits byte-stable); the dog flag now says WINNING or CHASING (a dog already ahead is the best quadrant, 6/6 on the ledger; a dog chasing is the classic repricing lag) and a 'coasting +2' tag marks the anti-DAMP state; hit_grade/hit_pct/dog_state land in signals_sent and the outcome record, and the EOD stats block grades the PRINTED ladder numbers nightly (A-GRADE-says-79 / BET-says-58 / NO-BET-says-37 rows plus DOG winning vs chasing) so the headline is always live-graded, never assumed; display + ledger ONLY, NEVER a gate, zero gate changes, zero extra credits + v10.96: DAY-LEVEL CREDIT PACING + PREDICTION CARD (user request Sep 12: 'does throttling compromise signal speed? ...prediction on each signal - win/draw/loss with a percentage, corners, cards, top-SOT scorer, odds in the message'): (1) PACING — the Sep 12 post-mortem: burn 1,195 credits/h at midday vs 437/h the 7,500/day plan can sustain, quota death projected 19:15 Sofia = blind for the whole evening slate; the 10s event fast lane alone was 66% of spend and the 2,500/day lane cap reset on EVERY restart (4 redeploys today); now: affordable rate = (remaining-100) / hours-to-00:00-UTC vs the rolling 45-min burn measured straight from quota headers (restart-proof ground truth); PACE1 (burn > 1.15x affordable): event lane 10->20s + discovery x1.5 - REAL SIGNALS UNCHANGED (the signal path is the stats batch: 30s hot / 15s ultra-fast, untouched; the lane only feeds shadow detection, surge alarms and goal flashes, +10s advisory latency); PACE2 (burn > 1.5x affordable, or < 1500 left with 3h+ to go, or boot-seed heuristics): lane 30s, discovery x2, and the single real-signal concession - hot-stats floor 30->45s, goal-priority 15s windows exempt; +15s worst-case latency beats going dark; budget modes CAREFUL/STRICT/EMERGENCY/STOP still own the tank bottom as before; dwell hysteresis 300s, Telegram transition alerts (max 1/h), heartbeat shows Pace: burn vs affordable; (2) the lane daily counter now persists to fastlane_credit.json (date-keyed, UTC-day flip = fresh 0) so a redeploy can never reset the cap mid-day again; (3) PREDICTION CARD - the FT win/draw/loss line is surfaced from the v10.74 red-card-aware Poisson engine: 'FT: Team 61% - draw 25% - Opp 14% (10v11)' (pred_ft_* were ledger-only since v10.95 dropped the display), cards & corners bits now carry their P(over): 'Cards 2/4.5 -> O 62% @1.61+' (ledger-recorded since v10.80, only displayed now), Top-SOT next-scorer line and the one-line odds block unchanged from v10.95; every new display value was already computed from data the bot already fetched - ZERO extra credits, zero gate changes, zero threshold changes, prediction display only)")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -14931,6 +15147,9 @@ def main():
             f"v10.50: Loaded {len(_fl_loaded)} fast-lane shadow record(s) "
             f"from {FASTLANE_SHADOW_FILE} ({_fl_resolved} resolved)"
         )
+
+    # v10.96: restore the event-lane daily credit counter (restart-proof cap)
+    _event_fast_lane_credits_today = lane_credits_load()
 
     # v10.75: Load box-burst shadow records + rebuild the dedupe set so a
     # mid-match restart can never double-shadow a team-side that already
@@ -15183,6 +15402,7 @@ def main():
                         # (previously dead local assignments — the credit counter
                         # never actually reset at midnight, only on redeploys)
                         _event_fast_lane_credits_today = 0
+                        lane_credits_save(0)  # v10.96: disk copy resets with it
                         _event_fast_lane_fids = []
                         _event_fast_lane_last = 0
                         # v10.50: reset fast-lane shadow runtime state
@@ -15410,6 +15630,46 @@ def main():
 
             budget = get_budget_mode()
 
+            # v10.96: DAY-LEVEL PACING — recompute once per loop pass from
+            # live quota telemetry (header samples collected by
+            # update_quota). Alert on mode TRANSITIONS (max 1/hour): the
+            # user sees the throttle engage and release, never silently.
+            _pace_prev_96 = pace_mode_now
+            _pace_now_96 = update_pace_mode()
+            if _pace_now_96 != _pace_prev_96 and now - pace_last_alert >= PACE_ALERT_EVERY:
+                pace_last_alert = now
+                _pb = f"{pace_burn_rate:.0f}" if pace_burn_rate else "?"
+                _pa = f"{pace_allowed_rate:.0f}" if pace_allowed_rate else "?"
+                if _pace_now_96 == "PACE2":
+                    _pace_txt = (
+                        f"\U0001f422 v10.96 PACE2: burning {_pb}/h but only "
+                        f"{_pa}/h affordable \u2014 event lane 30s, hot stats 45s. "
+                        f"Quota {quota_remaining}/{quota_limit}, "
+                        f"{_hours_to_utc_midnight():.1f}h to reset. Real signals "
+                        f"keep flowing (worst case +15s)."
+                    )
+                elif _pace_now_96 == "PACE1":
+                    _pace_txt = (
+                        f"\U0001f422 v10.96 PACE1: burning {_pb}/h vs {_pa}/h "
+                        f"affordable \u2014 event lane 20s, discovery slowed. "
+                        f"Signal speed UNCHANGED. Quota {quota_remaining}/{quota_limit}."
+                    )
+                else:
+                    _pace_txt = (
+                        f"\u2705 v10.96 pace back to NORMAL "
+                        f"(burn {_pb}/h vs {_pa}/h affordable) \u2014 full speed, "
+                        f"10s event lane restored."
+                    )
+                try:
+                    send_telegram(client, _pace_txt)
+                except Exception as _pe96:
+                    log.warning(f"v10.96 pace alert failed: {_pe96}")
+                log.info(
+                    f"  v10.96 PACE: {_pace_prev_96 or 'NORMAL'} -> "
+                    f"{_pace_now_96 or 'NORMAL'} (burn {_pb}/h, affordable "
+                    f"{_pa}/h, remaining {quota_remaining})"
+                )
+
             # v10.72: re-arm the STOP probe timer whenever we are NOT in STOP,
             # so a future exhaustion episode probes on its own cadence.
             if budget != "STOP" and stop_probe["last"] != 0.0:
@@ -15462,6 +15722,12 @@ def main():
             discovery_interval = get_discovery_interval(
                 budget, has_tracked_live, has_candidates
             )
+            # v10.96: pacing stretches the discovery gap (new-game pickup
+            # +60..120s in PACE modes — a bargain vs. the credits saved).
+            if pace_mode_now == "PACE2":
+                discovery_interval = int(discovery_interval * PACE2_DISCOVERY_MULT)
+            elif pace_mode_now == "PACE1":
+                discovery_interval = int(discovery_interval * PACE1_DISCOVERY_MULT)
             need_discovery = (now - last_discovery_time) >= discovery_interval
 
             if need_discovery:
@@ -15480,6 +15746,10 @@ def main():
                     discovery_interval = get_discovery_interval(
                         budget, has_tracked_live, has_candidates
                     )
+                    if pace_mode_now == "PACE2":
+                        discovery_interval = int(discovery_interval * PACE2_DISCOVERY_MULT)
+                    elif pace_mode_now == "PACE1":
+                        discovery_interval = int(discovery_interval * PACE1_DISCOVERY_MULT)
                     # v10.62: REDEPLOY GUARD [tracking] — once, after the
                     # FIRST discovery: classify every live game + send the
                     # one summary message proving data + coverage survived.
@@ -15793,6 +16063,16 @@ def main():
             if pending_outcomes:
                 outcome_str += f" | Pend:{len(pending_outcomes)}"
 
+            # v10.96: pace telemetry in every heartbeat — burn vs affordable.
+            _pace_hb = ""
+            if pace_burn_rate is not None or pace_mode_now:
+                _pb_h = f"{pace_burn_rate:.0f}" if pace_burn_rate is not None else "?"
+                _pa_h = f"{pace_allowed_rate:.0f}" if pace_allowed_rate is not None else "?"
+                _pace_hb = (
+                    f" | Pace: {_pb_h}/h vs {_pa_h}/h "
+                    f"{pace_mode_now if pace_mode_now else 'NORMAL'}"
+                )
+
             log.info(
                 f"Quota: {quota_remaining}/{quota_limit} | "
                 f"Mode: {mode_label} | "
@@ -15801,7 +16081,7 @@ def main():
                 f"Keys: {healthy_key_count()}/{len(API_KEYS)} | "
                 f"Next disc: {int(next_disc_in)}s | Next stats: {stats_str} | "
                 f"Sleep: {int(sleep_time)}s | Reqs: {request_count} | "
-                f"Signals: {len(signals_sent)}{fast_window_info}{extra_info}{outcome_str}"
+                f"Signals: {len(signals_sent)}{_pace_hb}{fast_window_info}{extra_info}{outcome_str}"
             )
 
             # v9.8: Log outcome summary when all matches done
