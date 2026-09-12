@@ -3,6 +3,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 import gzip
 import io
@@ -571,7 +572,38 @@ _goalburst_count_date: str | None = None
 # startup (banners were hardcoded per-feature strings), so a fresh
 # deploy could not be verified from logs until the first signal carried
 # its [v10.xx] tag. One f-string line fixes it for every future bump.
-BOT_VERSION = "v10.96"
+# v10.98 — (a) SELF-EXPLANATORY MARKET LINE (user request Sep 13: the
+# cards/corners bit was unreadable): 'Cards 0/3.5 -> U 95% @1.05+'
+# becomes 'Cards 0 so far / line 3.5 -> under 95% (min odds 1.05)' —
+# the live count, the bookmaker's line and the minimum take-price are
+# now labeled in plain words. SAME single render path (byte-stable
+# live edits), SAME maths, SAME mkt_* ledger fields — text only.
+# (b) TOP-SCORER MORNING REPORT (user request Sep 13): ONE message per
+# day BEFORE the first kickoff — per tracked league with games today,
+# the leading scorer (season apps + goals, /players/topscorers), his
+# OWN last-5 scoring record (/fixtures?team&last=5 + per-fixture
+# /fixtures/players), the clubs' H2H if they met recently, and a
+# Poisson P(he scores today) = season rate x L5 form x H2H. ~8
+# credits/league, morning-only (full tank), daily-capped, budget/
+# pace-guarded, daemon-threaded (the loop never waits), date-keyed
+# marker file (redeploys never re-send), manual /topscorers trigger.
+# v10.99 — DAILY GOALS BOARD (user request Sep 13: "like the top
+# scorers i want similar stats but for goals — how likely is it
+# gonna be over 2.5 or under in the todays game based on h2h and
+# recent performance"): ONE Telegram message per day BEFORE the
+# first kickoffs (companion to the top-scorer report): per tracked
+# game still to start — exp goals (each side = own L5 attack x
+# opponent's L5 defense, league base when a side is missing; H2H
+# meetings re-weight 15/25%; clamp 1.2-4.2), Poisson over/under
+# 2.5, supporting form g/g + H2H line. Reuses the v10.97 context
+# layer: a fixture warmed by the live layer reads FREE, a fresh one
+# pays the standard 5 credits once and is STORED (the board pre-pays
+# the evening signal context). Cap 30 games (busiest leagues first),
+# GOALSBOARD_DAILY_CAP=150, morning-only (full tank), same
+# quota/pace/budget guards, daemon-threaded, date-keyed
+# goalsboard_sent.json (redeploys never re-send), /goalsboard
+# manual trigger. Display-only — never a signal, never a gate.
+BOT_VERSION = "v10.99"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -2044,6 +2076,9 @@ def compute_goal_predictions(
     gps: float | None = None,
     team_reds: int | None = None,
     opp_reds: int | None = None,
+    form_mod_sig: float = 1.0,
+    form_mod_opp: float = 1.0,
+    h2h_mod: float | None = None,
 ) -> dict:
     """Compute over/under goal probabilities for the full match.
     
@@ -2153,7 +2188,24 @@ def compute_goal_predictions(
         if minute <= _bound:
             proj_xg_opponent *= _fac
             break
-    
+
+    # v10.97: FORM + H2H CONTEXT — applied LAST, after the whole shipped
+    # chain (rate -> remaining -> hotness -> scoreline -> reds -> caps ->
+    # v10.86 deflate), so the modifiers move the already-calibrated
+    # lambdas by a bounded amount and nothing upstream changes. The plain
+    # (no-context) values are recorded beside the adjusted ones so the EOD
+    # accuracy report grades whether the factors actually help.
+    # PREDICTION-ONLY: never a gate, never GPS input. User request Sep 12.
+    _fs97 = _clamp97(float(form_mod_sig) * (float(h2h_mod) if h2h_mod else 1.0),
+                     FORM_MOD_MIN, FORM_MOD_MAX)
+    _fo97 = _clamp97(float(form_mod_opp) * (float(h2h_mod) if h2h_mod else 1.0),
+                     FORM_MOD_MIN, FORM_MOD_MAX)
+    proj_xg_signal_plain = proj_xg_signal
+    proj_xg_opponent_plain = proj_xg_opponent
+    proj_xg_signal *= _fs97
+    proj_xg_opponent *= _fo97
+    _form_applied = (_fs97 != 1.0) or (_fo97 != 1.0)
+
     # --- Compute over/under probabilities ---
     # v10.44h: Account for goals already scored!
     # Poisson lambdas model FUTURE goals only, so shift threshold by current scoreline.
@@ -2223,6 +2275,13 @@ def compute_goal_predictions(
     return {
         "proj_xg_signal": round(proj_xg_signal, 2),
         "proj_xg_opponent": round(proj_xg_opponent, 2),
+        # v10.97: plain (no-context) lambdas + the applied modifiers, for
+        # the nightly form-vs-plain grading in the EOD accuracy report.
+        "proj_xg_signal_plain": round(proj_xg_signal_plain, 2),
+        "proj_xg_opponent_plain": round(proj_xg_opponent_plain, 2),
+        "form_mod_sig": round(_fs97, 3),
+        "form_mod_opp": round(_fo97, 3),
+        "form_applied": _form_applied,
         "expected_total_goals": round(expected_total, 2),
         "p_over_25": round(p_over_25, 2),
         "p_over_35": round(p_over_35, 2),
@@ -3798,7 +3857,7 @@ _REDEPLOY_JSONL_FILES: list[str] = [
 ]
 _REDEPLOY_JSON_FILES: list[str] = [
     "poisson_calibration.json", "field_census.json", "sot_feed_census.json",
-    "players_feed_census.json",
+    "players_feed_census.json", "form_context.json", "referee_cards.json",
 ]
 
 
@@ -9354,6 +9413,30 @@ MKT_LEAN_OVER_P = 0.55                # P(over) needed to print LEAN: OVER
 MKT_LEAN_UNDER_P = 0.45               # P(over) below this prints LEAN: UNDER
 MKT_EDIT_MIN_INTERVAL = 45            # seconds between edits of one message
 
+# --- v10.97: FORM / H2H / REFEREE CONTEXT (user request, Sep 12:
+# "when predicting the over goals take into consideration the team recent
+# 5 games form, h2h record if they played last month; same for the FT
+# score; for cards the referee, h2h and last 5 games") ---
+# All modifiers are PREDICTION-ONLY (never a gate, never GPS input),
+# clamped hard, and graded nightly in the EOD accuracy report against
+# the plain no-context predictions so the ledger itself says whether
+# each factor helps. Credit budget: 5 calls per fixture (2x last-5
+# fixtures, 2x teams/statistics, 1x H2H), pre-warmed the moment a
+# fixture turns warm (SOT>=1) — BEFORE a signal is possible — so the
+# signal send itself gains ZERO latency in the normal case.
+FORM_CTX_DAILY_CAP = 75              # credits/day for the whole context layer (1% of budget)
+FORM_MOD_MIN = 0.85                  # clamp: combined form modifier on a team's lambda
+FORM_MOD_MAX = 1.20
+H2H_MOD_MIN = 0.90                   # clamp: H2H total-goals environment modifier
+H2H_MOD_MAX = 1.10
+H2H_RECENT_WINDOW_DAYS = 31          # "if they played last month" (31d, either side)
+REF_CARD_MIN_GAMES = 3               # referee census warm-up (self-learned, free)
+REF_CARD_MOD_MIN = 0.75              # clamp: referee card-rate factor
+REF_CARD_MOD_MAX = 1.30
+TEAM_CARD_MOD_MIN = 0.80             # clamp: teams' season card-rate factor
+TEAM_CARD_MOD_MAX = 1.25
+CARDS_MOD_TOTAL_MIN = 0.75           # clamp: combined cards lambda modifier
+CARDS_MOD_TOTAL_MAX = 1.35
 # (fid, tid) -> market-block live state for editMessageText updates
 _market_block_live: dict[tuple[int, int], dict] = {}
 _ft_market_stats_done: set[int] = set()   # fixtures whose FT corners/cards were stamped
@@ -9392,6 +9475,1137 @@ def _mkt_project_total(current: int | None, game_minute: int,
     else:
         pace = base_pace
     return cur + pace * remaining * boost
+
+
+# ================= v10.97: FORM / H2H / REFEREE CONTEXT LAYER =================
+# One cached context dict per fixture (in-memory + form_context.json,
+# date-keyed, redeploy-proof), fetched the moment a fixture turns warm
+# (SOT>=1 — before a signal is possible): last-5 results per team
+# (/fixtures?team=X&last=5), season card rates per team
+# (/teams/statistics), head-to-head meetings (/fixtures/headtohead).
+# Derived: per-team form lambda modifiers + the H2H goal-environment
+# modifier + the cards lambda modifier (referee census is SELF-LEARNED
+# from games the bot itself watches — free, warms up over ~3 games per
+# official). Every modifier is clamped and PREDICTION-ONLY. The API
+# response shapes are parsed fully defensively (the v10.60 census
+# lesson: never assume a field — a missing piece degrades that one
+# modifier to neutral 1.0, the signal is never affected).
+FORM_CTX_FILE = os.path.join(_VOLUME_DIR, "form_context.json")
+REF_CARDS_FILE = os.path.join(_VOLUME_DIR, "referee_cards.json")
+_form_ctx: dict[int, dict | None] = {}      # fid -> context (None = fetch failed)
+_form_ctx_credits_today: int = 0
+_form_ctx_date: str = ""                    # UTC date key (daily reset)
+_ref_cards: dict[str, dict] = {}            # referee name -> {"games": n, "cards": n}
+
+
+def _clamp97(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(x)))
+
+
+def _form_ctx_date_now() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _form_ctx_load() -> None:
+    """Boot: restore yesterday's-today context + the referee census."""
+    global _form_ctx, _form_ctx_date, _ref_cards
+    try:
+        with open(FORM_CTX_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if raw.get("date") == _form_ctx_date_now():
+            _form_ctx = {int(k): (v if v else None) for k, v in (raw.get("ctx") or {}).items()}
+        _form_ctx_date = _form_ctx_date_now()
+        log.info(f"v10.97: form context loaded ({len(_form_ctx)} fixture(s), today)")
+    except Exception:
+        _form_ctx = {}
+        _form_ctx_date = _form_ctx_date_now()
+    try:
+        with open(REF_CARDS_FILE, "r", encoding="utf-8") as f:
+            _ref_cards = {str(k): dict(v) for k, v in json.load(f).items()}
+        log.info(f"v10.97: referee census loaded ({len(_ref_cards)} official(s))")
+    except Exception:
+        _ref_cards = {}
+
+
+def _form_ctx_save() -> None:
+    try:
+        with open(FORM_CTX_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": _form_ctx_date_now(), "ctx": {str(k): v for k, v in _form_ctx.items()}}, f)
+    except Exception:
+        pass
+
+
+def _ref_cards_save() -> None:
+    try:
+        with open(REF_CARDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_ref_cards, f, indent=1)
+    except Exception:
+        pass
+
+
+def _ref_cards_update(ref_name: str | None, ft_cards: int) -> None:
+    """v10.97: self-learned referee census — every FT-stamped fixture with
+    a known referee and a real cards total teaches the card rate. Free
+    (data the resolver already fetched). Persisted; warms up per official."""
+    if not ref_name:
+        return
+    try:
+        st = _ref_cards.setdefault(str(ref_name).strip(), {"games": 0, "cards": 0})
+        st["games"] = int(st.get("games", 0)) + 1
+        st["cards"] = int(st.get("cards", 0)) + int(ft_cards)
+        _ref_cards_save()
+    except Exception:
+        pass
+
+
+def _ref_cards_factor(ref_name: str | None) -> tuple[float, int | None]:
+    """Referee card-rate factor vs the 4.6/game league blend. Neutral 1.0
+    until the census holds >= REF_CARD_MIN_GAMES games for that official.
+    Returns (factor, n_games) — n_games None = referee unknown."""
+    if not ref_name:
+        return 1.0, None
+    st = _ref_cards.get(str(ref_name).strip())
+    if not st or int(st.get("games", 0)) < REF_CARD_MIN_GAMES:
+        return 1.0, int(st.get("games", 0)) if st else 0
+    avg = float(st["cards"]) / float(st["games"])
+    return _clamp97(avg / (MKT_BASE_PACE_CARDS * 90.0), REF_CARD_MOD_MIN, REF_CARD_MOD_MAX), int(st["games"])
+
+
+def _parse_last5(client: httpx.Client, team_id: int) -> dict | None:
+    """Last 5 played fixtures for one team: form string (most recent
+    first), goals for/against per game. /fixtures?team=X&last=5."""
+    try:
+        data = api_get(client, "/fixtures", {"team": team_id, "last": 5})
+        resp = data.get("response") or []
+        rows = []
+        for it in resp:
+            try:
+                g = it.get("goals") or {}
+                gf = g.get("home"); ga = g.get("away")
+                th = (it.get("teams") or {}).get("home") or {}
+                if gf is None or ga is None or not th.get("id"):
+                    continue
+                is_home = int(th.get("id")) == int(team_id)
+                mine = int(gf) if is_home else int(ga)
+                theirs = int(ga) if is_home else int(gf)
+                rows.append({"mine": mine, "theirs": theirs,
+                             "date": str((it.get("fixture") or {}).get("date") or "")[:10]})
+            except Exception:
+                continue
+        if not rows:
+            return None
+        letters = "".join("W" if r["mine"] > r["theirs"] else "D" if r["mine"] == r["theirs"] else "L" for r in rows)
+        return {
+            "form_str": letters,           # e.g. "WWDLW", most recent FIRST
+            "gf_pg": sum(r["mine"] for r in rows) / float(len(rows)),
+            "ga_pg": sum(r["theirs"] for r in rows) / float(len(rows)),
+            "n": len(rows),
+        }
+    except Exception:
+        return None
+
+
+def _parse_team_cards_stats(client: httpx.Client, team_id: int,
+                            league_id: int | None, season: int | None) -> dict | None:
+    """Season cards per game for one team: /teams/statistics. Booking
+    units = yellow + yellowred + red (the O/U settlement convention,
+    same as mkt_cards)."""
+    if not league_id or season is None:
+        return None
+    try:
+        data = api_get(client, "/teams/statistics",
+                       {"team": team_id, "league": league_id, "season": season})
+        resp = data.get("response") or {}
+        cards = resp.get("cards") or {}
+        played = int(((resp.get("fixtures") or {}).get("played") or {}).get("total") or 0)
+        tot = 0
+        for kind in ("yellow", "yellowred", "red"):
+            tot += int((cards.get(kind) or {}).get("total") or 0)
+        if played <= 0 or tot <= 0:
+            return None
+        return {"cards_pg": tot / float(played), "played": played}
+    except Exception:
+        return None
+
+
+def _parse_h2h(client: httpx.Client, t1: int, t2: int) -> dict | None:
+    """Head-to-head meetings: /fixtures/headtohead?h2h=t1-t2&last=5.
+    avg total goals + whether the most recent meeting sits inside the
+    31-day window (the user's 'if they played last month')."""
+    try:
+        data = api_get(client, "/fixtures/headtohead",
+                       {"h2h": f"{t1}-{t2}", "last": 5})
+        resp = data.get("response") or []
+        rows = []
+        for it in resp:
+            try:
+                g = it.get("goals") or {}
+                if g.get("home") is None or g.get("away") is None:
+                    continue
+                rows.append({
+                    "total": int(g["home"]) + int(g["away"]),
+                    "ts": (it.get("fixture") or {}).get("timestamp"),
+                })
+            except Exception:
+                continue
+        if not rows:
+            return None
+        now = time.time()
+        last_ts = None
+        for r in rows:
+            if r["ts"]:
+                last_ts = max(last_ts or 0, float(r["ts"]))
+        recent = bool(last_ts and (now - float(last_ts)) <= H2H_RECENT_WINDOW_DAYS * 86400.0)
+        return {
+            "avg_total": sum(r["total"] for r in rows) / float(len(rows)),
+            "n": len(rows),
+            "recent": recent,
+        }
+    except Exception:
+        return None
+
+
+def fetch_form_context(client: httpx.Client, fixture: dict) -> dict | None:
+    """Build the full v10.97 context dict for one fixture (5 credits).
+    Every sub-fetch is independent and None-safe: a failed/missing piece
+    degrades ONLY its own modifier to neutral — the over/FT/cards
+    predictions then run exactly as v10.96 did."""
+    home = (fixture.get("teams") or {}).get("home") or {}
+    away = (fixture.get("teams") or {}).get("away") or {}
+    lg = fixture.get("league") or {}
+    h_tid, a_tid = home.get("id"), away.get("id")
+    if not h_tid or not a_tid:
+        return None
+    ref_name = (fixture.get("fixture") or {}).get("referee")
+
+    base_team = PROJECTION_AVG_TOTAL / 2.0     # per-team goals/game baseline
+    cards_base = MKT_BASE_PACE_CARDS * 90.0    # 4.6 bookings/game league blend
+
+    l5_h = _parse_last5(client, int(h_tid))
+    l5_a = _parse_last5(client, int(a_tid))
+    ts_h = _parse_team_cards_stats(client, int(h_tid), lg.get("id"), lg.get("season"))
+    ts_a = _parse_team_cards_stats(client, int(a_tid), lg.get("id"), lg.get("season"))
+    h2h = _parse_h2h(client, int(h_tid), int(a_tid))
+
+    # --- form lambda modifiers: attack (own gf) blended 50/50 with the
+    # opponent's leakiness (their ga), vs the per-team baseline, clamped.
+    def _mod(me: dict | None, opp: dict | None) -> float | None:
+        if not me or not opp or me.get("n", 0) < 3 or opp.get("n", 0) < 3:
+            return None
+        attack = float(me.get("gf_pg") or 0.0)
+        opp_leak = float(opp.get("ga_pg") or 0.0)
+        return _clamp97((attack + opp_leak) / (2.0 * base_team), FORM_MOD_MIN, FORM_MOD_MAX)
+
+    mod_home = _mod(l5_h, l5_a)   # home scores: home attack x away defense
+    mod_away = _mod(l5_a, l5_h)   # away scores: away attack x home defense
+
+    # --- H2H goal-environment modifier: only when they met within 31 days
+    h2h_mod = None
+    if h2h and h2h.get("recent") and h2h.get("n", 0) >= 2:
+        h2h_mod = _clamp97(float(h2h["avg_total"]) / PROJECTION_AVG_TOTAL,
+                           H2H_MOD_MIN, H2H_MOD_MAX)
+
+    # --- cards modifier: referee factor x teams' season card rates
+    ref_factor, ref_games = _ref_cards_factor(ref_name)
+    team_cards_mod = None
+    if ts_h and ts_a:
+        pair_avg = (float(ts_h["cards_pg"]) + float(ts_a["cards_pg"])) / 2.0
+        team_cards_mod = _clamp97(pair_avg / cards_base, TEAM_CARD_MOD_MIN, TEAM_CARD_MOD_MAX)
+    cards_mod = None
+    if (ref_factor != 1.0) or team_cards_mod:
+        cards_mod = _clamp97(ref_factor * (team_cards_mod or 1.0),
+                             CARDS_MOD_TOTAL_MIN, CARDS_MOD_TOTAL_MAX)
+
+    if not any([mod_home, mod_away, h2h_mod, cards_mod, l5_h, l5_a, h2h, ref_name]):
+        return None
+
+    return {
+        "form_home": l5_h, "form_away": l5_a,
+        "form_mod_home": mod_home, "form_mod_away": mod_away,
+        "h2h": h2h, "h2h_mod": h2h_mod,
+        "referee": ref_name, "ref_games": ref_games,
+        "cards_mod": cards_mod,
+        "ts": time.time(),
+    }
+
+
+def _ensure_form_context(client: httpx.Client, fixture: dict) -> None:
+    """Pre-warm gate: fetch once per fixture per day, credit-capped
+    (FORM_CTX_DAILY_CAP), skipped when the tank is stressed (budget
+    STRICT+ or PACE2 with <1500 left — context is a luxury, signals are
+    the product). Called from the stats poll when a fixture first turns
+    warm (SOT>=1), i.e. BEFORE any signal can fire — the signal send
+    path itself never waits on these 5 calls."""
+    global _form_ctx_credits_today, _form_ctx_date
+    try:
+        fid = fixture["fixture"]["id"]
+        if _form_ctx_date != _form_ctx_date_now():
+            _form_ctx.clear()
+            _form_ctx_date = _form_ctx_date_now()
+            _form_ctx_credits_today = 0
+        if fid in _form_ctx:
+            return
+        if _form_ctx_credits_today + 5 > FORM_CTX_DAILY_CAP:
+            return
+        if quota_remaining is not None and quota_remaining < 400:
+            return
+        if pace_mode_now == "PACE2" and quota_remaining is not None and quota_remaining < 1500:
+            return
+        mode = get_budget_mode()
+        if mode in ("STRICT", "EMERGENCY", "STOP"):
+            return
+        ctx = fetch_form_context(client, fixture)
+        _form_ctx[fid] = ctx
+        if ctx:
+            _form_ctx_credits_today += 5
+            _form_ctx_save()
+            log.info(
+                f"  v10.97 FORM CTX F{fid}: "
+                f"home {(ctx.get('form_home') or {}).get('form_str', '?')} "
+                f"/ away {(ctx.get('form_away') or {}).get('form_str', '?')} "
+                f"| h2h {'%.1f' % (ctx.get('h2h') or {}).get('avg_total', 0) if ctx.get('h2h') else 'n/a'}"
+                f"{' (recent)' if (ctx.get('h2h') or {}).get('recent') else ''} "
+                f"| ref {ctx.get('referee') or '?'} (n={ctx.get('ref_games')})"
+            )
+    except Exception as _e97:
+        log.debug(f"  v10.97 form context skipped: {_e97}")
+
+
+def _form_ctx_line(fid: int, tname: str, is_home_sg: bool,
+                   home_name: str, away_name: str) -> str:
+    """v10.97: ONE compact transparency line for the signal message —
+    the inputs behind the adjusted percentages. Never breaks a send
+    (fully defensive)."""
+    try:
+        ctx = _form_ctx.get(fid)
+        if not ctx:
+            return ""
+        bits = []
+        me = (ctx.get("form_home") if is_home_sg else ctx.get("form_away")) or {}
+        opp = (ctx.get("form_away") if is_home_sg else ctx.get("form_home")) or {}
+        if me.get("form_str"):
+            _o = f" · {opp.get('form_str', '?')}" if opp.get("form_str") else ""
+            bits.append(f"Form: {me['form_str']}{_o}")
+        h2h = ctx.get("h2h")
+        if h2h and h2h.get("recent") and h2h.get("n"):
+            bits.append(
+                f"H2H {h2h['avg_total']:.1f} g/g (n={h2h['n']}, last month)"
+            )
+        elif h2h and h2h.get("n"):
+            bits.append(f"H2H n={h2h['n']} (older)")
+        ref = ctx.get("referee")
+        if ref:
+            st = _ref_cards.get(str(ref).strip())
+            if st and int(st.get("games", 0)) >= REF_CARD_MIN_GAMES:
+                bits.append(
+                    f"Ref {ref} {float(st['cards']) / float(st['games']):.1f} cards/g"
+                )
+            else:
+                bits.append(f"Ref {ref}")
+        if not bits:
+            return ""
+        return "\n\U0001f4ca " + " · ".join(bits)
+    except Exception:
+        return ""
+
+
+def _form_ctx_goal_mods(fid: int, is_home_sg: bool) -> tuple[float, float, float | None]:
+    """The (form_mod_sig, form_mod_opp, h2h_mod) triple for the SIGNALED
+    team, all neutral 1.0 when context is missing. Prediction-only."""
+    ctx = _form_ctx.get(fid)
+    if not ctx:
+        return 1.0, 1.0, None
+    ms = (ctx.get("form_mod_home") if is_home_sg else ctx.get("form_mod_away")) or 1.0
+    mo = (ctx.get("form_mod_away") if is_home_sg else ctx.get("form_mod_home")) or 1.0
+    return float(ms), float(mo), ctx.get("h2h_mod")
+
+
+# ================= v10.98: TOP-SCORER MORNING REPORT =================
+# One Telegram message per day, sent BEFORE the first kickoff (the loop
+# hook fires right after the 10:00 Sofia schedule fetch arms
+# todays_tracked_fixtures): for every tracked league with games today,
+# its leading scorer — season apps + goals (/players/topscorers), his
+# OWN last-5 scoring record (/fixtures?team=X&last=5 for the fixture
+# ids, then /fixtures/players per fixture), the clubs' H2H when they
+# met inside the 31-day window (same convention as the form context),
+# and a Poisson P(he scores today) = season goals/game x last-5 x H2H.
+# User request Sep 13. Cost ~8 credits per league, morning-only (full
+# tank right after the 00:00 UTC reset), daily-capped; same budget/
+# pace guards as every optional layer; daemon-threaded so the polling
+# loop NEVER waits on it; date-keyed topscorer_sent.json means a
+# redeploy can never re-send. PREDICTION-DISPLAY-ONLY — never a signal,
+# never a gate, nothing recorded in the ledger.
+TOPSCORER_SEND_HOUR_LOCAL = 10   # Sofia hour when the auto-send may fire
+TOPSCORER_MAX_LEAGUES = 15       # report length cap (busiest leagues first)
+TOPSCORER_DAILY_CAP = 130        # credits/day for the whole report layer
+TOPSCORER_L5_FIXTURES = 5        # per-player last-5 lookups
+TOPSCORER_LAM_MIN = 0.05         # clamp on the scorer's lambda
+TOPSCORER_LAM_MAX = 2.5
+TOPSCORER_SENT_FILE = os.path.join(_VOLUME_DIR, "topscorer_sent.json")
+_ts_credits_today: int = 0
+_ts_credits_date: str = ""
+_ts_inflight: bool = False
+_ts_attempts_today: int = 0
+_ts_attempt_date: str = ""
+
+
+def _ts_today() -> str:
+    """Sofia-day key (the report is a Sofia-day concept — same clock the
+    schedule, night gate and EOD markers use)."""
+    return datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+
+
+def _ts_sent_date() -> str:
+    """Load the persisted sent-marker (redeploy-proof, EOD pattern)."""
+    try:
+        if os.path.exists(TOPSCORER_SENT_FILE):
+            with open(TOPSCORER_SENT_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _ts_mark_sent() -> None:
+    try:
+        with open(TOPSCORER_SENT_FILE, "w", encoding="utf-8") as f:
+            f.write(_ts_today())
+    except Exception:
+        pass
+
+
+def _ts_topscorers(client: httpx.Client, league_id: int,
+                   season: int | None) -> list[dict]:
+    """/players/topscorers (1 credit) -> scorer dicts sorted by season
+    goals desc: pid, name, tid, team, apps, goals. Fully defensive
+    (the v10.60 lesson: never assume a field — a missing piece drops
+    that entry, a broken/empty response returns []). The API spells
+    appearances 'appearences' — both spellings read."""
+    global _ts_credits_today
+    try:
+        data = api_get(client, "/players/topscorers",
+                       {"league": int(league_id), "season": int(season)})
+        _ts_credits_today += 1
+    except Exception:
+        return []
+    rows: list[dict] = []
+    for it in (data.get("response") or []):
+        try:
+            pl = it.get("player") or {}
+            tm = it.get("team") or {}
+            st_arr = it.get("statistics") or []
+            st = st_arr[0] if st_arr else {}
+            games = st.get("games") or {}
+            goals = st.get("goals") or {}
+            pid = pl.get("id")
+            tid = tm.get("id")
+            name = str(pl.get("name") or "")
+            if pid is None or tid is None or not name:
+                continue
+            _apps = games.get("appearences", games.get("appearances"))
+            rows.append({
+                "pid": int(pid), "name": name, "tid": int(tid),
+                "team": str(tm.get("name") or "?"),
+                "apps": int(_apps or 0),
+                "goals": int(goals.get("total") or 0),
+            })
+        except Exception:
+            continue
+    rows.sort(key=lambda r: (-r["goals"], -r["apps"], r["name"]))
+    return rows
+
+
+def _ts_team_last5(client: httpx.Client, team_id: int) -> dict | None:
+    """/fixtures?team=X&last=5 (1 credit) -> the team's form dict (same
+    contract as _parse_last5: form string most-recent-first, gf/ga per
+    game) PLUS the fixture ids the player-level lookups need next."""
+    global _ts_credits_today
+    try:
+        data = api_get(client, "/fixtures",
+                       {"team": int(team_id), "last": TOPSCORER_L5_FIXTURES})
+        _ts_credits_today += 1
+    except Exception:
+        return None
+    rows: list[dict] = []
+    for it in (data.get("response") or []):
+        try:
+            g = it.get("goals") or {}
+            gf = g.get("home")
+            ga = g.get("away")
+            th = (it.get("teams") or {}).get("home") or {}
+            fid = (it.get("fixture") or {}).get("id")
+            if gf is None or ga is None or th.get("id") is None or fid is None:
+                continue
+            is_home = int(th.get("id")) == int(team_id)
+            rows.append({
+                "fid": int(fid),
+                "mine": int(gf) if is_home else int(ga),
+                "theirs": int(ga) if is_home else int(gf),
+            })
+        except Exception:
+            continue
+    if not rows:
+        return None
+    return {
+        "form_str": "".join(
+            "W" if r["mine"] > r["theirs"] else "D" if r["mine"] == r["theirs"] else "L"
+            for r in rows
+        ),
+        "gf_pg": sum(r["mine"] for r in rows) / float(len(rows)),
+        "ga_pg": sum(r["theirs"] for r in rows) / float(len(rows)),
+        "n": len(rows),
+        "fids": [r["fid"] for r in rows],
+    }
+
+
+def _ts_player_last5(client: httpx.Client, player_id: int,
+                     team_id: int, fids: list[int]) -> dict | None:
+    """The scorer's OWN last-5 record: /fixtures/players per fixture (1
+    credit each), reading ONLY his team's block and matching his player
+    id -> goals + minutes per game. Games where he does not appear
+    count as 0 goals and 0 minutes (missed/benched — honest). Returns
+    None when nothing at all could be read (feed gaps); otherwise
+    {games, goals, minutes}. Gentle 0.25s pacing — these payloads are
+    the biggest the API serves."""
+    global _ts_credits_today
+    games = 0
+    goals = 0
+    minutes = 0
+    read_fixtures = 0
+    for fid in (fids or [])[:TOPSCORER_L5_FIXTURES]:
+        found = False
+        try:
+            data = api_get(client, "/fixtures/players", {"fixture": int(fid)})
+            _ts_credits_today += 1
+            for blk in (data.get("response") or []):
+                try:
+                    t = blk.get("team") or {}
+                    if t.get("id") is None or int(t.get("id")) != int(team_id):
+                        continue
+                    for pl in blk.get("players") or []:
+                        if (pl.get("player") or {}).get("id") is None:
+                            continue
+                        if int((pl.get("player") or {}).get("id")) != int(player_id):
+                            continue
+                        st_arr = pl.get("statistics") or []
+                        st = st_arr[0] if st_arr else {}
+                        goals += int((st.get("goals") or {}).get("total") or 0)
+                        minutes += int((st.get("games") or {}).get("minutes") or 0)
+                        games += 1
+                        found = True
+                        break
+                    if found:
+                        break
+                except Exception:
+                    continue
+            if data.get("response") is not None:
+                read_fixtures += 1
+        except Exception:
+            continue
+        finally:
+            time.sleep(0.25)
+    if games == 0 and read_fixtures == 0:
+        return None
+    return {"games": games, "goals": goals, "minutes": minutes}
+
+
+def _ts_score_prob(scorer: dict, l5: dict | None, team_form: dict | None,
+                   h2h: dict | None) -> float:
+    """P(scorer scores >=1 today) = 1 - exp(-lambda), lambda = season
+    goals/game blended 50/50 with his own last-5 rate, scaled by the
+    SAME clamped environment factors the v10.97 predictions use (his
+    team's last-5 scoring form; the H2H goal environment when the clubs
+    met within 31 days). Display-only."""
+    apps = max(1, int(scorer.get("apps") or 0))
+    season_gpg = float(scorer.get("goals") or 0) / float(apps)
+    l5_gpg = None
+    if l5 is not None and int(l5.get("games") or 0) >= 2:
+        l5_gpg = float(l5.get("goals") or 0) / float(l5.get("games"))
+    lam = 0.5 * season_gpg + 0.5 * (l5_gpg if l5_gpg is not None else season_gpg)
+    mod = 1.0
+    if team_form is not None and int(team_form.get("n") or 0) >= 3:
+        mod *= _clamp97(
+            float(team_form.get("gf_pg") or 0.0) / (PROJECTION_AVG_TOTAL / 2.0),
+            FORM_MOD_MIN, FORM_MOD_MAX,
+        )
+    if h2h is not None and h2h.get("recent") and int(h2h.get("n") or 0) >= 2:
+        mod *= _clamp97(
+            float(h2h.get("avg_total") or 0.0) / PROJECTION_AVG_TOTAL,
+            H2H_MOD_MIN, H2H_MOD_MAX,
+        )
+    lam = _clamp97(lam * mod, TOPSCORER_LAM_MIN, TOPSCORER_LAM_MAX)
+    return 1.0 - math.exp(-lam)
+
+
+def _build_topscorer_report(client: httpx.Client) -> str | None:
+    """Assemble the morning message. Guards mirror _ensure_form_context
+    (quota-stressed / budget ladder / PACE2 with a low tank -> None,
+    retried on a later pass). League scope: every tracked league with
+    games today, busiest first, capped at TOPSCORER_MAX_LEAGUES; per
+    league the HIGHEST scorer whose club actually plays today."""
+    global _ts_credits_today, _ts_credits_date
+    if _ts_credits_date != _ts_today():
+        _ts_credits_today = 0
+        _ts_credits_date = _ts_today()
+    if quota_remaining is not None and quota_remaining < 400:
+        log.info("v10.98: top-scorer report deferred — quota guard")
+        return None
+    if pace_mode_now == "PACE2" and quota_remaining is not None and quota_remaining < 1500:
+        log.info("v10.98: top-scorer report deferred — PACE2 low-tank guard")
+        return None
+    if get_budget_mode() in ("STRICT", "EMERGENCY", "STOP"):
+        log.info("v10.98: top-scorer report deferred — budget ladder guard")
+        return None
+    if not todays_tracked_fixtures:
+        return None
+
+    # --- leagues with games today, busiest first ---
+    leagues: dict[int, dict] = {}
+    for f in todays_tracked_fixtures:
+        lg = f.get("league") or {}
+        lid = lg.get("id")
+        if lid is None:
+            continue
+        ent = leagues.setdefault(int(lid), {
+            "name": str(lg.get("name") or "?"),
+            "season": lg.get("season"),
+            "fixtures": [],
+        })
+        ent["fixtures"].append(f)
+    if not leagues:
+        return None
+    ranked = sorted(leagues.items(), key=lambda kv: -len(kv[1]["fixtures"]))
+
+    entries: list[str] = []
+    for lid, ent in ranked[:TOPSCORER_MAX_LEAGUES]:
+        if _ts_credits_today + 8 > TOPSCORER_DAILY_CAP:
+            log.info(
+                f"v10.98: top-scorer report credit cap reached "
+                f"({_ts_credits_today}/{TOPSCORER_DAILY_CAP}) — stopping at "
+                f"{len(entries)} league(s)"
+            )
+            break
+        season = ent["season"]
+        if season is None:
+            season = int(datetime.now(BULGARIA_TZ).year)
+        scorers = _ts_topscorers(client, int(lid), int(season))
+        if not scorers:
+            continue
+
+        # his team must actually play today in this league
+        fix_by_team: dict[int, tuple[dict, dict]] = {}
+        for f in ent["fixtures"]:
+            th = (f.get("teams") or {}).get("home") or {}
+            ta = (f.get("teams") or {}).get("away") or {}
+            if th.get("id") is not None:
+                fix_by_team[int(th["id"])] = (f, ta)
+            if ta.get("id") is not None:
+                fix_by_team[int(ta["id"])] = (f, th)
+        pick = None
+        for s in scorers[:10]:
+            if s["tid"] in fix_by_team:
+                pick = s
+                break
+        if pick is None:
+            continue
+        fixture, opp = fix_by_team[pick["tid"]]
+        opp_tid = opp.get("id")
+        opp_name = str(opp.get("name") or "?")
+
+        ko = "?"
+        try:
+            ko_dt = datetime.fromisoformat(
+                str((fixture.get("fixture") or {}).get("date") or "").replace("Z", "+00:00")
+            ).astimezone(BULGARIA_TZ)
+            ko = ko_dt.strftime("%H:%M")
+        except Exception:
+            pass
+
+        # context: his team's last-5 + his own last-5 + the clubs' H2H
+        l5 = _ts_team_last5(client, pick["tid"])
+        pl5 = _ts_player_last5(
+            client, pick["pid"], pick["tid"], (l5 or {}).get("fids") or []
+        )
+        h2h = None
+        if opp_tid is not None:
+            h2h = _parse_h2h(client, int(pick["tid"]), int(opp_tid))
+            _ts_credits_today += 1
+        p = _ts_score_prob(pick, pl5, l5, h2h)
+
+        if pl5 is not None and int(pl5.get("games") or 0) >= 1:
+            l5_txt = f"L5: {int(pl5.get('goals') or 0)}\u26bd in {int(pl5.get('games'))}"
+        elif pl5 is not None:
+            l5_txt = "L5: not played"
+        else:
+            l5_txt = "L5 n/a"
+        if h2h is not None and int(h2h.get("n") or 0) > 0:
+            tag = " last mo" if h2h.get("recent") else " older"
+            h2h_txt = f"H2H {float(h2h['avg_total']):.1f} g/g{tag}"
+        else:
+            h2h_txt = "H2H \u2014"
+        entries.append(
+            f"\u26bd {ent['name']} \u2014 {pick['name']} ({pick['team']})\n"
+            f"   vs {opp_name} {ko} Sofia \u00b7 {pick['apps']} apps \u00b7 "
+            f"{pick['goals']}\u26bd season \u00b7 {l5_txt} \u00b7 {h2h_txt} \u2192 "
+            f"\U0001f3af {p * 100:.0f}% scores today"
+        )
+        time.sleep(0.4)
+
+    if not entries:
+        return None
+    head = (
+        f"\u2b50 TOP SCORERS TODAY \u2014 "
+        f"{datetime.now(BULGARIA_TZ).strftime('%a %d %b')}\n"
+        f"{len(entries)} league(s) \u00b7 sent "
+        f"{datetime.now(BULGARIA_TZ).strftime('%H:%M')} Sofia, before kickoffs"
+    )
+    foot = (
+        "\n\nScore chance: season \u26bd/game \u00d7 his last-5 \u00d7 H2H (clubs, last "
+        "month) \u2014 Poisson, display-only"
+    )
+    return head + "\n\n" + "\n\n".join(entries) + foot
+
+
+def _ts_start_report(client: httpx.Client, manual: bool = False) -> bool:
+    """Spawn the report worker ONCE (daemon thread — the polling loop
+    never waits on ~120 credits of fetches). Returns True when a build
+    actually started. Manual (the /topscorers command) bypasses the
+    auto gates but still respects the inflight guard; a successful send
+    marks the day so the auto path never duplicates it."""
+    global _ts_inflight, _ts_attempts_today, _ts_attempt_date
+    if _ts_inflight:
+        return False
+    if _ts_attempt_date != _ts_today():
+        _ts_attempt_date = _ts_today()
+        _ts_attempts_today = 0
+    _ts_inflight = True
+
+    def _worker() -> None:
+        global _ts_inflight, _ts_attempts_today
+        try:
+            text = _build_topscorer_report(client)
+            if text:
+                if send_telegram(client, text):
+                    _ts_mark_sent()
+                    _ts_attempts_today = 0
+                    log.info(
+                        f"v10.98: top-scorer report sent "
+                        f"({_ts_credits_today} credits today)"
+                    )
+                    return
+            if manual:
+                send_telegram(
+                    client,
+                    "\u2b50 Top-scorer report: nothing built (schedule not "
+                    "loaded, quota guard, or no tracked games today).",
+                )
+            _ts_attempts_today += 1
+            if _ts_attempts_today >= 3:
+                _ts_mark_sent()
+                log.info(
+                    "v10.98: top-scorer report gave up after 3 attempts "
+                    "(day marked sent)"
+                )
+        except Exception as _e98:
+            log.warning(f"v10.98: top-scorer report failed: {_e98}")
+            _ts_attempts_today += 1
+            if _ts_attempts_today >= 3:
+                _ts_mark_sent()
+        finally:
+            _ts_inflight = False
+
+    threading.Thread(target=_worker, daemon=True, name="v10.98-topscorers").start()
+    return True
+
+
+def _maybe_send_topscorer_report(client: httpx.Client) -> None:
+    """Loop hook: the ONE pre-kickoff top-scorer message per day.
+    Fires after the 10:00 Sofia schedule fetch (todays_tracked_fixtures
+    armed), only while no monitored match is live (the build is
+    threaded anyway, but morning slots keep it away from live
+    polling), only when at least one kickoff still lies ahead. The
+    date-keyed marker survives redeploys; 3 failed attempts mark the
+    day done (never hammer the API for a luxury layer)."""
+    try:
+        if _ts_sent_date() == _ts_today():
+            return
+        if _ts_inflight:
+            return
+        now_bg = datetime.now(BULGARIA_TZ)
+        if now_bg.hour < TOPSCORER_SEND_HOUR_LOCAL:
+            return
+        if not todays_tracked_fixtures:
+            return
+        future = False
+        for f in todays_tracked_fixtures:
+            try:
+                ko = datetime.fromisoformat(
+                    str((f.get("fixture") or {}).get("date") or "").replace("Z", "+00:00")
+                )
+                if ko > datetime.now(timezone.utc):
+                    future = True
+                    break
+            except Exception:
+                continue
+        if not future:
+            _ts_mark_sent()
+            log.info("v10.98: top-scorer report skipped — no future kickoffs today")
+            return
+        if fast_monitored:
+            return  # a monitored match is live — defer, retry next pass
+        _ts_start_report(client, manual=False)
+    except Exception as _e:
+        log.debug(f"v10.98: top-scorer hook skipped: {_e}")
+
+
+# ================= v10.99: DAILY GOALS BOARD =================
+# One Telegram message per day, the companion to the top-scorer report
+# (sent after it — the hook defers while the scorer thread builds; user
+# request Sep 13: "like the top scorers i want similar stats but for
+# goals — how likely is it gonna be over 2.5 or under in the todays
+# game based on h2h and recent performance"): for every tracked game
+# still to start — expected total goals from BOTH clubs' last-5 goals
+# for/against (each side = own attack x opponent's defense, league
+# base when a side is missing), re-weighted toward the actual H2H
+# meetings, then Poisson P(total >= 3) = the over-2.5 read. PREDICTION-
+# DISPLAY-ONLY — never a bet signal, never a gate, nothing in the
+# ledger. Context reuses the v10.97 form layer: a fixture the live
+# layer already warmed reads FREE; a fresh fixture pays the standard 5
+# credits ONCE and is stored into _form_ctx, so the evening's signals
+# get their Form/H2H line and form-adj predictions free (the board
+# pre-pays the context). Morning-only (full tank post-reset), own
+# daily cap, same guards as every optional layer, daemon-threaded
+# (the loop never waits), date-keyed marker file (redeploys never
+# re-send), manual /goalsboard trigger.
+GOALSBOARD_SEND_HOUR_LOCAL = 10   # Sofia hour when the auto-send may fire
+GOALSBOARD_MAX_FIXTURES = 30      # report length cap (busiest leagues first)
+GOALSBOARD_DAILY_CAP = 150        # credits/day for the whole board layer (30 x 5)
+GB_LAM_MIN = 1.2                  # clamp: pre-match total-goals lambda
+GB_LAM_MAX = 4.2
+GB_FORM_MIN_N = 2                 # a club's L5 counts only with >=2 games
+GB_H2H_W_N2 = 0.25                # H2H re-weight with >=2 meetings
+GB_H2H_W_N1 = 0.15                # single meeting
+GB_OVER_HOT_P = 65.0              # 'hot' display tag — never a gate
+GB_UNDER_COLD_P = 40.0            # 'cold' display tag — never a gate
+GOALSBOARD_SENT_FILE = os.path.join(_VOLUME_DIR, "goalsboard_sent.json")
+_gb_credits_today: int = 0
+_gb_credits_date: str = ""
+_gb_inflight: bool = False
+_gb_attempts_today: int = 0
+_gb_attempt_date: str = ""
+
+
+def _gb_today() -> str:
+    """Sofia-day key (same clock as the top-scorer report)."""
+    return datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+
+
+def _gb_sent_date() -> str:
+    """Load the persisted sent-marker (redeploy-proof, EOD pattern)."""
+    try:
+        if os.path.exists(GOALSBOARD_SENT_FILE):
+            with open(GOALSBOARD_SENT_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _gb_mark_sent() -> None:
+    try:
+        with open(GOALSBOARD_SENT_FILE, "w", encoding="utf-8") as f:
+            f.write(_gb_today())
+    except Exception:
+        pass
+
+
+def _gb_total_lambda(l5_h: dict | None, l5_a: dict | None,
+                     h2h: dict | None) -> tuple[float, float, float]:
+    """Pre-match expected goals for ONE game: lambda_home = (own L5
+    goals-for + opponent's L5 goals-against) / 2 (attack x defense),
+    lambda_away mirrored, total = sum re-weighted toward the actual
+    H2H meetings (n>=2 -> 25%, n=1 -> 15%) and clamped
+    [GB_LAM_MIN, GB_LAM_MAX]. Pure, display-only; a side with fewer
+    than GB_FORM_MIN_N readable games falls back to the per-team
+    league base (PROJECTION_AVG_TOTAL/2)."""
+    base = PROJECTION_AVG_TOTAL / 2.0
+
+    def _use(d: dict | None) -> bool:
+        return d is not None and int(d.get("n") or 0) >= GB_FORM_MIN_N
+
+    def _side(att: dict | None, dfn: dict | None) -> float:
+        a = float(att.get("gf_pg") or 0.0) if _use(att) else base
+        d = float(dfn.get("ga_pg") or 0.0) if _use(dfn) else base
+        return (a + d) / 2.0
+
+    lam_h = _side(l5_h, l5_a)
+    lam_a = _side(l5_a, l5_h)
+    lam = lam_h + lam_a
+    if h2h is not None:
+        n_h2h = int(h2h.get("n") or 0)
+        if n_h2h >= 2:
+            lam = (1.0 - GB_H2H_W_N2) * lam \
+                + GB_H2H_W_N2 * float(h2h.get("avg_total") or 0.0)
+        elif n_h2h == 1:
+            lam = (1.0 - GB_H2H_W_N1) * lam \
+                + GB_H2H_W_N1 * float(h2h.get("avg_total") or 0.0)
+    lam = _clamp97(lam, GB_LAM_MIN, GB_LAM_MAX)
+    return lam, lam_h, lam_a
+
+
+def _gb_context(client: httpx.Client, fixture: dict) -> tuple[dict | None, int]:
+    """The v10.97 form/H2H context for one board row: FREE when the
+    live layer (or an earlier board pass) already warmed this fixture;
+    else the standard 5-credit fetch_form_context, STORED into
+    _form_ctx so every later signal's Form/H2H line, form-adj goal/FT
+    predictions and cards mods come free (the board pre-pays the
+    evening's context). Returns (ctx, credits_spent)."""
+    global _gb_credits_today
+    try:
+        fid = int(fixture["fixture"]["id"])
+    except Exception:
+        return None, 0
+    cached = _form_ctx.get(fid)
+    if cached is not None:
+        return cached, 0
+    ctx = fetch_form_context(client, fixture)
+    try:
+        _form_ctx[fid] = ctx
+        if ctx:
+            _gb_credits_today += 5
+            _form_ctx_save()
+    except Exception:
+        pass
+    return ctx, (5 if ctx else 0)
+
+
+def _build_goals_board(client: httpx.Client) -> str | None:
+    """Assemble the morning goals board. Guards mirror the top-scorer
+    report (quota-stressed / budget ladder / PACE2 low-tank -> None,
+    retried on a later pass). Scope: today's tracked games whose
+    kickoff still lies ahead, busiest leagues first, kickoff order
+    within a league, capped at GOALSBOARD_MAX_FIXTURES; a game with NO
+    form and NO H2H at all is skipped (pure league-average noise)."""
+    global _gb_credits_today, _gb_credits_date
+    if _gb_credits_date != _gb_today():
+        _gb_credits_today = 0
+        _gb_credits_date = _gb_today()
+    if quota_remaining is not None and quota_remaining < 400:
+        log.info("v10.99: goals board deferred — quota guard")
+        return None
+    if pace_mode_now == "PACE2" and quota_remaining is not None and quota_remaining < 1500:
+        log.info("v10.99: goals board deferred — PACE2 low-tank guard")
+        return None
+    if get_budget_mode() in ("STRICT", "EMERGENCY", "STOP"):
+        log.info("v10.99: goals board deferred — budget ladder guard")
+        return None
+    if not todays_tracked_fixtures:
+        return None
+
+    # --- future kickoffs only (the board is pre-match), per league ---
+    now_utc = datetime.now(timezone.utc)
+    leagues: dict[int, dict] = {}
+    for f in todays_tracked_fixtures:
+        lg = f.get("league") or {}
+        lid = lg.get("id")
+        if lid is None:
+            continue
+        try:
+            ko = datetime.fromisoformat(
+                str((f.get("fixture") or {}).get("date") or "").replace("Z", "+00:00")
+            )
+        except Exception:
+            continue
+        if ko <= now_utc:
+            continue
+        ent = leagues.setdefault(int(lid), {"name": str(lg.get("name") or "?"), "games": []})
+        ent["games"].append((ko, f))
+    if not leagues:
+        return None
+    flat: list[tuple[str, datetime, dict]] = []
+    for _lid, ent in sorted(leagues.items(), key=lambda kv: -len(kv[1]["games"])):
+        for ko, f in sorted(ent["games"], key=lambda kf: kf[0]):
+            flat.append((ent["name"], ko, f))
+    flat = flat[:GOALSBOARD_MAX_FIXTURES]
+
+    entries: list[str] = []
+    for lname, ko, f in flat:
+        # credit gate BEFORE the (maybe cached) fetch — cached fixtures
+        # never need the +5, uncapped spending stops here
+        fid = None
+        try:
+            fid = int(f["fixture"]["id"])
+        except Exception:
+            pass
+        if (fid is None or _form_ctx.get(fid) is None) \
+                and _gb_credits_today + 5 > GOALSBOARD_DAILY_CAP:
+            log.info(
+                f"v10.99: goals board credit cap reached "
+                f"({_gb_credits_today}/{GOALSBOARD_DAILY_CAP}) — stopping at "
+                f"{len(entries)} game(s)"
+            )
+            break
+        ctx, _spent = _gb_context(client, f)
+        l5_h = (ctx or {}).get("form_home")
+        l5_a = (ctx or {}).get("form_away")
+        h2h = (ctx or {}).get("h2h")
+        if not any([l5_h, l5_a, h2h]):
+            continue    # no form AND no H2H — nothing honest to say
+
+        lam, lam_h, lam_a = _gb_total_lambda(l5_h, l5_a, h2h)
+        p_over = _poisson_p_at_least(lam, 3)      # P(total >= 3) = over 2.5
+        p_under = 1.0 - p_over
+        hname = str(((f.get("teams") or {}).get("home") or {}).get("name") or "?")
+        aname = str(((f.get("teams") or {}).get("away") or {}).get("name") or "?")
+        try:
+            ko_s = ko.astimezone(BULGARIA_TZ).strftime("%H:%M")
+        except Exception:
+            ko_s = "?"
+        hot = ""
+        if p_over * 100.0 >= GB_OVER_HOT_P:
+            hot = "\U0001f525 "
+        elif p_over * 100.0 <= GB_UNDER_COLD_P:
+            hot = "\U0001f9ca "
+
+        # supporting stats — each self-skips when its data is missing
+        bits: list[str] = []
+        form_pieces: list[float] = []
+        letters: list[str] = []
+        for d in (l5_h, l5_a):
+            if d is not None and int(d.get("n") or 0) >= GB_FORM_MIN_N:
+                form_pieces.append(float(d.get("gf_pg") or 0.0)
+                                   + float(d.get("ga_pg") or 0.0))
+                if d.get("form_str"):
+                    letters.append(str(d["form_str"]))
+        if form_pieces:
+            _lt = f" ({' · '.join(letters)})" if letters else ""
+            bits.append(f"form {sum(form_pieces) / len(form_pieces):.1f} g/g L5{_lt}")
+        if h2h is not None and int(h2h.get("n") or 0) > 0:
+            tag = ", last mo" if h2h.get("recent") else ", older"
+            bits.append(f"H2H {float(h2h['avg_total']):.1f} g/g (n={int(h2h['n'])}{tag})")
+
+        # the H2H blend scales the TOTAL — rescale the split so the
+        # printed (home+away) still sums to the printed total
+        split = lam_h + lam_a
+        if split > 0:
+            lam_h = lam * lam_h / split
+            lam_a = lam * lam_a / split
+        tail = (f" · {' · '.join(bits)}") if bits else ""
+        entries.append(
+            f"\u26bd {lname} \u2014 {hname} v {aname} {ko_s} Sofia\n"
+            f"   {hot}over 2.5: {p_over * 100:.0f}% \u00b7 under {p_under * 100:.0f}% \u00b7 "
+            f"exp {lam:.1f} goals ({lam_h:.1f}+{lam_a:.1f}){tail}"
+        )
+        time.sleep(0.4)
+
+    if not entries:
+        return None
+    head = (
+        f"\u26bd GOALS BOARD \u2014 "
+        f"{datetime.now(BULGARIA_TZ).strftime('%a %d %b')}\n"
+        f"{len(entries)} game(s) \u00b7 over/under 2.5 \u00b7 sent "
+        f"{datetime.now(BULGARIA_TZ).strftime('%H:%M')} Sofia, before kickoffs"
+    )
+    foot = (
+        "\n\nHow: exp goals = L5 attack \u00d7 opponent L5 defense, H2H "
+        "re-weighted, Poisson over/under 2.5 \u2014 display-only, not a bet signal"
+    )
+    return head + "\n\n" + "\n\n".join(entries) + foot
+
+
+def _gb_start_report(client: httpx.Client, manual: bool = False) -> bool:
+    """Spawn the goals-board worker ONCE (daemon thread — the polling
+    loop never waits on ~150 credits of fetches). Manual (the
+    /goalsboard command) bypasses the auto gates but still respects
+    the inflight guard; a successful send marks the day so the auto
+    path never duplicates it. Mirrors _ts_start_report exactly."""
+    global _gb_inflight, _gb_attempts_today, _gb_attempt_date
+    if _gb_inflight:
+        return False
+    if _gb_attempt_date != _gb_today():
+        _gb_attempt_date = _gb_today()
+        _gb_attempts_today = 0
+    _gb_inflight = True
+
+    def _worker() -> None:
+        global _gb_inflight, _gb_attempts_today
+        try:
+            text = _build_goals_board(client)
+            if text:
+                if send_telegram(client, text):
+                    _gb_mark_sent()
+                    _gb_attempts_today = 0
+                    log.info(
+                        f"v10.99: goals board sent "
+                        f"({_gb_credits_today} credits today)"
+                    )
+                    return
+            if manual:
+                send_telegram(
+                    client,
+                    "\u26bd Goals board: nothing built (schedule not "
+                    "loaded, quota guard, or no tracked games left today).",
+                )
+            _gb_attempts_today += 1
+            if _gb_attempts_today >= 3:
+                _gb_mark_sent()
+                log.info(
+                    "v10.99: goals board gave up after 3 attempts "
+                    "(day marked sent)"
+                )
+        except Exception as _e99:
+            log.warning(f"v10.99: goals board failed: {_e99}")
+            _gb_attempts_today += 1
+            if _gb_attempts_today >= 3:
+                _gb_mark_sent()
+        finally:
+            _gb_inflight = False
+
+    threading.Thread(target=_worker, daemon=True, name="v10.99-goalsboard").start()
+    return True
+
+
+def _maybe_send_goals_board(client: httpx.Client) -> None:
+    """Loop hook: the ONE pre-kickoff goals board per day. Fires after
+    the 10:00 Sofia schedule fetch (todays_tracked_fixtures armed),
+    defers while the top-scorer report thread is building (one luxury
+    thread at a time — they share the API client), only while no
+    monitored match is live, only when at least one kickoff still lies
+    ahead. The date-keyed marker survives redeploys; 3 failed attempts
+    mark the day done (never hammer the API for a luxury layer)."""
+    try:
+        if _gb_sent_date() == _gb_today():
+            return
+        if _gb_inflight:
+            return
+        if _ts_inflight:
+            return  # top-scorer report building — retry next pass
+        now_bg = datetime.now(BULGARIA_TZ)
+        if now_bg.hour < GOALSBOARD_SEND_HOUR_LOCAL:
+            return
+        if not todays_tracked_fixtures:
+            return
+        future = False
+        for f in todays_tracked_fixtures:
+            try:
+                ko = datetime.fromisoformat(
+                    str((f.get("fixture") or {}).get("date") or "").replace("Z", "+00:00")
+                )
+                if ko > datetime.now(timezone.utc):
+                    future = True
+                    break
+            except Exception:
+                continue
+        if not future:
+            _gb_mark_sent()
+            log.info("v10.99: goals board skipped — no future kickoffs today")
+            return
+        if fast_monitored:
+            return  # a monitored match is live — defer, retry next pass
+        _gb_start_report(client, manual=False)
+    except Exception as _e:
+        log.debug(f"v10.99: goals board hook skipped: {_e}")
+
 
 
 def _collect_ou_lines(values: list) -> list[tuple[float, float | None, float | None]]:
@@ -9446,6 +10660,7 @@ def _build_market_block(
     cards_line: float | None, cards_ov: float | None, cards_un: float | None,
     corners_line: float | None, corners_ov: float | None, corners_un: float | None,
     team_name: str, book_name: str | None = None,
+    cards_mod: float | None = None,
 ) -> tuple[str, dict]:
     """v10.82: CARDS & CORNERS block — COMPACT (user request, Sep 9).
 
@@ -9453,6 +10668,8 @@ def _build_market_block(
     number the bet decision needs — the break-even price for the LEANED
     side (OVER -> 1/p, UNDER -> 1/(1-p); v10.80 printed the O-fair even
     when leaning UNDER, so the actionable number was missing).
+    v10.98 wording: '🟨 Cards 2 so far / line 4.5 → over 62% (min odds
+    1.61)' — every piece labeled in plain words (user request Sep 13).
 
     TEXT-ONLY change vs v10.80: the extras dict (mkt_* ledger fields),
     the record schema and the FT grading (mkt_*_ft_result) are
@@ -9473,39 +10690,46 @@ def _build_market_block(
         "mkt_corners_over_odds": corners_ov, "mkt_corners_under_odds": corners_un,
         "mkt_cards_proj": None, "mkt_cards_p_over": None,
         "mkt_cards_fair_over": None, "mkt_cards_lean": "NEUTRAL",
+        "mkt_cards_mod": None,   # v10.97: the applied context modifier (referee x team rates)
         "mkt_corners_proj": None, "mkt_corners_p_over": None,
         "mkt_corners_fair_over": None, "mkt_corners_lean": "NEUTRAL",
     }
 
     def _compact(emoji: str, label: str, now: int | None,
                  line: float | None, p_over: float | None) -> str:
-        """v10.96: one bit per market WITH the probability —
-        '🟨 Cards 2/4.5 → O 62% @1.61+'.
+        """v10.98: one bit per market, SELF-EXPLANATORY (user request
+        Sep 13: 'how do I know cards are 0 so far and why is the line
+        3.5') —
+        '🟨 Cards 0 so far / line 3.5 → under 95% (min odds 1.05)'.
 
-        The user's Sep 12 ask: percentages for corners and cards, next to
-        the odds. The P(over) was computed and LEDGER-RECORDED since
-        v10.80 — this only surfaces it. Lean side shows its own
-        probability (O = P(over), U = 1 - P(over)) + the break-even
-        price for that side; NEUTRAL shows the raw over-probability as
-        information. Same maths, same inputs, same single render path
-        (byte-stable live edits preserved).
+        Every piece is labeled in plain words now: the live count so
+        far, the bookmaker's O/U line, the leaned side's probability
+        and the minimum live price at which the bet is still break-even
+        (0.95 x 1.05 ≈ 1). Lean side shows its own probability (over =
+        P(over), under = 1 - P(over)) + its break-even price; NEUTRAL
+        shows the raw over-probability as information. Same maths, same
+        inputs, same single render path (byte-stable live edits
+        preserved); only the wording changed vs v10.96/97.
         """
         if now is None:
             return f"{emoji} {label}: n/a"
         if line is None:
-            return f"{emoji} {label}: {now}"
-        _base = f"{emoji} {label} {now}/{line:g}"
+            return f"{emoji} {label}: {now} so far"
+        _base = f"{emoji} {label} {now} so far / line {line:g}"
         if p_over is None:
             return _base
         lean = _mkt_lean(p_over)
         if lean == "OVER" and p_over > 1e-9:
-            return f"{_base} \u2192 O {p_over * 100:.0f}% @{1.0 / p_over:.2f}+"
+            return (
+                f"{_base} \u2192 over {p_over * 100:.0f}% "
+                f"(min odds {1.0 / p_over:.2f})"
+            )
         if lean == "UNDER" and p_over < 1.0 - 1e-9:
             return (
-                f"{_base} \u2192 U {(1.0 - p_over) * 100:.0f}% "
-                f"@{1.0 / (1.0 - p_over):.2f}+"
+                f"{_base} \u2192 under {(1.0 - p_over) * 100:.0f}% "
+                f"(min odds {1.0 / (1.0 - p_over):.2f})"
             )
-        return f"{_base} \u00b7 O {p_over * 100:.0f}%"
+        return f"{_base} \u00b7 over {p_over * 100:.0f}%"
 
     try:
         # v10.95: ONE line, both markets — the counts auto-update via the
@@ -9513,8 +10737,14 @@ def _build_market_block(
         parts = []
 
         # --- CARDS: v1 heuristic maths, ledger-identical to v10.80 ---
+        # v10.97: the cards lambda takes the CONTEXT modifier (referee
+        # card-rate census x both teams' season card rates, clamped) —
+        # user request Sep 12. PREDICTION-ONLY, ledger-recorded as
+        # mkt_cards_mod so the EOD accuracy report grades it; None =
+        # no context, lambda exactly as v10.96.
         lam_c = None
         p_c = None
+        _cmod97 = None
         if cards_now is not None:
             if fouls_now is not None:
                 heat = 1.0
@@ -9527,10 +10757,14 @@ def _build_market_block(
                     heat *= 1.10
                 heat = min(heat, 1.30)   # v1: cap the total card-heat
                 lam_c = _mkt_project_total(cards_now, game_minute, MKT_BASE_PACE_CARDS, heat)
+                if cards_mod is not None:
+                    _cmod97 = _clamp97(float(cards_mod), CARDS_MOD_TOTAL_MIN, CARDS_MOD_TOTAL_MAX)
+                    lam_c *= _cmod97
                 if cards_line is not None:
                     p_c = _poisson_p_at_least(lam_c, int(cards_line) + 1)
             extras["mkt_cards_proj"] = round(lam_c, 1) if lam_c is not None else None
             extras["mkt_cards_p_over"] = round(p_c, 3) if p_c is not None else None
+            extras["mkt_cards_mod"] = round(_cmod97, 3) if _cmod97 is not None else None
             if p_c is not None and p_c > 1e-9:
                 extras["mkt_cards_fair_over"] = round(1.0 / p_c, 2)
             extras["mkt_cards_lean"] = _mkt_lean(p_c)
@@ -9641,6 +10875,7 @@ def _update_market_blocks(
                 corners_line=st.get("corners_line"), corners_ov=st.get("corners_ov"),
                 corners_un=st.get("corners_un"),
                 team_name=st.get("team_name", "?"), book_name=st.get("book"),
+                cards_mod=st.get("cards_mod"),  # v10.97: same context modifier as the original send
             )
             if not block:
                 continue
@@ -9682,6 +10917,12 @@ def _stamp_ft_market_labels(client: httpx.Client, fixture: dict, fid: int) -> bo
     ft_cards_total = None
     if cards is not None:
         ft_cards_total = len(cards)
+        # v10.97: self-learned referee census — this fixture's real FT
+        # booking count teaches the official's card rate (free, persisted,
+        # warms up over ~3 games per official). None-safe.
+        _ref97 = entries[0].get("referee") if entries else None
+        if _ref97:
+            _ref_cards_update(_ref97, int(ft_cards_total))
         for entry in entries:
             if entry.get("ft_cards_total") != ft_cards_total:
                 entry["ft_cards_total"] = ft_cards_total
@@ -10563,11 +11804,17 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
         lines.append("")
 
         # By minute range
+        # v10.97: full-coverage bands (user request Sep 12: "winrate by
+        # period of minute, for example from 20 to 45") — the old
+        # 21-35/36-45/46-55/56-61 ladder stopped at 61' and left the whole
+        # late game ungraded; EARLY_OVERRIDE (<21') signals now have a row
+        # too. Ledger-only change, report-side.
         for min_label, min_filter in [
-            ("21-35'", lambda e: 21 <= e.get("game_minute", 0) <= 35),
-            ("36-45'", lambda e: 36 <= e.get("game_minute", 0) <= 45),
-            ("46-55'", lambda e: 46 <= e.get("game_minute", 0) <= 55),
-            ("56-61'", lambda e: 56 <= e.get("game_minute", 0) <= 61),
+            ("<21' (early override)", lambda e: e.get("game_minute", 0) < 21),
+            ("21-45'", lambda e: 21 <= e.get("game_minute", 0) <= 45),
+            ("46-60'", lambda e: 46 <= e.get("game_minute", 0) <= 60),
+            ("61-75'", lambda e: 61 <= e.get("game_minute", 0) <= 75),
+            ("76+'", lambda e: e.get("game_minute", 0) > 75),
         ]:
             group = [e for e in resolved if min_filter(e)]
             if not group:
@@ -10702,6 +11949,137 @@ def _format_stats_block(entries: list[dict], label: str) -> list[str]:
     return lines
 
 
+def _ft_pick_grade(e: dict, prefix: str = "pred_ft") -> tuple[bool | None, float | None]:
+    """v10.97 helper: grade one outcome's FT argmax pick against
+    pred_ft_actual. Works for both pred_ft_* (form-adjusted) and
+    pred_ft_plain_* (no-context) via prefix. Returns (correct, printed_p)
+    — (None, None) when the record can't grade (old records, missing
+    fields). Never raises."""
+    try:
+        ps = (e.get(f"{prefix}_sig"), e.get(f"{prefix}_draw"), e.get(f"{prefix}_opp"))
+        if any(p is None for p in ps):
+            return None, None
+        actual = e.get("pred_ft_actual")
+        if actual not in ("win", "draw", "loss"):
+            return None, None
+        pairs = {"win": ps[0], "draw": ps[1], "loss": ps[2]}
+        pick_key = max(pairs, key=lambda k: float(pairs[k]))
+        return pairs[actual] == pairs[pick_key], float(pairs[pick_key])
+    except Exception:
+        return None, None
+
+
+def _mkt_lean_grade(e: dict, market: str) -> tuple[bool | None, float | None]:
+    """v10.97 helper: grade one cards/corners lean. Returns (hit,
+    printed_lean_p) — the probability the MESSAGE printed for the leaned
+    side (OVER -> p_over, UNDER -> 1 - p_over). (None, None) = not
+    gradable."""
+    try:
+        res = e.get(f"mkt_{market}_ft_result")
+        if res not in ("HIT", "MISS"):
+            return None, None
+        p_over = e.get(f"mkt_{market}_p_over")
+        lean = e.get(f"mkt_{market}_lean")
+        printed = None
+        if p_over is not None and lean:
+            printed = float(p_over) if lean == "OVER" else 1.0 - float(p_over)
+        return (res == "HIT"), printed
+    except Exception:
+        return None, None
+
+
+def _format_accuracy_report(entries: list[dict]) -> list[str]:
+    """v10.97: EOD ACCURACY REPORT — winrate BY CATEGORY (FT score, the
+    main over bet, cards, corners) plus the form-vs-plain verdict, sent
+    with the nightly EOD summary (user request, Sep 12: "in the end of
+    the day i want a full accurate winrate report automatic send of the
+    past day including winrate by category corners, ft score, cards").
+
+    Reads ONLY ledger fields that already exist (pred_ft_* +
+    pred_ft_actual since v10.74, mkt_*_ft_result + mkt_*_p_over since
+    v10.80, outcome_full/15min since v10) plus the v10.97 form-plain
+    pairs — zero extra credits, pure report-side. Every row skips itself
+    when n=0 (old records simply lack the newer fields), and nothing
+    here can raise into the EOD send.
+    """
+    lines: list[str] = []
+    try:
+        resolved = [e for e in entries if e.get("resolved")]
+        if not resolved:
+            return lines
+
+        def _row(label: str, hits: int, n: int, extra: str = "") -> str:
+            pct = (hits / n * 100.0) if n else 0.0
+            _x = f" · {extra}" if extra else ""
+            return f"  {label}: {hits}/{n} ({pct:.0f}%){_x}"
+
+        lines.append("🎯 v10.97 ACCURACY REPORT (graded predictions)")
+        lines.append("")
+
+        # --- FT score (the win/draw/loss pick, argmax of the printed %s) ---
+        ft_adj = [_ft_pick_grade(e, "pred_ft") for e in resolved]
+        ft_adj = [(c, p) for c, p in ft_adj if c is not None]
+        n_adj = len(ft_adj)
+        if n_adj:
+            h_adj = sum(1 for c, _ in ft_adj if c)
+            avg_p = sum(p for _, p in ft_adj) / n_adj
+            lines.append(_row("FT pick (form-adj)", h_adj, n_adj,
+                              f"avg printed {avg_p * 100:.0f}%"))
+        ft_pl = [_ft_pick_grade(e, "pred_ft_plain") for e in resolved]
+        ft_pl = [(c, p) for c, p in ft_pl if c is not None]
+        if ft_pl:
+            h_pl = sum(1 for c, _ in ft_pl if c)
+            lines.append(_row("FT pick (plain, no form)", h_pl, len(ft_pl)))
+        # form-vs-plain verdict: per-entry where BOTH grade, count the
+        # entries form fixed vs broke — the honest "did it help?" number.
+        both = []
+        for e in resolved:
+            c_a, _ = _ft_pick_grade(e, "pred_ft")
+            c_p, _ = _ft_pick_grade(e, "pred_ft_plain")
+            if c_a is not None and c_p is not None and c_a != c_p:
+                both.append(c_a)
+        if both:
+            fixed = sum(1 for c in both if c)
+            lines.append(
+                f"  Form vs plain (FT): fixed {fixed} · broke {len(both) - fixed} "
+                f"· net {'+' if fixed >= len(both) - fixed else ''}{fixed - (len(both) - fixed)}"
+            )
+
+        # --- main over bet (the primary product) ---
+        ov = [e for e in resolved if e.get("outcome_full") in ("HIT", "MISS")]
+        if ov:
+            hf = sum(1 for e in ov if e["outcome_full"] == "HIT")
+            h15 = sum(1 for e in ov if e.get("outcome_15min") == "HIT")
+            lines.append(_row("Over bet (main)", hf, len(ov),
+                              f"15m {h15}/{len(ov)} ({h15 / len(ov) * 100:.0f}%)"))
+
+        # --- cards & corners leans ---
+        for market, label in (("cards", "Cards lean"), ("corners", "Corners lean")):
+            grades = [_mkt_lean_grade(e, market) for e in resolved]
+            grades = [(h, p) for h, p in grades if h is not None]
+            if grades:
+                hits = sum(1 for h, _ in grades if h)
+                ps = [p for _, p in grades if p is not None]
+                extra = f"avg printed {sum(ps) / len(ps) * 100:.0f}%" if ps else ""
+                lines.append(_row(label, hits, len(grades), extra))
+
+        # --- cards modifier verdict (only where it actually applied) ---
+        mod_on = [e for e in resolved if e.get("mkt_cards_mod") is not None]
+        if mod_on:
+            g = [_mkt_lean_grade(e, "cards") for e in mod_on]
+            g = [(h, p) for h, p in g if h is not None]
+            if g:
+                hits = sum(1 for h, _ in g if h)
+                lines.append(_row("Cards lean (ctx-applied)", hits, len(g)))
+
+        if len(lines) <= 2:
+            return []   # nothing gradable yet — send nothing rather than an empty shell
+        lines.append("")
+    except Exception:
+        return []
+    return lines
+
+
 def format_outcome_stats(entries: list[dict]) -> str:
     """v10.18: Format outcome statistics showing BOTH counting methods.
 
@@ -10802,6 +12180,13 @@ def send_end_of_day_summary(client: httpx.Client, days: int = 1) -> None:
     log.info(f"v10.13: Sending EOD summary {day_label} ({len(resolved)} resolved, {len(pending)} pending)")
 
     stats_text = format_outcome_stats(filtered)
+    # v10.97: ACCURACY REPORT — winrate by category (FT / over / cards /
+    # corners) + the form-vs-plain verdict, auto-sent with the nightly
+    # EOD summary (user request, Sep 12). Zero extra credits — reads
+    # ledger fields that already exist; empty list = nothing gradable.
+    _acc97 = _format_accuracy_report(filtered)
+    if _acc97:
+        stats_text += "\n\n" + "\n".join(_acc97)
     sent = send_telegram(client, stats_text)
     if sent and days == 1:
         eod_summary_sent_date = today_str
@@ -11133,7 +12518,10 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     "  \u2192 Send any ml_signals_*.jsonl or ml_polls_*.jsonl\n"
                     "  \u2192 Deduplicates automatically, safe to re-upload\n\n"
                     "\u26bd MATCHES\n"
-                    "/today or /matches \u2014 today's tracked matches\n\n"
+                    "/today or /matches \u2014 today's tracked matches\n"
+                    "/topscorers \u2014 top scorer per league + P(scores today)\n"
+                    "/goalsboard \u2014 over/under 2.5 per game (form + H2H)\n"
+                    "  \u2192 auto-sent every morning before kickoffs\n\n"
                     "\u26a1 SURGE WATCH & GOAL FLASHES\n"
                     "/surgewatch \u2014 PRE-GOAL pressure alerts on/off (default ON)\n"
                     "  \u2192 Warns when a quiet team's shots suddenly start\n"
@@ -11155,6 +12543,11 @@ def check_telegram_commands(client: httpx.Client) -> None:
                 # Load ALL outcomes from file (not just in-memory)
                 all_entries = load_all_outcomes()
                 stats_text = format_outcome_stats(all_entries)
+                # v10.97: accuracy report rides /stats too (same ledger-side
+                # computation as the nightly EOD send)
+                _acc97s = _format_accuracy_report(all_entries)
+                if _acc97s:
+                    stats_text += "\n\n" + "\n".join(_acc97s)
                 send_telegram(client, stats_text)
 
             elif text == "/stats3d":
@@ -11205,6 +12598,41 @@ def check_telegram_commands(client: httpx.Client) -> None:
             elif text == "/matches" or text == "/today":
                 # v10.18: On-demand match list ONLY (no form/scorers), only if <10 games
                 _send_today_command(client)
+
+            elif text == "/topscorers":
+                # v10.98: manual trigger of the morning top-scorer report
+                # (same build as the 10:00 auto-send; ~8 credits/league).
+                if _ts_inflight:
+                    send_telegram(
+                        client,
+                        "\u2b50 Top-scorer report is already building — "
+                        "it lands in ~1 min.",
+                    )
+                else:
+                    _ts_start_report(client, manual=True)
+                    send_telegram(
+                        client,
+                        "\u2b50 Building today's top-scorer report "
+                        "(~8 credits/league, about a minute)...",
+                    )
+
+            elif text == "/goalsboard":
+                # v10.99: manual trigger of the morning goals board
+                # (same build as the pre-kickoff auto-send; 5 credits
+                # per game not yet warmed, capped at 30 games).
+                if _gb_inflight:
+                    send_telegram(
+                        client,
+                        "\u26bd Goals board is already building — "
+                        "it lands in ~1 min.",
+                    )
+                else:
+                    _gb_start_report(client, manual=True)
+                    send_telegram(
+                        client,
+                        "\u26bd Building today's goals board (over/under "
+                        "2.5 per game, ~5 credits/game, about a minute)...",
+                    )
 
             elif text == "/recap":
                 # v10.18: Yesterday's recap (was auto-sent, now command-only)
@@ -11769,6 +13197,16 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
     for tname, tstats in teams_data.items():
         current_sot = safe_int(get_stat(tstats, "sot"))
         best_current_sot = max(best_current_sot, current_sot)
+
+    # v10.97: FORM/H2H/REFEREE CONTEXT PRE-WARM — the moment a fixture
+    # turns warm (first SOT), fetch the last-5 form, H2H and season card
+    # rates (5 credits, daily-capped) so every LATER signal of this
+    # fixture has the context in hand and the send path NEVER waits on
+    # these calls. One-time per fixture per day; redeploys restore the
+    # cache from form_context.json. No-op (silent, free) when capped,
+    # quota-stressed or already fetched.
+    if best_current_sot >= 1:
+        _ensure_form_context(client, fixture)
 
     # v10.21: Activate fast window only if SOT increased since last activation.
     # Prevents infinite re-activation loop when SOT is stuck (e.g. SOT=1 for 10+ min).
@@ -13539,6 +14977,10 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # v10.44g: Goal predictions (Poisson-based)
         _opp_sot_int = safe_int(opponent_sot) if isinstance(opponent_sot, str) else (opponent_sot or 0)
         _opp_xg_val = safe_float(opponent_xg) if isinstance(opponent_xg, str) else None
+        # v10.97: the form/H2H context modifiers (neutral 1.0 when the
+        # fixture has no cached context — cap hit, cold fixture, quota
+        # guard — so the predictions then run exactly as v10.96).
+        _fmod97, _fmodo97, _h2h97 = _form_ctx_goal_mods(fid, is_home_sg)
         _goal_pred = compute_goal_predictions(
             minute=minute,
             signal_team_xg=xg_value,
@@ -13551,6 +14993,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             gps=gps,  # v10.69: hotness lift (v10.74: shrunk 0.8->0.2) + late-game blend
             team_reds=_rc_team_count,  # v10.74: red-card lambda adjustment (None-safe)
             opp_reds=_rc_opp_count,
+            form_mod_sig=_fmod97,   # v10.97: last-5 form + H2H (prediction-only)
+            form_mod_opp=_fmodo97,
+            h2h_mod=_h2h97,
         )
         _current_goals = (sh or 0) + (sa or 0)
 
@@ -13564,6 +15009,21 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         _sig_goals_ft = (sh or 0) if is_home_sg else (sa or 0)
         _opp_goals_ft = (sa or 0) if is_home_sg else (sh or 0)
         _ft = compute_ft_prediction(_goal_pred, _sig_goals_ft, _opp_goals_ft)
+        # v10.97: the PLAIN (no-form) FT variant, recorded in the ledger
+        # beside the adjusted one so the EOD accuracy report grades
+        # whether the form/H2H factors actually improve the FT call.
+        # Zero extra credits — pure recomputation on already-fetched data.
+        _ft_plain = None
+        try:
+            if _goal_pred.get("form_applied") and (
+                _goal_pred.get("proj_xg_signal_plain") is not None
+            ):
+                _gp_plain = dict(_goal_pred)
+                _gp_plain["proj_xg_signal"] = _goal_pred["proj_xg_signal_plain"]
+                _gp_plain["proj_xg_opponent"] = _goal_pred["proj_xg_opponent_plain"]
+                _ft_plain = compute_ft_prediction(_gp_plain, _sig_goals_ft, _opp_goals_ft)
+        except Exception:
+            _ft_plain = None
 
         # v10.74: PITCH STATE — subs used and injury-labeled subs from the
         # events the bot already polls; recorded into the outcome
@@ -13649,6 +15109,19 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 msg += "\n" + " \u00b7 ".join(_flag_bits_95)
         except Exception as _de94:
             log.debug(f"  v10.94 dog/a-grade line skipped: {_de94}")
+
+        # v10.97: FORM / H2H / REFEREE context line — ONE compact
+        # transparency line showing the inputs behind the adjusted
+        # percentages (over-goals, FT, cards). Empty (no line at all)
+        # when the fixture has no cached context: the message then reads
+        # exactly as v10.96. Prediction-only, never a gate.
+        try:
+            _fc97_line = _form_ctx_line(fid, tname, is_home_sg,
+                                         home["name"], away["name"])
+            if _fc97_line:
+                msg += _fc97_line
+        except Exception as _fc97e:
+            log.debug(f"  v10.97 form context line skipped: {_fc97e}")
 
         # v10.96: FT WIN/DRAW/LOSS line (user request, Sep 12: "prediction
         # if it's going to be a win for either team or a draw with a
@@ -13736,6 +15209,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 cards_line=_c80_line, cards_ov=_c80_ov, cards_un=_c80_un,
                 corners_line=_n80_line, corners_ov=_n80_ov, corners_un=_n80_un,
                 team_name=tname, book_name=(_odds_msg or {}).get("bookmaker"),
+                cards_mod=((_form_ctx.get(fid) or {}).get("cards_mod")
+                           if _form_ctx.get(fid) else None),  # v10.97
             )
             if _mkt_block:
                 msg += _mkt_block
@@ -13756,6 +15231,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 "team_name": tname, "book": (_odds_msg or {}).get("bookmaker"),
                 "cards_line": _c80_line, "cards_ov": _c80_ov, "cards_un": _c80_un,
                 "corners_line": _n80_line, "corners_ov": _n80_ov, "corners_un": _n80_un,
+                "cards_mod": ((_form_ctx.get(fid) or {}).get("cards_mod")
+                              if _form_ctx.get(fid) else None),  # v10.97
                 "last_counts": (_cards_now_80, _corners_now_80),
                 "last_edit": time.time(),
             }
@@ -13968,6 +15445,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "mkt_cards_p_over": _mkt_extras.get("mkt_cards_p_over"),
             "mkt_cards_fair_over": _mkt_extras.get("mkt_cards_fair_over"),
             "mkt_cards_lean": _mkt_extras.get("mkt_cards_lean"),
+            "mkt_cards_mod": _mkt_extras.get("mkt_cards_mod"),  # v10.97: referee x team-rates factor
             "mkt_corners_line": _mkt_extras.get("mkt_corners_line"),
             "mkt_corners_over_odds": _mkt_extras.get("mkt_corners_over_odds"),
             "mkt_corners_under_odds": _mkt_extras.get("mkt_corners_under_odds"),
@@ -14048,6 +15526,25 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "pred_ft_opp": _ft.get("p_opp"),
             "pred_ft_actual": None,  # filled on resolution
             "pred_ft_rc_applied": _goal_pred.get("rc_applied"),
+            # v10.97: PLAIN (no-form) FT variant + the applied context
+            # modifiers — the EOD accuracy report grades form-adjusted vs
+            # plain nightly so the factors prove themselves or get tuned.
+            "pred_ft_plain_sig": (_ft_plain or {}).get("p_team") if _ft_plain else None,
+            "pred_ft_plain_draw": (_ft_plain or {}).get("p_draw") if _ft_plain else None,
+            "pred_ft_plain_opp": (_ft_plain or {}).get("p_opp") if _ft_plain else None,
+            "form_mod_sig": _goal_pred.get("form_mod_sig"),
+            "form_mod_opp": _goal_pred.get("form_mod_opp"),
+            "form_applied": _goal_pred.get("form_applied"),
+            "form_sig_str": (((_form_ctx.get(fid) or {}).get("form_home") if is_home_sg
+                              else (_form_ctx.get(fid) or {}).get("form_away")) or {}).get("form_str")
+                            if _form_ctx.get(fid) else None,
+            "form_opp_str": (((_form_ctx.get(fid) or {}).get("form_away") if is_home_sg
+                              else (_form_ctx.get(fid) or {}).get("form_home")) or {}).get("form_str")
+                            if _form_ctx.get(fid) else None,
+            "h2h_recent": ((_form_ctx.get(fid) or {}).get("h2h") or {}).get("recent")
+                          if _form_ctx.get(fid) else None,
+            "h2h_avg_total": ((_form_ctx.get(fid) or {}).get("h2h") or {}).get("avg_total")
+                             if _form_ctx.get(fid) else None,
             # v10.74: pitch-state context (events-based; None = no coverage)
             "opp_subst_count": _sub_opp,
             "injury_subs_team": _inj_sig,
@@ -15018,7 +16515,7 @@ def main():
     eod_report_sent_date = _load_eod_report_sent_date()
     log.info("=" * 60)
     # BOT_VERSION is now module-level (moved in v10.44d-patch)
-    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap + v10.68: ODDS CAPTURE HARDENING (signal-time market data made P&L-grade: one 3s retry when the odds fetch fails — 15/26 Sep-4 signals recorded NO odds — plus a suspect-price re-fetch and flag for impossible live prices (over-line implied < 12% before 80') and a live vs pre-match-fallback source tag — the stale pre-match totals prices were the Sep-4 garbage class (over 4.5 @ 23.00 etc.) that inflated the paper P&L by ~1,400 EUR; ~20 extra credits/day, retries quota-guarded, zero signal-logic changes + v10.69: PROJECTION SANITY + ADAPTIVE LINES + GOAL-SHOT-FREE FIRST SIGNALS (remaining-goals lambda = observed rate x REMAINING minutes, late blend to league average after 70' + GPS hotness lift and caps — the Elversberg 70' GPS-100 'Exp. total 9.0' projected 4 future goals where 2 landed; the projection block now shows only UNDECIDED over lines — at 2-2 the O2.5/O3.5 '100%' rows were pure noise — and BTTS hides once decided; and the CSKA Sofia post-mortem — the goal's own shot can no longer be the 3rd SOT that triggers a first CRITICAL: the SOT>=3 safety net and the 5-20' post-goal freshness check now run on ledger-genuine goal-shot-free counts, so a signal arriving minutes after the goal it announced is gone) + v10.70: TOP-SOT NON-SCORER ONLY (the 'scores next' line ONLY ever names players who have NOT scored yet — never a scorer, no '(scored)' tags, exactly the user's spec; when every listed shooter has already scored the line says exactly that; the deferred recovery stops quietly once the feed is current and all listed shooters scored — no credits on a line that can never exist — while a still-lagging feed keeps retrying because the unlisted SOT may belong to a non-scorer + v10.71: FEED-GUARD (silent API feed-death detection — the Sep 5 18:34 UTC incident: /fixtures?live=all returned an empty live set while 7 tracked matches were at 18'-78' and the quota counter froze at 7499 for 60+ min, all HTTP 200; now an all-monitored-vanish below 85' triggers a batched fixture-ID verification, verified-still-live games are HELD in monitoring with a Telegram alarm every 15m and auto-resume when the feed recovers (90m hold cap); a frozen-quota watchdog warns when the daily counter stops decrementing across 45+ calls; AND the pending-outcome orphan fix — signal_outcomes is never cleared while outcomes are pending (the Sep 5 18:42 gap-clear orphaned 9 pendings to disk), the EOD report/backup/clear now fire only at the true end of day (schedule-gated, anti-hammered), and mid-day gaps hold outcomes in memory for the 10-min periodic resolver + v10.72: SHADOW GATES + SELF-HEALING SLEEP (two would-suppress classes from the Sep 4-6 outcome data — DAMP: winning by 2+ with GPS<85, 23% full WR vs 31% baseline, and LATE75: signals at 75'+, 18% full WR — are now TAGGED in the log and every outcome record but sent UNCHANGED; the hard-gate flip is the one-line DAMPENER_HARD_GATE / LATE_HARD_GATE constant, decision after ~1 week of shadow data, ~300 tagged signals; heartbeat shows 'Shadow: DAMP:n+LATE75:n'; COLD-START LEDGER SEEDING: pre-restart goals seed the landed goal-shot ledger on a team's first poll, so the goal's own shot can never trigger a false first signal after a mid-match restart — Benfica 16' class, zero credits; STOP-MODE RENEWAL PROBE: one direct /status call per 30-min STOP wake re-reads the live quota header, so quota exhaustion self-heals at the 03:00 Sofia renewal instead of looping forever — api_get's pre-flight raise used to hide the renewal completely; MIDNIGHT LIVE-GAME GUARD: a live monitored match at the active-window rollover keeps being watched to FT (2h cap, freshness-gated so a stale cache can never fake it) — the GIL Vicente 71'-abandoned-at-00:00 class — and verified-FT guard releases + a heartbeat purge kill the frozen 'FastWin 0s' zombie + v10.73: RED-CARD VOICE + PLAYERS-STATS TOP-SOT FALLBACK (red cards now speak in every signal: the events feed the bot already polls yields player + minute + kind — Dunav-Slavia class: two reds, 10’ and 76’, previously invisible — with a NEW RED CARD warning inside 10 game minutes, man-up / man-down context, and red_cards_team / red_cards_opp / red_card_events recorded into every signal outcome and every poll for brain v2, zero extra credits, zero gate changes; AND when the events feed has no per-player shots at signal time — Serie A 0/16, Bundesliga 0/14, Eredivisie 0/9, Premier League 1/10, Ligue 1 1/13 in the Sep 1-5 audit — one /fixtures/players call delivers the Top SOT names from the stats pipeline: 1 credit, daily-capped (60), per-league censused (players_feed_census.json, visible in /sotfeed), same never-a-scorer ladder, merged into the player cache so repeat signals are free + v10.74: BOOT-PATH MIDNIGHT GUARD + CALIBRATED OVER PROJECTION + FT 1X2 PREDICTION (a restart at ~00:00 local no longer sleeps through live pending-outcome fixtures — the resolver's 'pendings on LIVE fixtures' knowledge feeds the v10.72 hold with a 25m freshness anchor and the same 2h cap, so the Sep 8 00:01-boot class is dead; the goal projection's GPS hotness lift is shrunk 0.8->0.2 after the Sep 1-7 backtest proved it pure bias — 74.5% predicted vs 54.1% landed on undecided O2.5 (n=170) and a naive no-pressure Poisson scored the better Brier 0.207 vs 0.301 — and the DISPLAYED over lines are now calibrated 50/50 against an empirical game-state table P(>=k more goals | current total x minute band) measured from the 229 resolved signals, with pred_over_*_cal + cal_mode recorded beside the raw model values for the next-week comparison; red cards now move the remaining-goals lambdas inside the same Poisson engine (0.72x down / 1.08x up per net red, events-based None-safe) so overs and FT odds both see 10v11; every signal carries a full-time 1X2 PREDICTION line — win/draw/loss for the signaled team from the live scoreline + adjusted lambdas, informational only, zero extra credits — plus a pitch-state line (men on pitch 11-Reds, subs used, injury-labeled subs from Subst detail='Injury') and pred_ft_sig/draw/opp outcome fields, with pred_ft_actual filled from the true FT result at resolution for later calibration; zero signal-gate changes, zero extra credits + v10.75: BOX-BURST SHADOW (the low-SOT box-volume class — SOT 1-2 while shots-inside-box>=8 within 21-61' — now records a VIRTUAL signal at the first crossing, never sent, never gating, zero extra credits; the Sep 2-8 backtest says 64.3% scored later / 35.7% within 15m plain (n=14) and 69.2%/38.5% with ib rising (n=13) vs a 48% base — the go-live rule after ~2 weeks of boxburst_shadow.jsonl records is >=60% later AND >=40% <=15m, then the one-line BOXBURST_LIVE flip adds a compact Telegram alert; records carry sot/ib/total_shots/ib_rising/gps/red-cards/real_signal_before and resolve EXACTLY like real signals through check_fastlane_shadow, which now walks BOTH shadow stores; own 2-poll ib history kept by the evaluator because the poll recency fields ib_5m_ago/ib_10m_ago are never populated; dedupe survives restarts (today's fired keys reloaded at boot), runtime state resets daily and purges with finished fixtures; heartbeat shows Shadow: ...+BOX:n; the redeploy guard verifies the new file and reports its count + v10.76: GOAL-BURST — THE TOTALS PATH (the Lille 2-3 Betis post-mortem: 5 goals by 53', ZERO signals — Betis' 3 SOT WERE the 3 goals so GOAL-SHOT NET left effective pressure 0, and GPS 52/65 never lit; the system only certifies sustained NON-goal pressure, so goal-burst games are structurally invisible; the Sep 2-8 backtest on 63,489 polls adds that 69% of FIRST goals land while the scorer's SOT is still <=2 — the SOT>=3 net is late by design; three banked-goals cells now record virtual MATCH-LEVEL signals at first crossing — G1 first-goal-by-25' (62% reach 3+, n=32), G2 two-goals-by-40' (84% next goal, 48% <=15m, n=44; GPS-blind subset 79%, no-signal-before 87% = the exact blind spot), G3 three-goals-by-55' (76%, n=37) — resolved with ANY-goal semantics (own goals count, Over-lines settlement) through check_fastlane_shadow which now walks THREE shadow stores; zero gate changes, zero extra credits; G2 already clears the box-burst go-live bar so its compact alert is ON by default (GOALBURST_LIVE) while G3/G1 stay shadow behind their own flags; ft_total + bet_hit stamped at resolution so the totals bets grade honestly; heartbeat shows Shadow: ...+GB:n; the redeploy guard verifies goalburst_shadow.jsonl and reports its count + v10.77: P&L-GRADE ODDS FILTER (the honest ledger: every signal outcome now carries odds_pnl_grade, True ONLY when odds_source='live' AND not odds_suspect — the Sep-6 post-mortem found 100% of recorded prices were prematch_fallback stale pre-match totals (Marseille O4.5 @ 26.0 with 4 goals already in at 54', AC Horsens O3.5 @ 11.0 with 3 in at 45', 22/58 prices >= 3.00) and the paper P&L of +1,900 EUR / ROI +164% on Sep 6 was the same garbage class as Sep 4's +1,400 EUR — at realistic live prices the day was break-even; the EOD report's MARKET / EV / Flat-ROI block now grades ONLY P&L-grade prices and SAYS how many stale prices were excluded, with backward-compatible derivation for old records (no field -> source/suspect fallback), while all prices remain in the file for research; zero gate changes, zero extra credits + v10.78: ODDS IN THE SIGNAL (the user's betting-decision block: every Telegram signal and every live G2 goal-burst alert now carries the MARKET PRICE captured at signal time — source-labeled LIVE vs 'PRE ref' with suspect prices flagged, the v10.77 ledger honesty moved into the chat — beside the CALIBRATED fair prices and break-evens for the next-goal over line and the team-to-score bet, so the 'do I bet?' call is: open your book, compare the live price against the printed break-even, done; one fast single-pass odds fetch (for_message mode: no retry sleep, no suspect re-fetch, quota-guarded) runs AFTER all gates pass and BEFORE the send (~1s later, same normal-path credit count, odds never influence the signal), the same data feeds the outcome record, a failed fast pass falls back to the full v10.68 hardened capture post-send; team-to-score fair = Poisson marginal blended 50/50 with the minute-banded landed rate from the user's own Sep 6-8 ledger (61%/65%/46%/35% bands), capped at the any-goal line; G2 alerts price the exact one-more-goal market and print the class break-even (84% -> 1.19); pred_team_scores/_cal + odds_ev_pct + odds_in_msg recorded for the next calibration pass; zero gate changes + v10.85: SIMPLIFIED SIGNAL (display-only, message cut ~45%: one-line stats per side with dead xG/BigChances/corners display channels dropped, one-line calibrated projection + FT prediction, plain-language bet block where the fair line says bet-only-at-LIVE-odds>=X, cards & corners lines say need-N-more and bet-Over-only-odds>=X, the Red Cards None line is gone, the orphan GPS +0 fragment fixed; the LEDGER, every recorded field, every gate and threshold UNCHANGED + v10.86: EMPIRICAL LAMBDA CALIBRATION — minute-banded deflate of the final remaining-goals lambdas (signal team 0.85/0.80/0.45, opponent 0.70/0.60/0.30 for <=45/<=60/61+; measured on the settled ledger Sep 2-9: opponent lambda 1.5x hot in both regimes, late-game collapse) — prediction-only, never a gate; fair prices + projections honest, bet-only-at-LIVE-odds>=X threshold stricter; 61+ signals stay full alerts (user decision) + v10.87: GOAL-RACE GUARD (feed-ahead-of-score mute — the PSV-Shakhtar 45' class: signal composed on a 0-0 stats batch while the events feed already knew the goal; the pre-send Top-SOT fetch's valid-goal count vs the message scoreline, feed-ahead -> mute + blocked-candidate record GOAL_RACE_FEED_AHEAD, the post-goal gates re-decide on the next poll; the POST-GOAL tag now says it watches the NEXT goal — the Fenerbahce 53' class was a genuine second-goal watch, only the wording hid it; v10.88: POST-GOAL HONESTY (the Man Utd 33' class — a stale 5-20m post-goal CRITICAL whose GPS>=75 trigger was completed by the goal's own shot — is now BLOCKED like every other tier, with POST_GOAL_STALE blocked records; the Como 28' class — a genuine attempt-burst next-goal watch that passed the 5-20m freshness gate in silence — now carries the same this-watches-the-NEXT-goal annotation; and the header ordinal becomes (next) once the signaling team has scored, so no post-goal signal can read as a first-goal warning + v10.89: RED-AWARE LOSING RELAXATION (a losing team with the opponent down a NET man and deficit <= 1 — the Slavia 1-0 Lens class, Lens blocked at 64' while chasing 10 men — now passes at STANDARD tier bars with a man-advantage message tag and a red_relax ledger field so the class grades itself; 11v11 losing, deficit >= 2, and missing-events cases keep the strict v10.34 gate — fail-closed) + v10.90: SOT3 SHADOW + G3 LIVE (blocked losing CRITICALs whose only failing criterion is SOT - GPS>=80, IB>=65, SOT==3, the Leipzig 54'/Galatasaray 75' class, 4/4 any-goal within 15m on the Sep 9-10 sample - are tagged sot3_relax on the blocked record for false-negative grading, promote at n>=15 with any-15m>=45%; G3 goes LIVE - 76% next-goal by FT, n=37 plus 3/4 on the fresh check - with a 10-minute anti-stack dedup so no Telegram alert stacks on a real signal or a recent burst alert; the shadow record is always written and graded + v10.94: LEDGER-GRADED SIGNAL FLAGS (the 309-signal Aug 30-Sep 11 ledger split: goal-pressure conversion is 68% (BE 1.46) in the top-9 tracked names - Ireland 80% (incl. 'Premier Division' alt name), 2.Bundesliga 79%, Bundesliga 75%, Süper Lig 71%, Superliga 65%, Coppa Italia 64%, UCL 63%, Czech Liga 62% - vs 42% (BE 2.36) in the cold-9 - PL 23%, First League 33%, La Liga 38%, HNL 40%, Ligue 1 42%, Liga I 47%, Serie A/Eredivisie/Primeira 50% - a 26pp spread the live market does not price because books grade pressure by game state, not league; every signal now carries a LEAGUE CLASS A/B/C line + ledger field, a DOG flag (team 1X2 >= 1.15x opponent, from the SAME signal-time odds fetch, zero extra credits - dogs convert 57% BE 1.74 n=68, dogs in class-A leagues 74% BE 1.34 n=39: the market anchors on the prematch favorite while the pressure is on the dog), and an A-GRADE composite line (pre-50' + not leading 2+ (anti-DAMP) + class-A-or-dog: 79% BE 1.26, 44% within 15m, n=78, vs 69%/36% for the plain pre-50' base - the betting shortlist); shots-inside-box was checked and deliberately NOT flagged on existing signals (flat once minute-controlled: 69/67/67/65% across ib buckets pre-50' - the raw ib split was minute confound, ib 10+ median 64' vs ib 0-3 median 36'; the box leverage stays where it belongs, the BOX-BURST shadow class); the EOD stats block grades every flag nightly (bet_flag, class A/C, DOG, A-GRADE) so class drift is caught live; ledger fields league_class/dog_flag/dog_odds_ratio/a_grade land in every outcome record; display + ledger ONLY, NEVER a gate, zero gate changes, zero extra credits + v10.95: SIMPLE SIGNAL + HIT-% LADDER (user request Sep 12: too much text and complexity - print the percentage likelihood of the signal to win): every signal now LEADS with the ledger hit-grade number - A-GRADE 79% (pre-50' + not leading 2+ + class-A-or-dog, n=78, 44% in 15m), BET 58% (pre-50' without qualifiers, n=105), NO-BET 37% (50'+, n=124) - stars carry the tier, the (next) post-goal ordinal stays in the header; the v10.94 league/dog/a-grade explanation lines, GPS/trigger detail, bet_flag, trend, recency, projection, FT prediction and pitch-state DISPLAY lines are all folded away (every value still lands in the ledger outcome record); the odds block is ONE line (book price + fair break-even + the bet-only-if-LIVE rule), cards & corners is ONE line with lean break-evens (same single render path, live edits byte-stable); the dog flag now says WINNING or CHASING (a dog already ahead is the best quadrant, 6/6 on the ledger; a dog chasing is the classic repricing lag) and a 'coasting +2' tag marks the anti-DAMP state; hit_grade/hit_pct/dog_state land in signals_sent and the outcome record, and the EOD stats block grades the PRINTED ladder numbers nightly (A-GRADE-says-79 / BET-says-58 / NO-BET-says-37 rows plus DOG winning vs chasing) so the headline is always live-graded, never assumed; display + ledger ONLY, NEVER a gate, zero gate changes, zero extra credits + v10.96: DAY-LEVEL CREDIT PACING + PREDICTION CARD (user request Sep 12: 'does throttling compromise signal speed? ...prediction on each signal - win/draw/loss with a percentage, corners, cards, top-SOT scorer, odds in the message'): (1) PACING — the Sep 12 post-mortem: burn 1,195 credits/h at midday vs 437/h the 7,500/day plan can sustain, quota death projected 19:15 Sofia = blind for the whole evening slate; the 10s event fast lane alone was 66% of spend and the 2,500/day lane cap reset on EVERY restart (4 redeploys today); now: affordable rate = (remaining-100) / hours-to-00:00-UTC vs the rolling 45-min burn measured straight from quota headers (restart-proof ground truth); PACE1 (burn > 1.15x affordable): event lane 10->20s + discovery x1.5 - REAL SIGNALS UNCHANGED (the signal path is the stats batch: 30s hot / 15s ultra-fast, untouched; the lane only feeds shadow detection, surge alarms and goal flashes, +10s advisory latency); PACE2 (burn > 1.5x affordable, or < 1500 left with 3h+ to go, or boot-seed heuristics): lane 30s, discovery x2, and the single real-signal concession - hot-stats floor 30->45s, goal-priority 15s windows exempt; +15s worst-case latency beats going dark; budget modes CAREFUL/STRICT/EMERGENCY/STOP still own the tank bottom as before; dwell hysteresis 300s, Telegram transition alerts (max 1/h), heartbeat shows Pace: burn vs affordable; (2) the lane daily counter now persists to fastlane_credit.json (date-keyed, UTC-day flip = fresh 0) so a redeploy can never reset the cap mid-day again; (3) PREDICTION CARD - the FT win/draw/loss line is surfaced from the v10.74 red-card-aware Poisson engine: 'FT: Team 61% - draw 25% - Opp 14% (10v11)' (pred_ft_* were ledger-only since v10.95 dropped the display), cards & corners bits now carry their P(over): 'Cards 2/4.5 -> O 62% @1.61+' (ledger-recorded since v10.80, only displayed now), Top-SOT next-scorer line and the one-line odds block unchanged from v10.95; every new display value was already computed from data the bot already fetched - ZERO extra credits, zero gate changes, zero threshold changes, prediction display only)")
+    log.info(f"Football Bot {BOT_VERSION} — Goal predictions (Poisson, scoreline-aware) + dead probe revival + signal cooldown + 15s polling + PRE/POST-GOAL tagging + xG escape hatch + SOT-since-goal tracking + pressure buildup override + SOT guard soft correct + opponent stats in poll data + untracked live debug + daily ML backup to Telegram (gzip) + /restore file upload + EOD retry resolution (90s wait) + disallowed goal filter + top SOT player in signals + /polls gzip + detection latency measurement + event fast lane (10s) + conditional both-signal slowdown + enriched signal data (poll_interval, last_goal_minute, time_since_prev_signal) + goal-triggered priority polling (discovery + stats) + goal detection latency (detect_lag, stats_lag) + signal_lag tracking + untracked-retry fast discovery (120s) + Bulgarian league 172 fix + live market data + source discovery + ML shadow scoring (logging-only) + top SOT non-scorer priority + signal min-gap guard (180s) + late-window SOT-rise requirement + late EW GPS floor + EW acceleration gate + GPS85 fast-lane lock + v10.49: signal-send decoupled from player-SOT fetch (every signal 0.5-2s faster) + blocked-signal false-negative tracking (logging-only) + Poisson per-league calibration tracking (logging-only) + v10.50: event fast lane widened to top-3 fixtures + FAST-LANE SHADOW MODE (virtual signals, logging-only, never sent) + SOT>=2 stats polling 45s->30s (go-max) + fast-lane daily credit reset bugfix + v10.51: fast-lane ghost-pick guard (stale GPS history from fixtures past the 85' ceiling no longer re-enters the pick list) + monitoring-drop reasons logged in discovery (why a game left 'Monitored:') + v10.52: fast-lane poll crash fix (_event_fast_lane_fids missing from global decl — UnboundLocalError killed the bot when any fixture became monitored) + full-file global-scoping audit clean + poll_event_fast_lane now covered by smoke tests + v10.53: GOAL WATCH instant goal flashes (~10-30s latency, close games 60'+, /goalwatch toggle, goal_flash.jsonl log) + cold-start warm-up (events backfill so freshness gates work immediately after mid-game restarts) + v10.54: SURGE WATCH pre-goal pressure alarms (quiet-team SOT wake-up + burst escalation + shot-flood layer; rides the same event polls at ZERO extra credits; /surgewatch toggle, default ON; surge_watch.jsonl log) + goal flashes default OFF (user preference: warn BEFORE the goal, not after) + v10.55: goal-aware surge semantics (a goal counts as the team's LAST KNOWN SHOT for silence measurement and closes open episodes, but NEVER triggers an alert; post-goal pressure needs a fresh quiet spell first = second-goal early watch) + SUSTAIN tier (3rd+ SOT in a burst keeps alerting up to the 5-per-game cap — continuous pressure fully covered, not just the first two shots) + v10.56: GOAL-SHOT EXCLUSION in the main signal pipeline (the v10.55 surge-watch goal semantics applied to repeat signals: pending/landed goal-SOT ledger so the shot that scored never counts as SOT-jump / buildup / burst / post-goal fresh-pressure evidence — sig_num>=2 SOT-jump gate, goal-pressure-continues, cooldown buildup override, first-signal-only exception, 80'+ event-burst exception and the SOT-at-goal baseline are all goal-shot-free; a goal's own +1 can only ever CLOSE pressure windows, never open them) + v10.57: TOP-SOT PLAYER GOAL REFRESH (a goal instantly drops the per-fixture Top-SOT player cache — the player who scored leaves the 'scores next' line and the next signal headlines the top SOT player who has NOT scored; cache rebuilds from fresh events after every goal, event lanes track valid-goal counts, the stats lane drops the cache on score change, and finished-fixture/daily cleanup now also clears the player cache) + v10.58: TOP-SOT NEVER-A-SCORER + BIG-CHANCE VOICE (the Top SOT line can never headline a player who already scored: when every SOT taker has scored it falls back to the top shooters who have not — shown as '(n shots)' — and when every shooter has scored no line is sent at all; an events-feed lag retry and a SOT-growth cache refresh keep the names fresh as new shooters appear; Big Chances GPS weight nearly doubled (2.5 pts/BC, cap 6) because they are the strongest single pre-goal stat the API offers, and signals now carry a NEW BIG CHANCE freshness warning when a big chance was created since the last poll) + v10.59: GPS-vs-ML SCOREBOARD (the ML shadow opinion is now computed once per poll BEFORE the gates and saved into every signal outcome, every blocked candidate and every pressure-poll record; new /mlstats command shows who reads incoming goals better — sent-signal winner/loser gaps, goals-the-gates-blocked capture rate, agreement — the model itself stays frozen, logging-only, zero extra credits) + v10.60: FIELD EXPANSION + AVAILABILITY CENSUS (GK saves, fouls, offsides, yellow cards, pass volume and accuracy, blocked shots, substitutions and card events are now parsed from responses the bot ALREADY fetches and recorded into every poll and signal as null-safe fields for brain v2 — never used in GPS or gates, zero extra credits, zero behavior change; a live-learned per-league census (/fields command, field_census.json) now tells us which fields the API actually delivers, after the big_chances post-mortem proved fields must be verified from real responses, never assumed) + v10.61: BC-MISSING REDISTRIBUTION SHADOW (big_chances is never delivered on this API plan, so the GPS always runs without its 6-pt BC component and without compensation when xG is present; every poll and signal now also logs gps_restored, the BC weight proportionally redistributed exactly like the xG-missing pattern, while the live gates stay on the historical scale — thresholds were tuned on it with real outcome data, all 74 CRITICALs ever were SOT>=3 safety-net fires, and the marginal sub-threshold bands convert no better; GPS_BC_REDISTRIBUTE=False until a threshold re-tune says otherwise) + v10.62: PHANTOM-GOAL PROTECTION + REDEPLOY GUARD (disallowed/missed-penalty 'Goal' events no longer hide their taker from the Top SOT 'scores next' line and no longer inflate events-side SOT — Viborg 42' phantom-goal post-mortem; every silently-skipped Top SOT line now logs WHY; and after every redeploy the bot PROVES nothing was lost: all volume files line-verified at startup with corrupt-tail auto-repair, then ONE Telegram message after first discovery reports data counts and every live game classified monitored / pickup pending / past 85' / untracked) + v10.63: STARTUP EOD RACE FIX + TOP-SOT FEED-LAG RECOVERY (a fresh startup is never again mistaken for end-of-day — EOD fires only after the session has actually LOOKED at live state: first discovery or a no-matches schedule; the 90s stall / duplicate ML backup / mid-game outcome-clear / orphaned pending outcomes race from the Sep 4 redeploy is dead; the 30s startup retry skips when every pending fixture is still live; the resolver timer is seeded so the startup /fixtures burst is not duplicated; and the redeploy message counts pending from the file, not possibly-cleared memory — PLUS the Top SOT 'scores next' line now survives events-feed lag: a deferred recovery retry (45s, max 2 attempts, credit-capped) re-fetches after the feed catches up and sends the line late with a feed-lag note, the cache path refreshes instead of serving stale silence when stats know more SOT than the cached feed, and the growth snapshot now covers BOTH teams of a fixture — Sparta/PEC post-mortem: stats knew SOT=3, the feed listed only the scorer, the never-show-a-scorer rule silenced the line and the 3s retry could not bridge a minutes-long lag) + v10.64: STARTUP CRASH HOTFIX (v10.63's new startup branch wrapped an INT pending count in len() — TypeError crash-loop at every restart where all pending outcomes sat on live fixtures, e.g. the Sep 4 19:19 UTC evening-slate restart with 7 pendings; fixed, and the main() startup wiring is now smoke-tested by DIRECT EXECUTION of the exact block, not just the functions it calls) + v10.65: TOP-SOT IN THE SIGNAL + SHOT-EVENT FEED CENSUS (the 'scores next' player line is now EMBEDDED in the signal itself — fetched before the send, one round-trip, no inline 3s retry — and an unavailable line SAYS so: no player data yet / every listed shooter already scored / player data unavailable for this league, learned from a live per-league census (sot_feed_census.json, /sotfeed) of which feeds ever deliver per-player Shot events; recovery retries widened to 3×60s and SKIPPED for leagues the census has learned never deliver, so no credits burn on hopeless follow-ups — Porto/Betis post-mortem: their feeds listed 2/6 and 0/6 SOT at signal time and both recoveries gave up + v10.66: EVENT-MINUTE CORRECTION (outcome records resolved live carry the DETECTION minute, not the true event minute — feed lag + poll cadence bias them late: Botev Vratsa's 86'/88' goals were booked as 90' (+49') and a true in-window goal detected past its window boundary records a false MISS; the FT resolution pass now re-verifies every live-stamped field against the true goal-event minutes it already fetched — goal minutes corrected, 5/10/15m windows recomputed with MISS->HIT flips where the event truth says HIT, phantom live goals flipped back to MISS via the final-score check, events-missing goals HELD with the live minute — zero extra credits, zero gate changes) + v10.67: LATE SURGE TO THE FINAL WHISTLE (close games crossing the 85' ceiling — Botev Vratsa's 86'/88' vs Septemvri Sofia — are retained in the events watch lane until FT (LATE-RETAIN), so every surge tier stays live 86-90'; late fixtures take watch-lane pick priority + a +2 alert-budget bonus; the stats lane, signal gates and signal_outcomes are untouched — warning-only, ~10-16 events polls per retained game inside the existing 1500/day lane cap + v10.68: ODDS CAPTURE HARDENING (signal-time market data made P&L-grade: one 3s retry when the odds fetch fails — 15/26 Sep-4 signals recorded NO odds — plus a suspect-price re-fetch and flag for impossible live prices (over-line implied < 12% before 80') and a live vs pre-match-fallback source tag — the stale pre-match totals prices were the Sep-4 garbage class (over 4.5 @ 23.00 etc.) that inflated the paper P&L by ~1,400 EUR; ~20 extra credits/day, retries quota-guarded, zero signal-logic changes + v10.69: PROJECTION SANITY + ADAPTIVE LINES + GOAL-SHOT-FREE FIRST SIGNALS (remaining-goals lambda = observed rate x REMAINING minutes, late blend to league average after 70' + GPS hotness lift and caps — the Elversberg 70' GPS-100 'Exp. total 9.0' projected 4 future goals where 2 landed; the projection block now shows only UNDECIDED over lines — at 2-2 the O2.5/O3.5 '100%' rows were pure noise — and BTTS hides once decided; and the CSKA Sofia post-mortem — the goal's own shot can no longer be the 3rd SOT that triggers a first CRITICAL: the SOT>=3 safety net and the 5-20' post-goal freshness check now run on ledger-genuine goal-shot-free counts, so a signal arriving minutes after the goal it announced is gone) + v10.70: TOP-SOT NON-SCORER ONLY (the 'scores next' line ONLY ever names players who have NOT scored yet — never a scorer, no '(scored)' tags, exactly the user's spec; when every listed shooter has already scored the line says exactly that; the deferred recovery stops quietly once the feed is current and all listed shooters scored — no credits on a line that can never exist — while a still-lagging feed keeps retrying because the unlisted SOT may belong to a non-scorer + v10.71: FEED-GUARD (silent API feed-death detection — the Sep 5 18:34 UTC incident: /fixtures?live=all returned an empty live set while 7 tracked matches were at 18'-78' and the quota counter froze at 7499 for 60+ min, all HTTP 200; now an all-monitored-vanish below 85' triggers a batched fixture-ID verification, verified-still-live games are HELD in monitoring with a Telegram alarm every 15m and auto-resume when the feed recovers (90m hold cap); a frozen-quota watchdog warns when the daily counter stops decrementing across 45+ calls; AND the pending-outcome orphan fix — signal_outcomes is never cleared while outcomes are pending (the Sep 5 18:42 gap-clear orphaned 9 pendings to disk), the EOD report/backup/clear now fire only at the true end of day (schedule-gated, anti-hammered), and mid-day gaps hold outcomes in memory for the 10-min periodic resolver + v10.72: SHADOW GATES + SELF-HEALING SLEEP (two would-suppress classes from the Sep 4-6 outcome data — DAMP: winning by 2+ with GPS<85, 23% full WR vs 31% baseline, and LATE75: signals at 75'+, 18% full WR — are now TAGGED in the log and every outcome record but sent UNCHANGED; the hard-gate flip is the one-line DAMPENER_HARD_GATE / LATE_HARD_GATE constant, decision after ~1 week of shadow data, ~300 tagged signals; heartbeat shows 'Shadow: DAMP:n+LATE75:n'; COLD-START LEDGER SEEDING: pre-restart goals seed the landed goal-shot ledger on a team's first poll, so the goal's own shot can never trigger a false first signal after a mid-match restart — Benfica 16' class, zero credits; STOP-MODE RENEWAL PROBE: one direct /status call per 30-min STOP wake re-reads the live quota header, so quota exhaustion self-heals at the 03:00 Sofia renewal instead of looping forever — api_get's pre-flight raise used to hide the renewal completely; MIDNIGHT LIVE-GAME GUARD: a live monitored match at the active-window rollover keeps being watched to FT (2h cap, freshness-gated so a stale cache can never fake it) — the GIL Vicente 71'-abandoned-at-00:00 class — and verified-FT guard releases + a heartbeat purge kill the frozen 'FastWin 0s' zombie + v10.73: RED-CARD VOICE + PLAYERS-STATS TOP-SOT FALLBACK (red cards now speak in every signal: the events feed the bot already polls yields player + minute + kind — Dunav-Slavia class: two reds, 10’ and 76’, previously invisible — with a NEW RED CARD warning inside 10 game minutes, man-up / man-down context, and red_cards_team / red_cards_opp / red_card_events recorded into every signal outcome and every poll for brain v2, zero extra credits, zero gate changes; AND when the events feed has no per-player shots at signal time — Serie A 0/16, Bundesliga 0/14, Eredivisie 0/9, Premier League 1/10, Ligue 1 1/13 in the Sep 1-5 audit — one /fixtures/players call delivers the Top SOT names from the stats pipeline: 1 credit, daily-capped (60), per-league censused (players_feed_census.json, visible in /sotfeed), same never-a-scorer ladder, merged into the player cache so repeat signals are free + v10.74: BOOT-PATH MIDNIGHT GUARD + CALIBRATED OVER PROJECTION + FT 1X2 PREDICTION (a restart at ~00:00 local no longer sleeps through live pending-outcome fixtures — the resolver's 'pendings on LIVE fixtures' knowledge feeds the v10.72 hold with a 25m freshness anchor and the same 2h cap, so the Sep 8 00:01-boot class is dead; the goal projection's GPS hotness lift is shrunk 0.8->0.2 after the Sep 1-7 backtest proved it pure bias — 74.5% predicted vs 54.1% landed on undecided O2.5 (n=170) and a naive no-pressure Poisson scored the better Brier 0.207 vs 0.301 — and the DISPLAYED over lines are now calibrated 50/50 against an empirical game-state table P(>=k more goals | current total x minute band) measured from the 229 resolved signals, with pred_over_*_cal + cal_mode recorded beside the raw model values for the next-week comparison; red cards now move the remaining-goals lambdas inside the same Poisson engine (0.72x down / 1.08x up per net red, events-based None-safe) so overs and FT odds both see 10v11; every signal carries a full-time 1X2 PREDICTION line — win/draw/loss for the signaled team from the live scoreline + adjusted lambdas, informational only, zero extra credits — plus a pitch-state line (men on pitch 11-Reds, subs used, injury-labeled subs from Subst detail='Injury') and pred_ft_sig/draw/opp outcome fields, with pred_ft_actual filled from the true FT result at resolution for later calibration; zero signal-gate changes, zero extra credits + v10.75: BOX-BURST SHADOW (the low-SOT box-volume class — SOT 1-2 while shots-inside-box>=8 within 21-61' — now records a VIRTUAL signal at the first crossing, never sent, never gating, zero extra credits; the Sep 2-8 backtest says 64.3% scored later / 35.7% within 15m plain (n=14) and 69.2%/38.5% with ib rising (n=13) vs a 48% base — the go-live rule after ~2 weeks of boxburst_shadow.jsonl records is >=60% later AND >=40% <=15m, then the one-line BOXBURST_LIVE flip adds a compact Telegram alert; records carry sot/ib/total_shots/ib_rising/gps/red-cards/real_signal_before and resolve EXACTLY like real signals through check_fastlane_shadow, which now walks BOTH shadow stores; own 2-poll ib history kept by the evaluator because the poll recency fields ib_5m_ago/ib_10m_ago are never populated; dedupe survives restarts (today's fired keys reloaded at boot), runtime state resets daily and purges with finished fixtures; heartbeat shows Shadow: ...+BOX:n; the redeploy guard verifies the new file and reports its count + v10.76: GOAL-BURST — THE TOTALS PATH (the Lille 2-3 Betis post-mortem: 5 goals by 53', ZERO signals — Betis' 3 SOT WERE the 3 goals so GOAL-SHOT NET left effective pressure 0, and GPS 52/65 never lit; the system only certifies sustained NON-goal pressure, so goal-burst games are structurally invisible; the Sep 2-8 backtest on 63,489 polls adds that 69% of FIRST goals land while the scorer's SOT is still <=2 — the SOT>=3 net is late by design; three banked-goals cells now record virtual MATCH-LEVEL signals at first crossing — G1 first-goal-by-25' (62% reach 3+, n=32), G2 two-goals-by-40' (84% next goal, 48% <=15m, n=44; GPS-blind subset 79%, no-signal-before 87% = the exact blind spot), G3 three-goals-by-55' (76%, n=37) — resolved with ANY-goal semantics (own goals count, Over-lines settlement) through check_fastlane_shadow which now walks THREE shadow stores; zero gate changes, zero extra credits; G2 already clears the box-burst go-live bar so its compact alert is ON by default (GOALBURST_LIVE) while G3/G1 stay shadow behind their own flags; ft_total + bet_hit stamped at resolution so the totals bets grade honestly; heartbeat shows Shadow: ...+GB:n; the redeploy guard verifies goalburst_shadow.jsonl and reports its count + v10.77: P&L-GRADE ODDS FILTER (the honest ledger: every signal outcome now carries odds_pnl_grade, True ONLY when odds_source='live' AND not odds_suspect — the Sep-6 post-mortem found 100% of recorded prices were prematch_fallback stale pre-match totals (Marseille O4.5 @ 26.0 with 4 goals already in at 54', AC Horsens O3.5 @ 11.0 with 3 in at 45', 22/58 prices >= 3.00) and the paper P&L of +1,900 EUR / ROI +164% on Sep 6 was the same garbage class as Sep 4's +1,400 EUR — at realistic live prices the day was break-even; the EOD report's MARKET / EV / Flat-ROI block now grades ONLY P&L-grade prices and SAYS how many stale prices were excluded, with backward-compatible derivation for old records (no field -> source/suspect fallback), while all prices remain in the file for research; zero gate changes, zero extra credits + v10.78: ODDS IN THE SIGNAL (the user's betting-decision block: every Telegram signal and every live G2 goal-burst alert now carries the MARKET PRICE captured at signal time — source-labeled LIVE vs 'PRE ref' with suspect prices flagged, the v10.77 ledger honesty moved into the chat — beside the CALIBRATED fair prices and break-evens for the next-goal over line and the team-to-score bet, so the 'do I bet?' call is: open your book, compare the live price against the printed break-even, done; one fast single-pass odds fetch (for_message mode: no retry sleep, no suspect re-fetch, quota-guarded) runs AFTER all gates pass and BEFORE the send (~1s later, same normal-path credit count, odds never influence the signal), the same data feeds the outcome record, a failed fast pass falls back to the full v10.68 hardened capture post-send; team-to-score fair = Poisson marginal blended 50/50 with the minute-banded landed rate from the user's own Sep 6-8 ledger (61%/65%/46%/35% bands), capped at the any-goal line; G2 alerts price the exact one-more-goal market and print the class break-even (84% -> 1.19); pred_team_scores/_cal + odds_ev_pct + odds_in_msg recorded for the next calibration pass; zero gate changes + v10.85: SIMPLIFIED SIGNAL (display-only, message cut ~45%: one-line stats per side with dead xG/BigChances/corners display channels dropped, one-line calibrated projection + FT prediction, plain-language bet block where the fair line says bet-only-at-LIVE-odds>=X, cards & corners lines say need-N-more and bet-Over-only-odds>=X, the Red Cards None line is gone, the orphan GPS +0 fragment fixed; the LEDGER, every recorded field, every gate and threshold UNCHANGED + v10.86: EMPIRICAL LAMBDA CALIBRATION — minute-banded deflate of the final remaining-goals lambdas (signal team 0.85/0.80/0.45, opponent 0.70/0.60/0.30 for <=45/<=60/61+; measured on the settled ledger Sep 2-9: opponent lambda 1.5x hot in both regimes, late-game collapse) — prediction-only, never a gate; fair prices + projections honest, bet-only-at-LIVE-odds>=X threshold stricter; 61+ signals stay full alerts (user decision) + v10.87: GOAL-RACE GUARD (feed-ahead-of-score mute — the PSV-Shakhtar 45' class: signal composed on a 0-0 stats batch while the events feed already knew the goal; the pre-send Top-SOT fetch's valid-goal count vs the message scoreline, feed-ahead -> mute + blocked-candidate record GOAL_RACE_FEED_AHEAD, the post-goal gates re-decide on the next poll; the POST-GOAL tag now says it watches the NEXT goal — the Fenerbahce 53' class was a genuine second-goal watch, only the wording hid it; v10.88: POST-GOAL HONESTY (the Man Utd 33' class — a stale 5-20m post-goal CRITICAL whose GPS>=75 trigger was completed by the goal's own shot — is now BLOCKED like every other tier, with POST_GOAL_STALE blocked records; the Como 28' class — a genuine attempt-burst next-goal watch that passed the 5-20m freshness gate in silence — now carries the same this-watches-the-NEXT-goal annotation; and the header ordinal becomes (next) once the signaling team has scored, so no post-goal signal can read as a first-goal warning + v10.89: RED-AWARE LOSING RELAXATION (a losing team with the opponent down a NET man and deficit <= 1 — the Slavia 1-0 Lens class, Lens blocked at 64' while chasing 10 men — now passes at STANDARD tier bars with a man-advantage message tag and a red_relax ledger field so the class grades itself; 11v11 losing, deficit >= 2, and missing-events cases keep the strict v10.34 gate — fail-closed) + v10.90: SOT3 SHADOW + G3 LIVE (blocked losing CRITICALs whose only failing criterion is SOT - GPS>=80, IB>=65, SOT==3, the Leipzig 54'/Galatasaray 75' class, 4/4 any-goal within 15m on the Sep 9-10 sample - are tagged sot3_relax on the blocked record for false-negative grading, promote at n>=15 with any-15m>=45%; G3 goes LIVE - 76% next-goal by FT, n=37 plus 3/4 on the fresh check - with a 10-minute anti-stack dedup so no Telegram alert stacks on a real signal or a recent burst alert; the shadow record is always written and graded + v10.94: LEDGER-GRADED SIGNAL FLAGS (the 309-signal Aug 30-Sep 11 ledger split: goal-pressure conversion is 68% (BE 1.46) in the top-9 tracked names - Ireland 80% (incl. 'Premier Division' alt name), 2.Bundesliga 79%, Bundesliga 75%, Süper Lig 71%, Superliga 65%, Coppa Italia 64%, UCL 63%, Czech Liga 62% - vs 42% (BE 2.36) in the cold-9 - PL 23%, First League 33%, La Liga 38%, HNL 40%, Ligue 1 42%, Liga I 47%, Serie A/Eredivisie/Primeira 50% - a 26pp spread the live market does not price because books grade pressure by game state, not league; every signal now carries a LEAGUE CLASS A/B/C line + ledger field, a DOG flag (team 1X2 >= 1.15x opponent, from the SAME signal-time odds fetch, zero extra credits - dogs convert 57% BE 1.74 n=68, dogs in class-A leagues 74% BE 1.34 n=39: the market anchors on the prematch favorite while the pressure is on the dog), and an A-GRADE composite line (pre-50' + not leading 2+ (anti-DAMP) + class-A-or-dog: 79% BE 1.26, 44% within 15m, n=78, vs 69%/36% for the plain pre-50' base - the betting shortlist); shots-inside-box was checked and deliberately NOT flagged on existing signals (flat once minute-controlled: 69/67/67/65% across ib buckets pre-50' - the raw ib split was minute confound, ib 10+ median 64' vs ib 0-3 median 36'; the box leverage stays where it belongs, the BOX-BURST shadow class); the EOD stats block grades every flag nightly (bet_flag, class A/C, DOG, A-GRADE) so class drift is caught live; ledger fields league_class/dog_flag/dog_odds_ratio/a_grade land in every outcome record; display + ledger ONLY, NEVER a gate, zero gate changes, zero extra credits + v10.95: SIMPLE SIGNAL + HIT-% LADDER (user request Sep 12: too much text and complexity - print the percentage likelihood of the signal to win): every signal now LEADS with the ledger hit-grade number - A-GRADE 79% (pre-50' + not leading 2+ + class-A-or-dog, n=78, 44% in 15m), BET 58% (pre-50' without qualifiers, n=105), NO-BET 37% (50'+, n=124) - stars carry the tier, the (next) post-goal ordinal stays in the header; the v10.94 league/dog/a-grade explanation lines, GPS/trigger detail, bet_flag, trend, recency, projection, FT prediction and pitch-state DISPLAY lines are all folded away (every value still lands in the ledger outcome record); the odds block is ONE line (book price + fair break-even + the bet-only-if-LIVE rule), cards & corners is ONE line with lean break-evens (same single render path, live edits byte-stable); the dog flag now says WINNING or CHASING (a dog already ahead is the best quadrant, 6/6 on the ledger; a dog chasing is the classic repricing lag) and a 'coasting +2' tag marks the anti-DAMP state; hit_grade/hit_pct/dog_state land in signals_sent and the outcome record, and the EOD stats block grades the PRINTED ladder numbers nightly (A-GRADE-says-79 / BET-says-58 / NO-BET-says-37 rows plus DOG winning vs chasing) so the headline is always live-graded, never assumed; display + ledger ONLY, NEVER a gate, zero gate changes, zero extra credits + v10.96: DAY-LEVEL CREDIT PACING + PREDICTION CARD (user request Sep 12: 'does throttling compromise signal speed? ...prediction on each signal - win/draw/loss with a percentage, corners, cards, top-SOT scorer, odds in the message'): (1) PACING — the Sep 12 post-mortem: burn 1,195 credits/h at midday vs 437/h the 7,500/day plan can sustain, quota death projected 19:15 Sofia = blind for the whole evening slate; the 10s event fast lane alone was 66% of spend and the 2,500/day lane cap reset on EVERY restart (4 redeploys today); now: affordable rate = (remaining-100) / hours-to-00:00-UTC vs the rolling 45-min burn measured straight from quota headers (restart-proof ground truth); PACE1 (burn > 1.15x affordable): event lane 10->20s + discovery x1.5 - REAL SIGNALS UNCHANGED (the signal path is the stats batch: 30s hot / 15s ultra-fast, untouched; the lane only feeds shadow detection, surge alarms and goal flashes, +10s advisory latency); PACE2 (burn > 1.5x affordable, or < 1500 left with 3h+ to go, or boot-seed heuristics): lane 30s, discovery x2, and the single real-signal concession - hot-stats floor 30->45s, goal-priority 15s windows exempt; +15s worst-case latency beats going dark; budget modes CAREFUL/STRICT/EMERGENCY/STOP still own the tank bottom as before; dwell hysteresis 300s, Telegram transition alerts (max 1/h), heartbeat shows Pace: burn vs affordable; (2) the lane daily counter now persists to fastlane_credit.json (date-keyed, UTC-day flip = fresh 0) so a redeploy can never reset the cap mid-day again; (3) PREDICTION CARD - the FT win/draw/loss line is surfaced from the v10.74 red-card-aware Poisson engine: 'FT: Team 61% - draw 25% - Opp 14% (10v11)' (pred_ft_* were ledger-only since v10.95 dropped the display), cards & corners bits now carry their P(over): 'Cards 2/4.5 -> O 62% @1.61+' (ledger-recorded since v10.80, only displayed now), Top-SOT next-scorer line and the one-line odds block unchanged from v10.95; every new display value was already computed from data the bot already fetched - ZERO extra credits, zero gate changes, zero threshold changes, prediction display only) + v10.97: FORM/H2H/REFEREE CONTEXT + EOD ACCURACY REPORT (user request Sep 12: over-goals and FT should consider the teams' recent 5-game form and the H2H if they played last month; cards should consider the referee, H2H and recent games; a full nightly winrate report by category and by minute period): (1) CONTEXT LAYER - one cached dict per fixture, PRE-WARMED the moment a fixture turns warm (first SOT, before any signal can fire) so the signal send path NEVER waits on the fetches: last-5 results per team (/fixtures?team=X&last=5), season card rates (/teams/statistics), H2H meetings (/fixtures/headtohead, the 31-day recent window is the user's 'last month'), 5 credits per fixture, daily-capped 75, quota-guarded, persisted to form_context.json (date-keyed, redeploy-proof, registered in the redeploy guard); every piece is parsed defensively and degrades ONLY its own modifier to neutral 1.0 - a cold/capped fixture predicts exactly as v10.96 did; (2) OVER-GOALS + FT - the form modifier (own last-5 goals scored blended 50/50 with the opponent's last-5 goals conceded, vs the per-team baseline) and the H2H total-goals modifier (only when they met within 31 days, >=2 meetings) scale the remaining-goals lambdas AFTER the whole shipped chain (rate -> remaining -> hotness -> scoreline -> reds -> caps -> v10.86 deflate), clamped 0.85-1.20 - so the next-goal over %, the FT win/draw/loss line and the team-to-score fair price all see the context; PREDICTION-ONLY, never a gate, never GPS input; the PLAIN no-context values are computed beside the adjusted ones (proj_xg_*_plain, pred_ft_plain_*) for the nightly verdict; (3) CARDS - the cards lambda takes a context modifier = referee card-rate factor x both teams' season card-rate factor, clamped 0.75-1.35; the referee census is SELF-LEARNED for free from FT-stamped booking counts (referee_cards.json, warm-up >=3 games per official, updated inside the v10.80 FT-label pass, redeploy-guard registered); H2H card counts are NOT available on this API plan's cheap endpoints - the H2H leg for cards is honestly limited to the goal-environment signal, stated up front; live market-block edits pass the same modifier so the message stays byte-stable; (4) MESSAGE - one compact transparency line 'Form: WWDLW - DLWWL | H2H 3.0 g/g (n=4, last month) | Ref X 5.2 cards/g' between the flags line and the FT line, only when context exists; (5) EOD ACCURACY REPORT - auto-sent with the nightly summary (and /stats): winrate BY CATEGORY - FT pick (argmax of the printed W/D/L %s) form-adj vs plain with the fixed-vs-broke verdict, the main over bet (full + 15m), cards lean and corners lean (HIT/MISS from the v10.80 FT grading + the avg printed probability), plus a ctx-applied cards row - and winrate BY MINUTE PERIOD with full-coverage bands (<21, 21-45, 46-60, 61-75, 76+; the old ladder stopped at 61') - zero extra credits, pure report-side on ledger fields that already exist, every row self-skips at n=0, backward compatible with old records + v10.98: (a) SELF-EXPLANATORY MARKET LINE (user request Sep 13: 'how do I know cards are 0 so far and why is the line 3.5') — 'Cards 0/3.5 -> U 95% @1.05+' becomes 'Cards 0 so far / line 3.5 -> under 95% (min odds 1.05)': the live count, the bookmaker's O/U line and the minimum take-price are labeled in plain words; SAME maths, SAME single render path (byte-stable live edits), SAME mkt_* ledger fields, text-only; (b) TOP-SCORER MORNING REPORT (user request Sep 13): ONE message per day BEFORE the first kickoff — for every tracked league with games today (busiest first, cap 15) its leading scorer whose club actually plays (season apps + goals from /players/topscorers), his OWN last-5 scoring record (/fixtures?team&last=5 + /fixtures/players per fixture, 0 goals when he missed the game), the clubs' H2H when they met within 31 days, and a Poisson P(he scores today) = season goals/game blended 50/50 with his last-5 rate, scaled by the SAME clamped form/H2H modifiers as the v10.97 predictions; ~8 credits/league, morning-only (full tank), TOPSCORER_DAILY_CAP=130, same quota/budget/pace guards as the form layer, daemon-threaded (the polling loop NEVER waits on it), date-keyed topscorer_sent.json (redeploys never re-send, 3 failed attempts mark the day done), /topscorers manual trigger — display-only, never a signal, never a gate, nothing in the ledger + v10.99: DAILY GOALS BOARD (user request Sep 13: 'like the top scorers i want similar stats but for goals — how likely over 2.5 or under in the todays game based on h2h and recent performance'): ONE message per day before kickoffs alongside the top-scorer report — per tracked game still to start: exp goals (both clubs' L5 attack x opponent L5 defense, H2H meetings re-weight, clamp 1.2-4.2), Poisson over/under 2.5, supporting form g/g + H2H line; reuses the v10.97 context layer (a warmed fixture reads FREE, a fresh one pays 5 credits once and is STORED — the board pre-pays the evening's signal context), GOALSBOARD_MAX_FIXTURES=30 busiest-leagues-first, GOALSBOARD_DAILY_CAP=150, morning-only, same quota/pace/budget guards, daemon-threaded, date-keyed goalsboard_sent.json, /goalsboard manual trigger — display-only, never a signal, never a gate")
     log.info("=" * 60)
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
@@ -15137,6 +16634,7 @@ def main():
     # per-player Shot events for the Top SOT line)
     load_sot_feed_census()
     load_players_feed_census()   # v10.73: players-stats fallback census
+    _form_ctx_load()             # v10.97: form/H2H context cache + referee card census
 
     # v10.50: Load fast-lane shadow records (virtual signals, logging-only)
     _fl_loaded = _load_fastlane_shadow()
@@ -15474,6 +16972,25 @@ def main():
 
             # --- Fetch daily schedule (1 call/day, re-fetches on date change) ---
             has_matches = fetch_daily_active_hours(client)
+
+            # v10.98: TOP-SCORER MORNING REPORT — one message per day
+            # BEFORE the first kickoff (league top scorers, their own
+            # last-5 scoring record, H2H, P(scores today)); threaded,
+            # date-keyed, quota-guarded — the loop never waits on it.
+            try:
+                if has_matches:
+                    _maybe_send_topscorer_report(client)
+            except Exception as _ts_hook_e:
+                log.debug(f"v10.98: top-scorer report hook skipped: {_ts_hook_e}")
+
+            # v10.99: DAILY GOALS BOARD — the over/under 2.5 companion
+            # message to the top-scorer report (L5 form + H2H per game);
+            # threaded, date-keyed, quota-guarded — the loop never waits.
+            try:
+                if has_matches:
+                    _maybe_send_goals_board(client)
+            except Exception as _gb_hook_e:
+                log.debug(f"v10.99: goals board hook skipped: {_gb_hook_e}")
             
             # v10.18: Daily summary removed from auto-send. Use /today in Telegram.
             # Auto-send was burning credits on team form; now command-only, <10 games.
