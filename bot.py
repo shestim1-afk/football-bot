@@ -649,7 +649,7 @@ _goalburst_count_date: str | None = None
 # SOT-rising + IB>=50, and the 2 clean near-misses hit only LATE (0/2
 # within 15') — softening would re-open the flat-pressure junk zone
 # the v10.48 acceleration gate exists to kill.
-BOT_VERSION = "v10.101"
+BOT_VERSION = "v10.102"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -12612,7 +12612,7 @@ def check_telegram_commands(client: httpx.Client) -> None:
     /stats3d  = past 3 days
     /stats7d  = past 7 days
     /recap    = yesterday's stats (was auto-sent, now command-only)
-    /eod      = full EOD report with poll data (yesterday)
+    /eod      = full EOD report with poll data (yesterday) — sent as ONE .txt file
     /eod3     = full EOD report (past 3 days)
     /eod7     = full EOD report (past 7 days)
     /eodall   = full EOD report (all data YTD)
@@ -12665,7 +12665,7 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     "/stats7d \u2014 stats for past 7 days\n"
                     "/recap \u2014 yesterday's signal results\n\n"
                     "\U0001f4c4 REPORTS\n"
-                    "/eod \u2014 full EOD report (yesterday)\n"
+                    "/eod \u2014 full EOD report (yesterday, sent as .txt file)\n"
                     "/eod3 \u2014 EOD report (past 3 days)\n"
                     "/eod7 \u2014 EOD report (past 7 days)\n"
                     "/eodall \u2014 EOD report (all data YTD)\n\n"
@@ -12817,6 +12817,13 @@ def check_telegram_commands(client: httpx.Client) -> None:
             elif text in ("/eod", "/eod1", "/eod3", "/eod7", "/eodall"):
                 # v10.35: On-demand full EOD report (with poll data)
                 # /eod = yesterday only, /eod3 = 3 days, /eod7 = 7 days, /eodall = all data
+                # v10.102: FILE MODE — the report is written to ONE .txt file
+                # and sent as a single Telegram document instead of the old
+                # ~15-40 chunked messages. eod_report.py's --out flag does
+                # the writing; sendDocument (same proven pattern as /outcomes)
+                # does the delivery. Zero API-Sports credits; Telegram is
+                # free. Rollback: restore --send in cmd and drop the file
+                # block below.
                 days = None
                 specific_date = None
                 if text == "/eod" or text == "/eod1":
@@ -12835,17 +12842,44 @@ def check_telegram_commands(client: httpx.Client) -> None:
                         pass
                 if specific_date:
                     send_telegram(client, f"Generating EOD report for {specific_date}...")
-                    cmd = ["python3", "eod_report.py", "--send", "--date", specific_date, "--quiet"]
+                    _eod_label = specific_date
+                    cmd = ["python3", "eod_report.py", "--date", specific_date, "--quiet"]
                 elif days:
                     send_telegram(client, f"Generating EOD report (last {days} days)...")
-                    cmd = ["python3", "eod_report.py", "--send", "--days", str(days), "--quiet"]
+                    _eod_label = f"last{days}d"
+                    cmd = ["python3", "eod_report.py", "--days", str(days), "--quiet"]
                 else:
                     send_telegram(client, "Generating EOD report (all data YTD)...")
-                    cmd = ["python3", "eod_report.py", "--send", "--all", "--quiet"]
+                    _eod_label = "ytd"
+                    cmd = ["python3", "eod_report.py", "--all", "--quiet"]
+                # v10.102: single .txt into the persistent volume, then one sendDocument
+                _eod_file = os.path.join(_VOLUME_DIR, f"eod_report_{_eod_label}.txt")
+                cmd += ["--out", _eod_file]
                 try:
-                    result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)), timeout=60)
+                    result = subprocess.run(
+                        cmd,
+                        cwd=os.path.dirname(os.path.abspath(__file__)),
+                        timeout=120,
+                    )
                     if result.returncode != 0:
                         send_telegram(client, f"EOD report failed (exit code {result.returncode}).")
+                    elif os.path.exists(_eod_file) and os.path.getsize(_eod_file) > 0:
+                        _eod_size = os.path.getsize(_eod_file)
+                        try:
+                            with open(_eod_file, "rb") as f:
+                                client.post(
+                                    f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                                    data={"chat_id": TELEGRAM_CHAT_ID},
+                                    files={"document": (os.path.basename(_eod_file), f, "text/plain")},
+                                    timeout=30.0,
+                                )
+                            send_telegram(client, f"EOD report sent as file ({_eod_size / 1024:.1f} KB)")
+                            log.info(f"/eod v10.102: sent {_eod_file} as document ({_eod_size / 1024:.1f} KB)")
+                        except Exception as e:
+                            send_telegram(client, f"Failed to send EOD file: {e}")
+                            log.error(f"/eod v10.102 sendDocument failed: {e}")
+                    else:
+                        send_telegram(client, "EOD report produced no file (no data for that period?).")
                 except Exception as e:
                     send_telegram(client, f"EOD report error: {e}")
 
@@ -17051,10 +17085,31 @@ def main():
                         today_bg = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
                         if eod_report_sent_date != today_bg:
                             try:
-                                subprocess.run(
-                                    ["python3", "eod_report.py", "--send", "--days", "1", "--quiet"],
-                                    cwd=os.path.dirname(os.path.abspath(__file__)), timeout=60,
+                                # v10.102: auto EOD also goes out as ONE .txt
+                                # document (same file-mode pattern as /eod).
+                                _auto_eod_file = os.path.join(
+                                    _VOLUME_DIR,
+                                    f"eod_report_auto_{today_bg}.txt",
                                 )
+                                subprocess.run(
+                                    ["python3", "eod_report.py", "--days", "1", "--quiet",
+                                     "--out", _auto_eod_file],
+                                    cwd=os.path.dirname(os.path.abspath(__file__)), timeout=120,
+                                )
+                                if os.path.exists(_auto_eod_file) and os.path.getsize(_auto_eod_file) > 0:
+                                    with open(_auto_eod_file, "rb") as f:
+                                        client.post(
+                                            f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                                            data={"chat_id": TELEGRAM_CHAT_ID},
+                                            files={"document": (os.path.basename(_auto_eod_file), f, "text/plain")},
+                                            timeout=30.0,
+                                        )
+                                    log.info(
+                                        f"v10.102: auto EOD report sent as file "
+                                        f"({_auto_eod_file}, {os.path.getsize(_auto_eod_file) / 1024:.1f} KB)"
+                                    )
+                                else:
+                                    log.warning("v10.102: auto EOD file missing/empty — report skipped")
                                 eod_report_sent_date = today_bg
                                 _save_eod_report_sent_date(today_bg)
                                 log.info("v10.35: EOD report sent via subprocess")
