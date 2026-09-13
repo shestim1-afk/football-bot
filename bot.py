@@ -12679,7 +12679,7 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     send_telegram(client, "Generating EOD report (all data YTD)...")
                     cmd = ["python3", "eod_report.py", "--send", "--all", "--quiet"]
                 try:
-                    result = subprocess.run(cmd, cwd="/app", timeout=60)
+                    result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)), timeout=60)
                     if result.returncode != 0:
                         send_telegram(client, f"EOD report failed (exit code {result.returncode}).")
                 except Exception as e:
@@ -15156,6 +15156,14 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 msg += _ft96_line
         except Exception as _ft96e:
             log.debug(f"  v10.96 FT line skipped: {_ft96e}")
+        # v10.100-patch: GREEN FLAG — signals inside the 20-56' CORE
+        # window (the profit zone in the ledger backtest: 77% hit over
+        # Sep 8-12, 59% long-run at even money) get a green flag line
+        # at the very top of the alert so they are recognizable at a
+        # glance. Display only — never a gate, never changes thresholds.
+        _green_hdr = (
+            "\U0001F7E2 BET WINDOW 20-56'\n" if 20 <= int(minute or 0) <= 56 else ""
+        )
         # v10.95: HIT-% HEADLINE — the ledger ladder number, PREPENDED so
         # it is the first thing read (user request: the percentage
         # likelihood of the signal to win). sig_label keeps the post-goal
@@ -15165,12 +15173,12 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 minute, _deficit_now, _lg_class, _dog_flag_msg,
             )
             msg = (
-                f"{tier_emoji(tier)} {_grade_word} — {_hit_pct}% goal chance "
+                f"{_green_hdr}{tier_emoji(tier)} {_grade_word} — {_hit_pct}% goal chance "
                 f"{_grade_stars} ({sig_label})\n\n" + msg
             )
         except Exception as _he95:
             log.debug(f"  v10.95 headline skipped: {_he95}")
-            msg = f"{tier_emoji(tier)} {tier} ({sig_label})\n\n" + msg
+            msg = f"{_green_hdr}{tier_emoji(tier)} {tier} ({sig_label})\n\n" + msg
 
         # v10.80: CARDS & CORNERS market block — the OVER/UNDER prediction
         # line with odds, built from the SAME odds fetch (zero extra
@@ -16865,7 +16873,7 @@ def main():
                             try:
                                 subprocess.run(
                                     ["python3", "eod_report.py", "--send", "--days", "1", "--quiet"],
-                                    cwd="/app", timeout=60,
+                                    cwd=os.path.dirname(os.path.abspath(__file__)), timeout=60,
                                 )
                                 eod_report_sent_date = today_bg
                                 _save_eod_report_sent_date(today_bg)
