@@ -523,6 +523,18 @@ fastlane_shadow: list[dict] = []        # v10.50: virtual-signal records
 _fl_shadow_dedupe: dict[tuple, float] = {}  # v10.50: (fid, tid) -> last shadow wall-time
 _fl_shadow_count_today: int = 0         # v10.50: daily shadow cap counter (400)
 _fl_shadow_count_date: str | None = None
+# v10.101: FAST-LANE LIVE TRIAL — promote the v10.50 shadows to compact
+# LIVE Telegram alerts, tagged so the EOD ledger grades them separately.
+# Evidence (Sep 13 log backtest): 38 shadows, 34 not duplicating a real
+# signal, counterfactual outcomes 71% full-window / 35% within 15' —
+# materially better than the sent-signal baseline that day (49% / 24%).
+# The events lane sees shot storms 30-60s before the stats lane, and the
+# goal_proximity trigger is the 'goals come in bursts' pattern the stats
+# path suppresses on purpose (post-goal cooldown). Rollback is one flag.
+FASTLANE_LIVE_MODE = True
+FASTLANE_LIVE_DAILY_CAP = 30             # hard spam guard for the trial
+_fl_live_sent_today: int = 0
+_fl_live_sent_date: str | None = None
 BOXBURST_SHADOW_FILE = os.path.join(_VOLUME_DIR, "boxburst_shadow.jsonl")  # v10.75
 boxburst_shadow: list[dict] = []        # v10.75: box-burst virtual-signal records
 _boxburst_fired: dict[tuple, float] = {}   # v10.75: (fid, tid) -> wall-time (dedupe)
@@ -603,7 +615,41 @@ _goalburst_count_date: str | None = None
 # quota/pace/budget guards, daemon-threaded, date-keyed
 # goalsboard_sent.json (redeploys never re-send), /goalsboard
 # manual trigger. Display-only — never a signal, never a gate.
-BOT_VERSION = "v10.99"
+# v10.100 — PHANTOM-GOAL REVERT (Silkeborg-Viborg Sep 13 post-mortem:
+# user asked why no Viborg signal fired in the 2nd half although Viborg
+# raised box shots, SOT and scored). The scoreline feed flapped Viborg
+# goals 0->1 at ~29' AND ~34' while the real score was 1-0 all along;
+# each flap registered +1 in the v10.56 goal-shot ledger and NOTHING
+# cleaned it on the revert (goals are monotonic — a decrease is always
+# a feed flap). The poisoned ledger then: consumed Viborg's genuine 70'
+# SOT 2->3 rise as a "goal shot landing" (genuine rise -> 0), inflated
+# the goal-inclusive SOT-at-goal baseline to 4 instead of 2 (SOT 3 < 4
+# -> POST-GOAL STALE blocked every later poll), and fed the v10.69 net
+# "3 goal shots in SOT=3 -> effective 0". _rollback_phantom_goals now
+# reverts EVERY per-goal record on a scoreline drop (pending, landed,
+# goal-shot minutes, fixture goal log, at-goal baseline, last goal
+# minute) so the real 57' goal starts from a clean ledger — with it,
+# the 70' GPS=80 poll passes POST-GOAL (SOT 3>2) and the LATE GPS
+# FLOOR (80>=80) and the CRITICAL signal fires.
+# v10.101 — FAST-LANE LIVE TRIAL (Sep 13 log backtest, same post-mortem
+# thread: user asked whether the bot predicts incoming goals well and
+# what 'promote the fast lane' means). Full-day replay of today_log.txt:
+# 43 sent signals -> 49% full-window hit / 24% within 15'; the 38
+# v10.50 fast-lane shadows (events feed, 10s lane, top-3 fixtures) ->
+# counterfactual 71% full / 35% within 15' on the 34 that did not
+# duplicate a real signal. The events lane sees shot storms 30-60s
+# before the stats lane and its goal_proximity trigger is exactly the
+# 'goals come in bursts' pattern the stats path suppresses on purpose
+# (post-goal cooldown). Promotion is deliberately CONSERVATIVE: shadows
+# still land in fastlane_shadow.jsonl unchanged (EOD grading separate),
+# the Telegram alert is compact + tagged 'FAST-LANE (TRIAL)', a hard
+# FASTLANE_LIVE_DAILY_CAP=30 guards spam, and rollback is the single
+# flag FASTLANE_LIVE_MODE=False (back to pure shadow mode). The EW GPS
+# floor stays 60: the 55-59 zone held 1,419 polls that day, only 5 with
+# SOT-rising + IB>=50, and the 2 clean near-misses hit only LATE (0/2
+# within 15') — softening would re-open the flat-pressure junk zone
+# the v10.48 acceleration gate exists to kill.
+BOT_VERSION = "v10.101"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -5125,7 +5171,8 @@ def check_blocked_outcomes(fixture: dict, client: httpx.Client = None) -> None:
         rewrite_blocked_file()
 
 
-def _evaluate_fl_shadow(fid: int, tid: int, m: int, tname: str, hist: list[tuple[int, float]]) -> None:
+def _evaluate_fl_shadow(fid: int, tid: int, m: int, tname: str, hist: list[tuple[int, float]],
+                        client: httpx.Client | None = None) -> None:
     """v10.50: Evaluate ONE new events-feed SOT event for a SHADOW (virtual) signal.
 
     Candidate rules (FASTLANE_PROPOSAL.md 3.1):
@@ -5135,9 +5182,14 @@ def _evaluate_fl_shadow(fid: int, tid: int, m: int, tname: str, hist: list[tuple
       - no REAL signal for this team in the last 180s,
       - no shadow for this team in the last 180s,
       - daily cap 400 shadow records.
-    NEVER sends Telegram messages, never gates anything. Recording only.
+    v10.50: shadow record only (ledger grading, never sent).
+    v10.101: when FASTLANE_LIVE_MODE, additionally sends ONE compact LIVE
+    Telegram alert (tagged 'FAST-LANE TRIAL') under a separate daily cap;
+    the shadow ledger record is written either way, so EOD grading and the
+    on-disk JSONL are unchanged. Never gates the standard signal engine.
     """
     global _fl_shadow_count_today, _fl_shadow_count_date
+    global _fl_live_sent_today, _fl_live_sent_date
     try:
         # Minute window
         if not (21 <= m <= 80):
@@ -5241,10 +5293,43 @@ def _evaluate_fl_shadow(fid: int, tid: int, m: int, tname: str, hist: list[tuple
         with open(FASTLANE_SHADOW_FILE, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
         _lag_txt = f"+{entry['lag_sot']} ahead" if entry["lag_sot"] is not None else "n/a"
+        # v10.101: live trial send — compact, clearly tagged, separately capped.
+        # Failure here must never break the shadow ledger: wrapped standalone.
+        _live_sent = False
+        if FASTLANE_LIVE_MODE and client is not None:
+            try:
+                _lt = time.strftime("%Y-%m-%d")
+                if _fl_live_sent_date != _lt:
+                    _fl_live_sent_date = _lt
+                    _fl_live_sent_today = 0
+                if _fl_live_sent_today < FASTLANE_LIVE_DAILY_CAP:
+                    _fl_live_sent_today += 1
+                    _live_sent = True
+                    _trig_txt = (
+                        "shot burst — 2nd SOT inside 3'"
+                        if _trigger == "sot_burst"
+                        else "SOT within 2' after a goal — burst risk"
+                    )
+                    _score_txt = entry["scoreline"]
+                    _lines = [
+                        f"\u26a1 v10.101 FAST-LANE (TRIAL) — {tname} {m}'",
+                        f"{_league} | F{fid}",
+                        _trig_txt,
+                        f"events SOT={_ev_sot_total} vs stats SOT="
+                        f"{_stats_sot if _stats_sot is not None else '?'} ({_lag_txt})",
+                        f"GPS={entry['gps'] if entry['gps'] is not None else '?'} "
+                        f"| {_score_txt} {entry['goals_at_shadow']}-{entry['opponent_goals_at_shadow']}",
+                        "[trial alert — EOD grades FAST-LANE separately; "
+                        "not a standard signal]",
+                    ]
+                    send_telegram(client, "\n".join(_lines))
+            except Exception as _fl101e:
+                _live_sent = False
+                log.warning(f"  v10.101 fast-lane live send failed: {_fl101e}")
         log.info(
             f"  v10.50 SHADOW: {tname} F{fid} {m}' [{_trigger}] "
             f"evSOT={_ev_sot_total} statsSOT={_stats_sot if _stats_sot is not None else '?'} ({_lag_txt}) "
-            f"— virtual, NOT sent"
+            f"— {'LIVE (v10.101 trial)' if _live_sent else 'virtual, NOT sent'}"
         )
     except Exception as e:
         log.debug(f"  v10.50 shadow-eval error: {e}")
@@ -8096,6 +8181,7 @@ def poll_event_fast_lane(client: httpx.Client) -> None:
                         fid, tid_ev, m,
                         _team_names.get(tid_ev, f"team{tid_ev}"),
                         _hist,
+                        client,
                     )
                     _hist.append((m, time.time()))
 
@@ -8906,6 +8992,84 @@ def _consume_pending_goal_sot(fid: int, tid: int, sot: int, prev_sot) -> int:
     _pending_goal_sot[(fid, tid)] = _pend - _consumed
     _goal_sot_landed[(fid, tid)] = _goal_sot_landed.get((fid, tid), 0) + _consumed
     return _consumed
+
+
+def _rollback_phantom_goals(fid: int, tid: int, tname: str, minute: int,
+                            goals_now: int, goals_prev: int,
+                            sot: int) -> tuple[int, int]:
+    """v10.100: scoreline goal revert — roll back phantom goal bookkeeping.
+
+    A team's goal count is MONOTONIC: own goals credit the opponent and
+    cumulative match counters never decrease. When the scoreline field
+    drops below the previous poll's value (Silkeborg-Viborg Sep 13: the
+    feed flapped Viborg 0->1 at ~29' and ~34' while the real score was
+    1-0 throughout), the earlier rise(s) were provider-side flaps — but
+    the v10.56 ledger registered them like real goals, and nothing ever
+    cleaned them on the revert. The poison chain that followed:
+      * phantom pending goal shots consumed the genuine 70' SOT 2->3
+        rise as a "goal shot landing" (genuine_poll_rise -> 0)
+      * the goal-inclusive at-goal baseline read 4 instead of 2, so
+        POST-GOAL STALE blocked every later Viborg poll (SOT 3 < 4)
+      * goal-shot minutes fed the v10.69 net "3 goal shots in SOT=3
+        -> effective 0" — the safety net went permanently silent
+    This rolls back EVERY per-goal record for the phantom count so the
+    next REAL goal (57') starts from a clean ledger.
+
+    Returns the corrected (sot_at_last_goal, last_goal_minute) for the
+    caller to store: the baseline uses the same goal-INCLUSIVE formula
+    as v10.56 registration but computed on the cleaned ledger, and the
+    goal minute belongs to the most recent REMAINING registered goal
+    (0 when none remain — post-goal machinery correctly switches off).
+    The ledger is clamped to the feed's own claim (pending + landed <=
+    goals_now), so a flapping feed can never leave residue behind.
+    """
+    _phantom = (goals_prev or 0) - (goals_now or 0)
+    _keep = max(0, goals_now or 0)          # goal shots the feed still claims
+    _pend_was = _pending_goal_sot.get((fid, tid), 0)
+    _landed_was = _goal_sot_landed.get((fid, tid), 0)
+    # Keep at most `goals_now` goal-shot records: landed first (already
+    # settled in the SOT counter), the remainder stays pending. On every
+    # reachable state this is the exact inverse of the registration
+    # (pending rolls back before landed, mirroring the consume order);
+    # on a desynced feed it can only shrink the ledger toward the feed's
+    # own claim — never grow it, never go negative.
+    _landed_now = min(_landed_was, _keep)
+    _pend_now = min(_pend_was, _keep - _landed_now)
+    _pending_goal_sot[(fid, tid)] = _pend_now
+    _goal_sot_landed[(fid, tid)] = _landed_now
+    # Goal-shot minutes (attempt-burst netting, v10.84): pop this team's
+    # phantom registrations (append-ordered per goal); then trim any
+    # excess beyond what the feed still claims (desync safety).
+    _gs_list = _goal_shot_minutes.get((fid, tid))
+    if _gs_list:
+        for _ in range(min(_phantom, len(_gs_list))):
+            _gs_list.pop()
+        while _gs_list and len(_gs_list) > _keep:
+            _gs_list.pop()
+    # Fixture goal log (response-window input, v10.84): drop this team's
+    # most recent entries so phantom goals never widen the window.
+    _flog = _fixture_goal_log.get(fid)
+    if _flog:
+        for _ in range(_phantom):
+            for _i in range(len(_flog) - 1, -1, -1):
+                if _flog[_i][1] == tid:
+                    _flog.pop(_i)
+                    break
+    # The goal never happened: recompute the goal-inclusive baseline
+    # from the CLEANED ledger (same formula as registration) and let the
+    # most recent REMAINING registered goal own last_goal_minute.
+    sot_at_last_goal = sot + _pend_now
+    _gs_kept = _goal_shot_minutes.get((fid, tid)) or []
+    last_goal_minute = _gs_kept[-1] if _gs_kept else 0
+    log.info(
+        f"  v10.100 PHANTOM-GOAL REVERT: {tname} {goals_prev}->{goals_now} at "
+        f"~{minute}' — goals can never decrease; rolling back {_phantom} phantom "
+        f"goal(s): pending {_pend_was}->{_pend_now}, landed "
+        f"{_landed_was}->{_landed_now}, at-goal baseline -> {sot_at_last_goal}, "
+        f"last_goal_minute -> {last_goal_minute} "
+        f"(feed flap; real goals re-register when the scoreline rises again)"
+    )
+    return sot_at_last_goal, last_goal_minute
 
 
 def _genuine_sot_jump(team_sig: dict | None, sot: int, fid: int, tid: int) -> int:
@@ -13895,6 +14059,22 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 f"{_pending_goal_sot.get((fid, tid), 0)} pending goal shot(s) "
                 f"= {sot_at_last_goal} (goal shots never count as fresh pressure)"
             )
+
+        # v10.100: PHANTOM-GOAL REVERT (Silkeborg-Viborg Sep 13 post-mortem).
+        # Goals are monotonic — team_goals can NEVER legitimately drop
+        # below the previous poll. A decrease means the earlier rise(s)
+        # were scoreline feed flaps (Viborg flapped 0->1 at ~29' and ~34'
+        # while the real score was 1-0), and every piece of goal
+        # bookkeeping they registered is still in the ledger poisoning
+        # the gates: the inflated at-goal baseline just read from
+        # _prev_state above, phantom pending goal shots (they consume
+        # genuine SOT rises as "goal shot landings"), goal-shot minutes
+        # (v10.69 net "effective 0"), and a phantom post-goal window.
+        # Roll it ALL back; a real goal re-registers cleanly when the
+        # feed rises again.
+        if _prev_goals is not None and team_goals < _prev_goals:
+            sot_at_last_goal, last_goal_minute = _rollback_phantom_goals(
+                fid, tid, tname, minute, team_goals, _prev_goals, sot)
 
         # Store state AFTER classification (for next comparison)
         team_state[(fid, tid)] = {
