@@ -479,7 +479,9 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
     def _pnl_grade(e):
         if "odds_pnl_grade" in e:
             return bool(e.get("odds_pnl_grade"))
-        return e.get("odds_source") == "live" and not e.get("odds_suspect")
+        # v10.111: feed-2 live prices + manual /price receipts are P&L-grade
+        return (e.get("odds_source") in ("live", "oddsapi_live", "manual")
+                and not e.get("odds_suspect"))
 
     with_odds_all = [e for e in resolved if e.get("odds_over_odds") is not None]
     with_odds = [e for e in with_odds_all if _pnl_grade(e)]
@@ -490,7 +492,8 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
             f"=== MARKET / EV ANALYSIS — SKIPPED ({stale_n} stale pre-match "
             f"price(s) excluded, only {len(with_odds)} P&L-grade live "
             f"price(s), 3 needed) ===")
-        lines.append("  v10.77: paper P&L needs live odds (odds_source='live');")
+        lines.append("  v10.111: paper P&L needs live odds (odds_source")
+        lines.append("  live/oddsapi_live) or a manual /price receipt;")
         lines.append("  pre-match fallback prices are not P&L-grade.")
     if len(with_odds) >= 3:
         lines.append("")
