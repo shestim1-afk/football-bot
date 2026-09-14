@@ -174,6 +174,17 @@ SHADOW_MARKETS_ENABLED = os.environ.get("SHADOW_MARKETS_ENABLED", "true").lower(
 SHADOW_MIN_MINUTE = int(os.environ.get("SHADOW_MIN_MINUTE", "35"))
 SHADOW_MIN_MARGIN = float(os.environ.get("SHADOW_MIN_MARGIN", "1.0"))
 
+# v10.108: TERRITORY + RED-EDGE — gps_adj bonuses (PREDICTION-ONLY, never
+# gates): share bonus = (pass_share - 0.50) * 40 clamped to
+# [-TERRITORY_MAX_PENALTY, +TERRITORY_MAX_BONUS]; opponent red card adds
+# +RED_EDGE_BONUS. Derived from the Sep 12-13 polls backtest (the 3x
+# share gradient and the 2.2x red edge; see _territory_adj docstring).
+# TERRITORY_ENABLED=0 zeroes both bonuses (fields still logged for EOD).
+TERRITORY_ENABLED = os.environ.get("TERRITORY_ENABLED", "true").lower() == "true"
+TERRITORY_MAX_BONUS = float(os.environ.get("TERRITORY_MAX_BONUS", "10"))
+TERRITORY_MAX_PENALTY = float(os.environ.get("TERRITORY_MAX_PENALTY", "8"))
+RED_EDGE_BONUS = float(os.environ.get("RED_EDGE_BONUS", "12"))
+
 # v10.15: Pre-window monitoring — start polling from minute 1.
 # v10.20: Raised from 12→20 so min_allowed = 21-20 = 1'.
 # Fixes chicken-and-egg: bot needs to poll stats to discover high early SOT,
@@ -722,7 +733,23 @@ _goalburst_count_date: str | None = None
 # report now records the exact block reason (quota / PACE2 / budget
 # ladder / no tracked games / no reportable scorer) and prints it in
 # the message. Diagnostics only — report maths untouched.
-BOT_VERSION = "v10.107"
+# v10.108: TERRITORY + RED-EDGE — the possession proxy (pass share from
+# BOTH teams' total_passes; API-Football v3 never delivers ball
+# possession on this plan) + the opponent-red-card edge, both already
+# delivered+logged but never consumed by the goal model. Backtest
+# (Sep 12-13 polls): pass-share 3x goal-rate gradient INCREMENTAL over
+# GPS (33.6% vs 11.0% next-15' inside GPS 45-60); opp red 41.6% vs
+# 18.9%. gps_adj = GPS + clamped share bonus + red bonus. PREDICTION
+# ONLY — gates stay on raw GPS (v10.61 lesson); zero extra credits.
+# v10.109: SHADOW LIVE-PRICE GATE — the v10.105 paper bets froze whatever
+# price the market block carried, including odds_source=prematch_fallback
+# (the Sep-4 stale class that once inflated paper P&L by ~1,900 EUR; the
+# Sep 12-13 backtest ledger was 100% fallback-priced, so its +31%/+44.5%
+# ROI is an upper bound, not a live-price result). A shadow bet now
+# freezes ONLY on a live-priced market block; the frozen dict stamps
+# src=live and the ledger logs corners/cards_shadow_odds_src so the
+# validation week's go/no-go counts LIVE receipts only.
+BOT_VERSION = "v10.109"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -3162,6 +3189,11 @@ def record_pressure_poll(
     # v10.73: events-based red-card counts (logging only, null-safe)
     red_cards: int | None = None,
     opp_red_cards: int | None = None,
+    # v10.108: territory + red-edge adjusted GPS (prediction-only)
+    gps_adj: float | None = None,
+    terr_share: float | None = None,
+    terr_bonus: float | None = None,
+    red_edge: float | None = None,
 ) -> None:
     """v10.1: Write poll-level data to JSONL for backtesting.
 
@@ -3220,6 +3252,11 @@ def record_pressure_poll(
             "data_quality": round(data_quality, 2),  # v10.26: REAL quality score
             "gps": round(gps, 1),
             "gps_restored": components.get("gps_restored"),  # v10.61: BC-redistributed shadow value
+            # v10.108: territory + red-edge adjusted GPS (prediction-only)
+            "gps_adj": round(gps_adj, 1) if gps_adj is not None else None,
+            "terr_share": round(terr_share, 3) if terr_share is not None else None,
+            "terr_bonus": round(terr_bonus, 1) if terr_bonus is not None else None,
+            "red_edge": round(red_edge, 1) if red_edge is not None else None,
             "ml": round(ml_score, 1) if ml_score is not None else None,  # v10.59: shadow opinion
             "gps_sot": components.get("sot", 0),
             "gps_ib": components.get("inside_box", 0),
@@ -9714,6 +9751,34 @@ def _mkt_project_total(current: int | None, game_minute: int,
     return cur + pace * remaining * boost
 
 
+def _territory_adj(gps: float, total_passes: int | None,
+                   opp_total_passes: int | None,
+                   opp_red_cards: int | None) -> tuple[float, float | None, float, float]:
+    """v10.108: TERRITORY + RED-EDGE adjusted GPS — prediction-only.
+
+    Backtest (Sep 12-13 polls archive, 33,045 team-polls, 163 persistent
+    goals, scripts/goal_stat_backtest.py): pass-share >= 60% -> 32.6%
+    goal-next-15' vs 10.7% at <40%; WITHIN the GPS 45-60 band 33.6%
+    (share>=0.55) vs 11.0% (share<0.45) — incremental over GPS in every
+    band. Opponent red card: 41.6% vs 18.9% baseline (2.2x). Bonus map:
+    (share-0.50)*40 clamped; opp red +RED_EDGE_BONUS. NEVER gates —
+    display + polls + signal ledger only, EOD-graded like the ML shadow.
+    Returns (gps_adj, terr_share, terr_bonus, red_edge).
+    """
+    terr_share = None
+    terr_bonus = 0.0
+    if total_passes and opp_total_passes and (total_passes + opp_total_passes) > 0:
+        terr_share = total_passes / float(total_passes + opp_total_passes)
+        terr_bonus = (terr_share - 0.50) * 40.0
+        terr_bonus = max(-TERRITORY_MAX_PENALTY, min(TERRITORY_MAX_BONUS, terr_bonus))
+    red_edge = RED_EDGE_BONUS if ((opp_red_cards or 0) >= 1) else 0.0
+    if not TERRITORY_ENABLED:
+        terr_bonus = 0.0
+        red_edge = 0.0
+    gps_adj = max(0.0, min(100.0, gps + terr_bonus + red_edge))
+    return gps_adj, terr_share, terr_bonus, red_edge
+
+
 # ================= v10.97: FORM / H2H / REFEREE CONTEXT LAYER =================
 # One cached context dict per fixture (in-memory + form_context.json,
 # date-keyed, redeploy-proof), fetched the moment a fixture turns warm
@@ -10929,7 +10994,8 @@ def _mkt_lean(p_over: float | None) -> str:
     return "NEUTRAL"
 
 
-def _shadow_market_decisions(minute: int | None, mkt_extras: dict | None) -> dict:
+def _shadow_market_decisions(minute: int | None, mkt_extras: dict | None,
+                             odds_source: str | None = None) -> dict:
     """v10.105: freeze the PAPER corner/card bet decisions at signal time.
 
     Backtest cells (Sep 12+13 ledger): corners lean hit 69.5% overall but
@@ -10939,12 +11005,24 @@ def _shadow_market_decisions(minute: int | None, mkt_extras: dict | None) -> dic
     SHADOW_MARKETS_ENABLED=0 kills it. Pure function over the mkt_*
     extras the odds fetch already produced; never blocks or alters the
     goal signal itself.
+
+    v10.109: LIVE-PRICE GATE — odds_source must be 'live' for a freeze.
+    The Sep 12-13 ledger was 100% prematch_fallback-priced (the stale
+    class that once inflated paper P&L by ~1,900 EUR) and the book's
+    in-play line moves with the live count, so a fallback-priced paper
+    receipt would overstate the validation week. The frozen dict stamps
+    src='live'; the ledger logs corners/cards_shadow_odds_src.
     """
     out: dict = {"corners": None, "cards": None}
     try:
         if not SHADOW_MARKETS_ENABLED or minute is None:
             return out
         if minute < SHADOW_MIN_MINUTE:
+            return out
+        # v10.109: LIVE-PRICE GATE — paper bets freeze ONLY on a live
+        # /odds response; prematch_fallback prices are the Sep-4 stale
+        # class (paper-profit inflation), never P&L grade.
+        if odds_source != "live":
             return out
         for kind in ("corners", "cards"):
             lean = (mkt_extras or {}).get(f"mkt_{kind}_lean")
@@ -10960,7 +11038,8 @@ def _shadow_market_decisions(minute: int | None, mkt_extras: dict | None) -> dic
             if not odds:
                 continue
             out[kind] = {"side": lean, "line": float(line),
-                         "proj": float(proj), "odds": float(odds)}
+                         "proj": float(proj), "odds": float(odds),
+                         "src": "live"}  # v10.109: price provenance
         return out
     except Exception:
         return {"corners": None, "cards": None}
@@ -14049,6 +14128,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # v10.60: opponent KPI expansion (null-safe, logging only)
         _opp_gk_saves = None
         _opp_fouls = None
+        _opp_total_passes = None  # v10.108: territory pass-share
         _opp_offsides = None
         _opp_yellow_cards = None
         for oname, ostats in teams_data.items():
@@ -14063,6 +14143,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 _opp_big_chances = safe_int(get_stat(ostats, "big_chances"))
                 _opp_gk_saves, _ = get_stat_present(ostats, "gk_saves")
                 _opp_fouls, _ = get_stat_present(ostats, "fouls")
+                _opp_total_passes, _ = get_stat_present(ostats, "total_passes")  # v10.108
                 _opp_offsides, _ = get_stat_present(ostats, "offsides")
                 _opp_yellow_cards, _ = get_stat_present(ostats, "yellow_cards")
                 # Infer opponent total_shots if missing (same logic as main team)
@@ -14105,6 +14186,15 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # Count accelerating indicators (for polling + logging)
         accel_count = get_accel_count_from_state(
             sot, total_shots, shots_off_target, xg_value, state, minute
+        )
+
+        # v10.108: TERRITORY + RED-EDGE adjusted GPS — computed from the
+        # stats this poll already parsed (zero extra credits). Pass share
+        # needs BOTH teams' total_passes; red edge uses the events-based
+        # opponent red count. PREDICTION ONLY — gates/tiers/polling stay
+        # on the raw GPS scale (the v10.61 lesson).
+        _gps_adj, _terr_share, _terr_bonus, _red_edge = _territory_adj(
+            gps, total_passes, _opp_total_passes, red_cards_opp_n
         )
 
         # === v10: Log GPS on every poll ===
@@ -14232,6 +14322,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             # v10.73: events-based red-card counts (logging only, null-safe)
             red_cards=red_cards_team_n,
             opp_red_cards=red_cards_opp_n,
+            # v10.108: territory + red-edge adjusted GPS (prediction-only)
+            gps_adj=_gps_adj,
+            terr_share=_terr_share,
+            terr_bonus=_terr_bonus,
+            red_edge=_red_edge,
         )
 
         # === v10.1: Update GPS history (includes timestamp + xg for window calc) ===
@@ -15538,11 +15633,30 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         _bc_bit = f" | Big Chances {big_chances}" if (big_chances or 0) > 0 else ""
         _oxg_v = safe_float(opponent_xg) if isinstance(opponent_xg, str) else opponent_xg
         _oxg_bit = f" | xG {_oxg_v:.2f}" if _oxg_v is not None else ""
+        # v10.108: TERRITORY line — the pass-share possession proxy + red
+        # edge, the two delivered-but-unused stats with measured next-goal
+        # signal (3x share gradient; 2.2x red edge). One compact line,
+        # only when it moves the needle (|bonus| >= 3 or red edge live);
+        # the ledger records the numbers either way.
+        _terr_bits = []
+        if _terr_share is not None and abs(_terr_bonus) >= 3:
+            _terr_bits.append(
+                f"pass-share {_terr_share * 100:.0f}% ({_terr_bonus:+.0f})"
+            )
+        if _red_edge:
+            _terr_bits.append(f"OPP RED CARD (+{_red_edge:.0f})")
+        _terr_line = ""
+        if _terr_bits:
+            _terr_line = (
+                "\U0001f9ed Territory: " + " \u00b7 ".join(_terr_bits)
+                + f" \u2192 GPS-adj {_gps_adj:.0f} (raw {gps:.0f})\n"
+            )
         msg = (
             f"{home['name']} {sh}-{sa} {away['name']} \u00b7 {league} \u00b7 {minute}'\n\n"
             f"{tname}: SOT {sot} | shots {total_shots} (box {ib_pct})"
             f"{_xg_bit}{_bc_bit}\n"
             f"Opp: SOT {opponent_sot}{_oxg_bit}{_bc_fresh}\n"
+            f"{_terr_line}"
             f"{_rc_block}"
             f"{losing_tag}"
             f"{stale_tag}"
@@ -15875,7 +15989,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             # v10.105: freeze the paper-bet decisions from the signal-time
             # extras, then re-render the block WITH them (pure re-render,
             # same inputs -> same extras; the first pass computed them).
-            _shadow105 = _shadow_market_decisions(minute, _mkt_extras)
+            _shadow105 = _shadow_market_decisions(
+                minute, _mkt_extras,
+                odds_source=(_odds_msg or {}).get("odds_source"))  # v10.109
             if _shadow105.get("corners") or _shadow105.get("cards"):
                 _mkt_block, _ = _build_market_block(
                     game_minute=minute,
@@ -16034,6 +16150,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "possession": possession,
             "gps": round(gps, 1),
             "gps_restored": components.get("gps_restored"),  # v10.61: BC-redistributed shadow value
+            # v10.108: territory + red-edge adjusted GPS (prediction-only)
+            "gps_adj": round(_gps_adj, 1),
+            "terr_share": round(_terr_share, 3) if _terr_share is not None else None,
+            "terr_bonus": round(_terr_bonus, 1),
+            "red_edge": round(_red_edge, 1),
             "ml_score": round(ml_score, 1) if ml_score is not None else None,  # v10.59: shadow opinion at signal time
             # v10.60: free-tier KPI expansion at signal time (logging only,
             # null-safe — None = API did not deliver the field)
@@ -16163,6 +16284,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "corners_shadow_odds": (_shadow105.get("corners") or {}).get("odds"),
             "cards_shadow_side": (_shadow105.get("cards") or {}).get("side"),
             "cards_shadow_odds": (_shadow105.get("cards") or {}).get("odds"),
+            # v10.109: price provenance of the frozen paper bet
+            "corners_shadow_odds_src": (_shadow105.get("corners") or {}).get("src"),
+            "cards_shadow_odds_src": (_shadow105.get("cards") or {}).get("src"),
             "referee": (fixture.get("fixture") or {}).get("referee"),
             "outcome_5min": None,   # v10: expanded windows
             "outcome_10min": None,  # v10: expanded windows
@@ -17249,6 +17373,18 @@ def main():
         f"minute {SHADOW_MIN_MINUTE} with |proj-line| >= {SHADOW_MIN_MARGIN:g} "
         f"(2-day backtest: corners 73.8% / cards 79.1% in these cells; "
         f"graded nightly via mkt_*_ft_result)"
+    )
+    log.info(
+        f"v10.108 TERRITORY + RED-EDGE active: GPS-adj = GPS + pass-share "
+        f"bonus (max +{TERRITORY_MAX_BONUS:g} / -{TERRITORY_MAX_PENALTY:g}) "
+        f"+ opp-red +{RED_EDGE_BONUS:g} — prediction-only, EOD-graded "
+        f"(2-day backtest: 33.6% vs 11.0% goal-next-15' inside GPS 45-60)"
+    )
+    log.info(
+        "v10.109 SHADOW LIVE-PRICE GATE active: paper corners/cards bets "
+        "freeze ONLY on live-priced market blocks (prematch_fallback "
+        "receipts would inflate the validation week — the 1,900 EUR "
+        "stale-odds lesson); ledger stamps corners/cards_shadow_odds_src"
     )
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
