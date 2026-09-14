@@ -759,7 +759,7 @@ _goalburst_count_date: str | None = None
 # report file was produced, so a dead report retries instead of being
 # silently skipped (the nightly v10.97 Accuracy Report was dead on
 # systemd boxes — nobody has seen it since the systemd move).
-BOT_VERSION = "v10.110"
+BOT_VERSION = "v10.111"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -5786,7 +5786,7 @@ def _goalburst_send_alert(entry: dict, label: str) -> None:
                 )
             if _od and _od.get("over_odds"):
                 _live = (
-                    _od.get("odds_source") == "live"
+                    _od.get("odds_source") in ("live", "oddsapi_live")  # v10.111
                     and not _od.get("suspect")
                 )
                 _sus = (
@@ -9481,9 +9481,302 @@ def _live_empty_diag(data) -> dict | None:
         return None
 
 
+# ============================================================
+# v10.111: THE ODDS API — the second LIVE-odds feed (free tier)
+# ============================================================
+# The Sep 14 on-server --odds-test (live board, 4 tracked fixtures,
+# /odds/live called on each) returned: response present, ZERO
+# bookmakers — verdict COVERAGE. api-sports simply carries no live
+# prices for our leagues; three measured windows had zero P&L-grade
+# prices and the price stack (v10.103 gate, v10.109 shadow receipts,
+# EV grading) was starved of input. No code can conjure prices from
+# that feed — so this module adds feed #2:
+#
+#   the-odds-api.com v4: GET /v4/sports/upcoming/odds
+#   ?regions=eu&markets=totals returns LIVE (in-play) events WITH
+#   odds (their docs: "Returns a list of upcoming and live games with
+#   recent odds"; commence_time in the past = in-play). Cost: 1 credit
+#   per region per market; free tier = 500 credits/month; the
+#   x-requests-remaining response header is the live budget gauge.
+#
+# Budget discipline (fits the free tier with room to spare):
+#   * ONE board call per 90 s shared by every signal in the window
+#     (all live soccer arrives in that single response);
+#   * per-league sport-key fallback ONLY when the board missed the
+#     event (1 credit, cached the same 90 s);
+#   * hard stop under ODDSAPI_BUDGET_FLOOR remaining credits so the
+#     month never runs dry mid-week;
+#   * no key configured -> the whole module is a no-op (the manual
+#     /price path needs no API at all).
+# Feed-2 prices the GOALS market only (totals). Corners/cards markets
+# do not exist on this feed — those stay manual via /price.
+
+ODDSAPI_KEY = os.environ.get("ODDSAPI_KEY", "").strip()
+ODDSAPI_BASE = "https://api.the-odds-api.com"
+ODDSAPI_BUDGET_FLOOR = int(os.environ.get("ODDSAPI_BUDGET_FLOOR", "40"))
+ODDSAPI_BOARD_TTL = 90            # seconds one all-live board is reused
+ODDSAPI_MIN_IMPL = 0.03           # sanity bounds on a live totals price
+ODDSAPI_MAX_IMPL = 0.95
+ODDSAPI_KICKOFF_SLACK = 1800      # +/- seconds when matching kickoffs
+ODDSAPI_SPORT_KEYS = {            # api-sports league id -> odds-api sport key
+    39: "soccer_epl", 140: "soccer_spain_la_liga",
+    78: "soccer_germany_bundesliga", 79: "soccer_germany_bundesliga2",
+    135: "soccer_italy_serie_a", 61: "soccer_france_ligue_one",
+    2: "soccer_uefa_champs_league", 3: "soccer_uefa_europa_league",
+    848: "soccer_uefa_conference_league",
+    94: "soccer_portugal_primeira_liga",
+    88: "soccer_netherlands_eredivisie", 203: "soccer_turkey_super_league",
+    283: "soccer_romania_liga_1", 210: "soccer_croatia_first_league",
+    345: "soccer_czech_first_league", 119: "soccer_denmark_superliga",
+    137: "soccer_finland_veikkausliiga", 191: "soccer_hungary_nb_i",
+    543: "soccer_ireland_premier_division",
+}
+_oddsapi_board: dict = {"ts": 0.0, "events": []}      # shared board cache
+_oddsapi_league_cache: dict = {}                       # sport_key -> (ts, events)
+_oddsapi_remaining: int | None = None                  # x-requests-remaining
+_oddsapi_floor_logged = False
+_oddsapi_fixture_ctx: dict = {}                        # fid -> context tuple
+
+
+def _fixture_kickoff_ts(fixture: dict) -> float | None:
+    """v10.111: kickoff as epoch seconds (timestamp field, else ISO date)."""
+    try:
+        ff = (fixture or {}).get("fixture") or {}
+        ts = ff.get("timestamp")
+        if ts:
+            return float(ts)
+        iso = ff.get("date")
+        if iso:
+            return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        pass
+    return None
+
+
+def _norm_team(s: str) -> str:
+    """lowercase alphanumeric tokens for cross-feed name matching."""
+    out = "".join(c if c.isalnum() else " " for c in str(s or "").lower())
+    return " ".join(out.split())
+
+
+def _teams_match(a: str, b: str) -> bool:
+    """v10.111: cross-feed team-name match — token containment or high
+    string similarity (Real Betis~Betis, SC Braga~Braga resolve)."""
+    try:
+        na, nb = _norm_team(a), _norm_team(b)
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        ta, tb = set(na.split()), set(nb.split())
+        if ta <= tb or tb <= ta:
+            return True
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, na, nb).ratio() >= 0.6
+    except Exception:
+        return False
+
+
+def _oddsapi_event_start(ev: dict) -> float | None:
+    try:
+        return datetime.fromisoformat(
+            str(ev.get("commence_time", "")).replace("Z", "+00:00")
+        ).timestamp()
+    except Exception:
+        return None
+
+
+def _oddsapi_budget_ok() -> bool:
+    global _oddsapi_floor_logged
+    if _oddsapi_remaining is None:
+        return True
+    if _oddsapi_remaining > ODDSAPI_BUDGET_FLOOR:
+        return True
+    if not _oddsapi_floor_logged:
+        log.warning(
+            f"v10.111 oddsapi: budget floor reached ({_oddsapi_remaining} "
+            f"credits left) — feed-2 live prices paused, manual /price still on"
+        )
+        _oddsapi_floor_logged = True
+    return False
+
+
+def _oddsapi_get_odds(client: httpx.Client, sport_key: str) -> list:
+    """v10.111: one odds-api odds fetch (1 credit) — returns soccer events."""
+    global _oddsapi_remaining
+    try:
+        r = client.get(
+            f"{ODDSAPI_BASE}/v4/sports/{sport_key}/odds",
+            params={
+                "apiKey": ODDSAPI_KEY, "regions": "eu",
+                "markets": "totals", "oddsFormat": "decimal",
+            },
+            timeout=15.0,
+        )
+        rem = r.headers.get("x-requests-remaining")
+        if rem is not None:
+            try:
+                _oddsapi_remaining = int(rem)
+            except Exception:
+                pass
+        if r.status_code != 200:
+            log.info(f"v10.111 oddsapi: {sport_key} HTTP {r.status_code} — skipped")
+            return []
+        return [e for e in (r.json() or [])
+                if str(e.get("sport_key", "")).startswith("soccer")]
+    except Exception as e:
+        log.info(f"v10.111 oddsapi: {sport_key} fetch failed: {e}")
+        return []
+
+
+def _oddsapi_board_events(client: httpx.Client) -> list:
+    """v10.111: the 90s-cached all-live board — the 'upcoming' pseudo-sport
+    returns every live game plus the next 8 upcoming across all sports;
+    one 1-credit call shared by all signals inside the window."""
+    if not ODDSAPI_KEY or not _oddsapi_budget_ok():
+        return []
+    now = time.time()
+    if _oddsapi_board["events"] and now - _oddsapi_board["ts"] < ODDSAPI_BOARD_TTL:
+        return _oddsapi_board["events"]
+    evs = _oddsapi_get_odds(client, "upcoming")
+    if evs:
+        _oddsapi_board["ts"] = now
+        _oddsapi_board["events"] = evs
+        log.info(
+            "v10.111 oddsapi: live board refreshed — %d soccer events%s"
+            % (len(evs), f" ({_oddsapi_remaining} credits left)"
+               if _oddsapi_remaining is not None else "")
+        )
+    return evs
+
+
+def _oddsapi_league_events(client: httpx.Client, sport_key: str) -> list:
+    """v10.111: per-league fallback when the board missed the event."""
+    if not ODDSAPI_KEY or not _oddsapi_budget_ok():
+        return []
+    now = time.time()
+    cached = _oddsapi_league_cache.get(sport_key)
+    if cached and now - cached[0] < ODDSAPI_BOARD_TTL:
+        return cached[1]
+    evs = _oddsapi_get_odds(client, sport_key)
+    _oddsapi_league_cache[sport_key] = (now, evs)
+    return evs
+
+
+def _oddsapi_find_event(events, home_name, away_name, kickoff_ts):
+    """v10.111: match our fixture to an odds-api event — kickoff window
+    (when known) AND fuzzy match on BOTH team names."""
+    for ev in events or []:
+        if not (_teams_match(home_name, ev.get("home_team") or "")
+                and _teams_match(away_name, ev.get("away_team") or "")):
+            continue
+        if kickoff_ts is not None:
+            st = _oddsapi_event_start(ev)
+            if st is None or abs(st - float(kickoff_ts)) > ODDSAPI_KICKOFF_SLACK:
+                continue
+        return ev
+    return None
+
+
+def _oddsapi_totals_price(event: dict, total_goals: int) -> dict | None:
+    """v10.111: the live totals (Over) price off a matched event.
+    Prefers bet365; otherwise the best (highest) Over price. Only lines
+    ABOVE the current goal count count — a line at/below it is a stale
+    leftover, exactly the class v10.68 taught us to distrust."""
+    best_price, best_book, best_point = None, None, None
+    try:
+        for book in event.get("bookmakers") or []:
+            bkey = book.get("key")
+            for mk in book.get("markets") or []:
+                if mk.get("key") != "totals":
+                    continue
+                for oc in mk.get("outcomes") or []:
+                    if oc.get("name") != "Over":
+                        continue
+                    try:
+                        point = float(oc.get("point"))
+                        price = float(oc.get("price"))
+                    except (TypeError, ValueError):
+                        continue
+                    if point <= float(total_goals):
+                        continue          # stale/pre-match leftover line
+                    impl = 1.0 / price
+                    if not (ODDSAPI_MIN_IMPL <= impl <= ODDSAPI_MAX_IMPL):
+                        continue
+                    if bkey == "bet365":
+                        best_price, best_book, best_point = price, "bet365", point
+                        break
+                    if best_price is None or price > best_price:
+                        best_price, best_book, best_point = price, str(bkey), point
+                if best_book == "bet365":
+                    break
+            if best_book == "bet365":
+                break
+    except Exception:
+        return None
+    if best_price is None:
+        return None
+    return {
+        "over_line": best_point,
+        "over_odds": best_price,
+        "over_implied": round(1.0 / best_price, 4),
+        "btts_yes_odds": None, "btts_implied": None,
+        "match_home_odds": None, "match_away_odds": None,
+        "match_draw_odds": None,
+        "bookmaker": best_book,
+        "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "markets_available": ["totals"],
+        "oddsapi_event_id": event.get("id"),
+    }
+
+
+def _oddsapi_try(client: httpx.Client, fixture_id: int, total_goals: int,
+                 home_name=None, away_name=None, kickoff_ts=None,
+                 league_id=None) -> dict | None:
+    """v10.111: one bounded feed-2 attempt — the cached board first, the
+    league's sport key only if the board missed the event. Fixture
+    context (names/kickoff) is remembered per fixture so later calls
+    (drift re-checks, hardened ledger fetch) work even when the caller
+    passes nothing. Returns a _parse_signal_odds-shaped dict or None."""
+    if not ODDSAPI_KEY:
+        return None
+    ctx = _oddsapi_fixture_ctx.get(fixture_id)
+    if ctx is not None:
+        home_name = home_name or ctx[0]
+        away_name = away_name or ctx[1]
+        if kickoff_ts is None:
+            kickoff_ts = ctx[2]
+        if league_id is None:
+            league_id = ctx[3]
+    if not home_name or not away_name:
+        return None
+    if ctx is None:
+        _oddsapi_fixture_ctx[fixture_id] = (home_name, away_name, kickoff_ts, league_id)
+    ev = _oddsapi_find_event(
+        _oddsapi_board_events(client), home_name, away_name, kickoff_ts)
+    if ev is None and league_id in ODDSAPI_SPORT_KEYS:
+        ev = _oddsapi_find_event(
+            _oddsapi_league_events(client, ODDSAPI_SPORT_KEYS[league_id]),
+            home_name, away_name, kickoff_ts)
+    if ev is None:
+        return None
+    price = _oddsapi_totals_price(ev, total_goals)
+    if price is not None:
+        log.info(
+            f"  MKT2: F{fixture_id} {home_name} vs {away_name} — "
+            f"O{price['over_line']} @{price['over_odds']} "
+            f"[{price['bookmaker']}] (the-odds-api live)"
+        )
+    return price
+
+
 def fetch_signal_odds(client: httpx.Client, fixture_id: int,
                       total_goals: int, game_minute: int | None = None,
-                      for_message: bool = False) -> dict | None:
+                      for_message: bool = False,
+                      home_name: str | None = None,
+                      away_name: str | None = None,
+                      kickoff_ts: float | None = None,
+                      league_id: int | None = None) -> dict | None:
     """v10.36: Fetch odds at signal time for EV/ROI analysis.
 
     Captures odds PASSIVELY — the signal decision is already final.
@@ -9554,10 +9847,29 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
             result = _parse_signal_odds(data, total_goals, multi_book=True)
             if result is None:
                 _live_diag = _live_empty_diag(data)
-                data = api_get(client, "/odds", {"fixture": fixture_id})
-                source = "prematch_fallback"
-                result = _parse_signal_odds(data, total_goals)
-                fail_reason = "no-markets" if result is None else None
+                # v10.111: THE ODDS API fallback — api-sports live came
+                # back empty (the COVERAGE verdict from --odds-test):
+                # try the second live feed BEFORE settling for the stale
+                # pre-match fallback. Bounded: one board call per 90s,
+                # budget-guarded, zero api-sports credits.
+                _oa = None
+                try:
+                    _oa = _oddsapi_try(
+                        client, fixture_id, total_goals,
+                        home_name=home_name, away_name=away_name,
+                        kickoff_ts=kickoff_ts, league_id=league_id,
+                    )
+                except Exception as _oe:
+                    log.debug(f"  v10.111 oddsapi fallback failed: {_oe}")
+                if _oa is not None:
+                    result = _oa
+                    source = "oddsapi_live"
+                    fail_reason = None
+                else:
+                    data = api_get(client, "/odds", {"fixture": fixture_id})
+                    source = "prematch_fallback"
+                    result = _parse_signal_odds(data, total_goals)
+                    fail_reason = "no-markets" if result is None else None
             else:
                 fail_reason = None
         except Exception as e:
@@ -9588,7 +9900,8 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     # pre-match-leftover class — refetch once for a fresh live price.
     suspect = False
     if (
-        result.get("over_implied") is not None
+        source != "oddsapi_live"   # v10.111: feed-2 prices are sanitized at parse
+        and result.get("over_implied") is not None
         and result["over_implied"] < ODDS_SUSPECT_IMPLIED
         and (game_minute is None or game_minute < ODDS_SUSPECT_MINUTE_MAX)
     ):
@@ -11576,7 +11889,7 @@ def _drift_watch_tick(client, fixtures_now: dict) -> None:
                 _drift_day["checks"] += 1
                 if (
                     od is not None
-                    and od.get("odds_source") == "live"
+                    and od.get("odds_source") in ("live", "oddsapi_live")  # v10.111
                     and not od.get("suspect")
                     and od.get("over_odds") is not None
                 ):
@@ -11637,7 +11950,7 @@ def _apply_price_gate(bet_flag: str, odds_msg: dict | None) -> tuple[str, str, f
     try:
         if (
             odds_msg is not None
-            and odds_msg.get("odds_source") == "live"
+            and odds_msg.get("odds_source") in ("live", "oddsapi_live")  # v10.111: feed-2 gates too
             and not odds_msg.get("suspect")
             and odds_msg.get("over_odds") is not None
         ):
@@ -13105,6 +13418,239 @@ def _format_ml_scoreboard(sig_entries: list[dict], blocked_entries: list[dict], 
     return "\n".join(lines)
 
 
+# ============================================================
+# v10.111: /price — MANUAL PRICE RECEIPTS (the always-free path)
+# ============================================================
+# api-sports live odds are empty for our leagues (COVERAGE verdict) and
+# feed-2 prices only the goals market — /price closes every remaining
+# gap with the one price that is provably real: what the user's own
+# book app shows at bet time.
+#   /price                — signals still waiting for a price
+#   /price 1.85           — the Over price (reply to the signal = exact)
+#   /price corners 1.95   — freeze the corners shadow bet at a real price
+#   /price cards 1.90     — freeze the cards shadow bet at a real price
+# Ledger discipline (the anti-1,900-EUR rules):
+#   * odds_source = 'manual', P&L-grade ONLY within 15 min of the signal
+#     (later entries recorded + flagged, research-only);
+#   * the pre-manual capture is preserved in odds_pre_manual;
+#   * shadow freezes respect the same v10.105 cells live prices obey.
+
+_PRICE_MANUAL_WINDOW = 900      # seconds for a P&L-grade manual entry
+_PRICE_LIST_WINDOW = 4 * 3600   # how far back /price lists pending signals
+_PRICE_LIST_MAX = 8
+
+_PRICE_USAGE = (
+    "\u2139\ufe0f /price \u2014 freeze a REAL price into the ledger\n\n"
+    "/price \u2014 what\u2019s waiting for a price\n"
+    "/price 1.85 \u2014 the Over price from your book app\n"
+    "   (reply to the signal message = exact match)\n"
+    "/price corners 1.95 \u2014 corners shadow bet price\n"
+    "/price cards 1.90 \u2014 cards shadow bet price\n\n"
+    "Within 15 min of the signal it counts as P&L-grade; later entries"
+    " are kept for research only."
+)
+
+
+def _price_float(s):
+    try:
+        return float(str(s).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_g(v):
+    try:
+        return f"{float(v):g}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _price_graded(e: dict) -> bool:
+    """v10.111: does this entry already carry a P&L-grade price?"""
+    if "odds_pnl_grade" in e:
+        return bool(e.get("odds_pnl_grade"))
+    return (e.get("odds_source") in ("live", "oddsapi_live")
+            and not e.get("odds_suspect"))
+
+
+def _price_pending(kind: str = "goals", reply_id: int | None = None):
+    """v10.111: pick the /price target — replied-to signal first, else the
+    newest unresolved signal missing that price. Returns (entry, how) or
+    (None, reason)."""
+    if reply_id is not None:
+        for e in signal_outcomes:
+            if e.get("sig_msg_id") == reply_id and not e.get("resolved"):
+                return e, "reply"
+        return None, "reply"
+    now = time.time()
+    for e in reversed(signal_outcomes):
+        st = e.get("signal_time")
+        if not st or e.get("resolved") or now - st > _PRICE_LIST_WINDOW:
+            continue
+        if kind == "goals":
+            if e.get("odds_source") == "manual" or _price_graded(e):
+                continue
+        else:
+            if e.get(f"{kind}_shadow_side") is not None:
+                continue
+            if e.get(f"mkt_{kind}_lean") not in ("OVER", "UNDER"):
+                continue
+        return e, "newest"
+    return None, "none"
+
+
+def _price_list_text() -> str:
+    """v10.111: what's waiting for a real price (last 4h)."""
+    now = time.time()
+    rows = []
+    for e in reversed(signal_outcomes):
+        st = e.get("signal_time")
+        if not st or e.get("resolved") or now - st > _PRICE_LIST_WINDOW:
+            continue
+        if len(rows) >= _PRICE_LIST_MAX:
+            break
+        needs_goal = not (_price_graded(e) or e.get("odds_source") == "manual")
+        c_need = (e.get("mkt_corners_lean") in ("OVER", "UNDER")
+                  and e.get("corners_shadow_side") is None)
+        d_need = (e.get("mkt_cards_lean") in ("OVER", "UNDER")
+                  and e.get("cards_shadow_side") is None)
+        if not (needs_goal or c_need or d_need):
+            continue
+        head = (f"\U0001f3af {e.get('team_name')} {e.get('game_minute')}\u2019"
+                f" \u00b7 {e.get('league')} \u00b7 F{e.get('fixture_id')}")
+        bits = []
+        if needs_goal:
+            bits.append("reply  /price <over-odds>")
+        if c_need:
+            bits.append(f"corners {e.get('mkt_corners_lean')} "
+                        f"{_fmt_g(e.get('mkt_corners_line'))} \u2192 "
+                        "/price corners <odds>")
+        if d_need:
+            bits.append(f"cards {e.get('mkt_cards_lean')} "
+                        f"{_fmt_g(e.get('mkt_cards_line'))} \u2192 "
+                        "/price cards <odds>")
+        rows.append(head + "\n    " + "\n    ".join(bits))
+    if not rows:
+        return ("\u2705 Nothing waiting \u2014 every recent signal already has a "
+                "real (live / oddsapi / manual) price.")
+    return ("\U0001f64b SIGNALS WAITING FOR A REAL PRICE (last 4h)\n"
+            "Reply TO the signal\u2019s message for the exact match;\n"
+            "a bare /price targets the newest.\n\n" + "\n\n".join(rows))
+
+
+def _price_apply_goals(entry: dict, odds: float) -> str:
+    """v10.111: freeze a manual Over price into the ledger (P&L-grade
+    only near signal time; the old capture is preserved)."""
+    if _price_graded(entry) and entry.get("odds_source") != "manual":
+        return (f"\u2139\ufe0f {entry.get('team_name')} already carries a feed "
+                f"price (@{entry.get('odds_over_odds')}, "
+                f"{entry.get('odds_source')}) \u2014 nothing to enter.")
+    now = time.time()
+    st = entry.get("signal_time") or now
+    delay = now - st
+    entry["odds_pre_manual"] = {
+        k: entry.get(k) for k in (
+            "odds_bookmaker", "odds_over_line", "odds_over_odds",
+            "odds_over_implied", "odds_source",
+        )
+    }
+    if entry.get("odds_over_line") is None:
+        _tot = (entry.get("goals_at_signal") or 0) + (
+            entry.get("opponent_goals_at_signal") or 0)
+        entry["odds_over_line"] = _tot + 0.5
+    entry["odds_bookmaker"] = "manual"
+    entry["odds_over_odds"] = odds
+    entry["odds_over_implied"] = round(1.0 / odds, 4)
+    entry["odds_source"] = "manual"
+    entry["odds_manual_entered_at"] = now
+    entry["odds_manual_delay_s"] = round(max(0.0, delay), 1)
+    entry["odds_pnl_grade"] = bool(0 <= delay <= _PRICE_MANUAL_WINDOW)
+    rewrite_outcomes_file()
+    if entry["odds_pnl_grade"]:
+        grade = "\u2705 P&L-grade \u2014 enters tonight\u2019s MARKET/EV analysis"
+    else:
+        grade = (f"\u26a0\ufe0f entered {max(0.0, delay) / 60:.0f} min after the "
+                 "signal \u2014 kept for research, NOT P&L-grade")
+    return (f"\u2705 PRICE FROZEN \u2014 {entry.get('team_name')} "
+            f"{entry.get('game_minute')}\u2019 \u00b7 Over "
+            f"{_fmt_g(entry.get('odds_over_line'))} @ {odds:.2f} (manual)\n"
+            f"\u2192 {grade}")
+
+
+def _price_apply_shadow(entry: dict, kind: str, odds: float) -> str:
+    """v10.111: freeze the corners/cards paper bet at a REAL manual price
+    (same v10.105 cells live freezes obey: minute + margin gates)."""
+    word = "Corners" if kind == "corners" else "Cards"
+    side_key = f"{kind}_shadow_side"
+    if entry.get(side_key) is not None:
+        return (f"\u2139\ufe0f {word} shadow already frozen: "
+                f"{entry.get(side_key)} @ {entry.get(f'{kind}_shadow_odds')} "
+                f"({entry.get(f'{kind}_shadow_odds_src')}) \u2014 nothing to enter.")
+    lean = entry.get(f"mkt_{kind}_lean")
+    line = entry.get(f"mkt_{kind}_line")
+    proj = entry.get(f"mkt_{kind}_proj")
+    minute = entry.get("game_minute")
+    if lean not in ("OVER", "UNDER") or line is None:
+        return (f"\u274c No {kind} lean was recorded on that signal \u2014 "
+                "nothing to freeze.")
+    if minute is None or minute < SHADOW_MIN_MINUTE:
+        return (f"\u274c {word} shadow cell needs minute \u2265 "
+                f"{SHADOW_MIN_MINUTE}\u2019 (this signal: {minute}\u2019) \u2014 "
+                "outside the strongest cell.")
+    try:
+        margin = abs(float(proj) - float(line))
+    except (TypeError, ValueError):
+        margin = None
+    if proj is None or margin is None or margin < SHADOW_MIN_MARGIN:
+        return (f"\u274c {word} shadow cell needs |proj \u2212 line| \u2265 "
+                f"{SHADOW_MIN_MARGIN:g} (this signal: proj {proj} vs line "
+                f"{line}) \u2014 outside the strongest cell.")
+    entry[side_key] = lean
+    entry[f"{kind}_shadow_odds"] = odds
+    entry[f"{kind}_shadow_odds_src"] = "manual"   # v10.109 provenance, v10.111 manual
+    entry[f"{kind}_shadow_manual_at"] = time.time()
+    rewrite_outcomes_file()
+    return (f"\U0001f7e1 SHADOW BET FROZEN \u2014 {word} {lean} "
+            f"{_fmt_g(line)} @ {odds:.2f} (manual price) \u00b7 "
+            f"{entry.get('team_name')} {entry.get('game_minute')}\u2019\n"
+            "\u2192 paper trade, EOD-graded at the real price")
+
+
+def _handle_price_command(client: httpx.Client, text: str,
+                          reply_id: int | None) -> str:
+    """v10.111: /price — parse, target, freeze, persist. Returns the reply
+    text; never raises."""
+    try:
+        parts = (text or "").split()
+        if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == "list"):
+            return _price_list_text()
+        kind, odds = "goals", None
+        if len(parts) == 2:
+            odds = _price_float(parts[1])
+        elif len(parts) == 3 and parts[1].lower() in ("corners", "cards"):
+            kind = parts[1].lower()
+            odds = _price_float(parts[2])
+        elif len(parts) == 3 and parts[1].lower() in ("over", "goals"):
+            odds = _price_float(parts[2])
+        if odds is None:
+            return _PRICE_USAGE
+        if not (1.01 <= odds <= 50.0):
+            return (f"\u274c {odds} is not a plausible decimal price "
+                    "(send 1.01\u201350, e.g. /price 1.85).")
+        entry, how = _price_pending(kind, reply_id)
+        if entry is None:
+            if how == "reply":
+                return ("\u274c That reply didn\u2019t match a live signal "
+                        "message \u2014 reply to the message the SIGNAL came in.")
+            return ("\u274c No unresolved signal is waiting for that price "
+                    "right now. /price lists what\u2019s pending.")
+        if kind == "goals":
+            return _price_apply_goals(entry, odds)
+        return _price_apply_shadow(entry, kind, odds)
+    except Exception as e:
+        return f"\u274c /price failed: {e}"
+
+
 def check_telegram_commands(client: httpx.Client) -> None:
     """v10.18: Check for Telegram commands.
 
@@ -13173,6 +13719,15 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     "/eod3 \u2014 EOD report (past 3 days)\n"
                     "/eod7 \u2014 EOD report (past 7 days)\n"
                     "/eodall \u2014 EOD report (all data YTD)\n\n"
+                    "\U0001f4b8 REAL PRICES\n"
+                    "/price \u2014 signals still missing a real price\n"
+                    "/price 1.85 \u2014 freeze YOUR Over price (P&L receipt;\n"
+                    "  reply to the signal message = exact match)\n"
+                    "/price corners 1.95 \u2014 corners shadow bet price\n"
+                    "/price cards 1.90 \u2014 cards shadow bet price\n"
+                    "  \u2192 api-sports live odds are EMPTY for our leagues\n"
+                    "  \u2192 (--odds-test COVERAGE verdict); real prices come\n"
+                    "  \u2192 from feed-2 (The Odds API, ODDSAPI_KEY) or you\n\n"
                     "\U0001f4c1 ML DATA\n"
                     "/count \u2014 signal/poll counts + ML readiness\n"
                     "/mlstatus \u2014 full ML status with dates covered\n"
@@ -13656,6 +14211,14 @@ def check_telegram_commands(client: httpx.Client) -> None:
                 # v10.65: shot-event feed census (live-learned, read-only)
                 send_telegram(client, format_sot_feed_census())
 
+            elif text.startswith("/price"):
+                # v10.111: manual real-price receipts (goals + shadow bets)
+                try:
+                    _pr_reply = (msg.get("reply_to_message") or {}).get("message_id")
+                    send_telegram(
+                        client, _handle_price_command(client, text, _pr_reply))
+                except Exception as _pe:
+                    send_telegram(client, f"\u274c /price failed: {_pe}")
             elif text.startswith("/goalwatch"):
                 # v10.53: goal flash alerts toggle/status
                 _parts = text.split()
@@ -15806,7 +16369,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         _odds_extras: dict = {}
         try:
             _odds_msg = fetch_signal_odds(
-                client, fid, _current_goals, game_minute=minute, for_message=True
+                client, fid, _current_goals, game_minute=minute, for_message=True,
+                home_name=(home or {}).get("name"),      # v10.111: feed-2 context
+                away_name=(away or {}).get("name"),
+                kickoff_ts=_fixture_kickoff_ts(fixture),
+                league_id=(fixture.get("league") or {}).get("id"),
             )
             _odds_block, _odds_extras = _build_odds_value_block(
                 _odds_msg, _goal_pred, tname, minute=minute
@@ -15837,6 +16404,19 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     _price_live, _current_goals
                 )
         msg += _price_gate_line(_price_gate, _price_live)
+        # v10.111: manual-price invitation when neither live feed produced
+        # a price for the message (api-sports empty AND feed-2 empty/absent).
+        try:
+            if _odds_msg is None or (
+                (_odds_msg.get("odds_source") or "") not in ("live", "oddsapi_live")
+            ):
+                msg += (
+                    "\n\U0001f64b NO LIVE PRICE \u2014 reply to this message with"
+                    "\n    /price 1.85   (the Over price in YOUR book app)"
+                    "\nand it becomes the P&L-grade receipt price."
+                )
+        except Exception:
+            pass
 
         # v10.94: DOG FLAG + A-GRADE COMPOSITE — the two ledger classes
         # the user asked to see in the signal. The 1X2 prices ride the
@@ -16089,7 +16669,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         if _odds_msg is not None:
             _odds_data = _odds_msg
         else:
-            _odds_data = fetch_signal_odds(client, fid, _total_goals_now, game_minute=minute)
+            _odds_data = fetch_signal_odds(
+                client, fid, _total_goals_now, game_minute=minute,
+                home_name=(home or {}).get("name"),      # v10.111: feed-2 context
+                away_name=(away or {}).get("name"),
+                kickoff_ts=_fixture_kickoff_ts(fixture),
+                league_id=(fixture.get("league") or {}).get("id"),
+            )
 
         # v10.103: ledger-grade price verdict from the FINAL capture (the
         # hardened post-send fetch may hold a live price the fast pass
@@ -16146,6 +16732,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "league": league,
             "signal_time": time.time(),
             "signal_clock": time.strftime("%Y-%m-%d %H:%M"),
+            "sig_msg_id": _send_ok if isinstance(_send_ok, int) else None,  # v10.111: /price reply target
             "game_minute": minute,
             "sot": sot,
             "stats_sot_raw": stats_sot,  # v10.31: audit trail
@@ -16253,7 +16840,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             # (Marseille O4.5 @ 26.0 with 4 goals already in) that inflated paper P&L
             # by ~1,900 EUR on Sep 6 alone; they stay recorded for research but are
             # excluded from every P&L / EV / ROI computation.
-            "odds_pnl_grade": bool(_odds_data and _odds_data.get("odds_source") == "live" and not _odds_data.get("suspect")) if _odds_data else None,
+            "odds_pnl_grade": bool(_odds_data and _odds_data.get("odds_source") in ("live", "oddsapi_live") and not _odds_data.get("suspect")) if _odds_data else None,  # v10.111: + feed-2 live
             "odds_markets": _odds_data.get("markets_available") if _odds_data else [],
             # v10.78: ODDS-IN-MESSAGE calibration fields — the fair prices
             # shown in the Telegram block, recorded so the next calibration
@@ -17401,6 +17988,14 @@ def main():
         "eod_report.py under sys.executable (systemd PATH resolved bare "
         "'python3' to the dependency-less system python -> exit code 1); "
         "nightly now retries until the report actually delivers"
+    )
+    log.info(
+        "v10.111 REAL-PRICE STACK active: The Odds API live fallback "
+        "(ODDSAPI_KEY, free tier, budget-guarded) + /price manual receipts "
+        "for goals AND corners/cards shadow bets — the Sep 14 --odds-test "
+        "verdict was COVERAGE (api-sports /odds/live: zero bookmakers for "
+        "our tracked leagues), so real prices need a second feed or a "
+        "human eye; this version has both"
     )
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
