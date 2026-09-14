@@ -749,7 +749,17 @@ _goalburst_count_date: str | None = None
 # freezes ONLY on a live-priced market block; the frozen dict stamps
 # src=live and the ledger logs corners/cards_shadow_odds_src so the
 # validation week's go/no-go counts LIVE receipts only.
-BOT_VERSION = "v10.109"
+# v10.110: VENV INTERPRETER FIX — /eod and the nightly auto-EOD spawned
+# eod_report.py with bare "python3"; under systemd (ExecStart =
+# venv/bin/python3, no activation) that resolves to the SYSTEM python,
+# which lacks httpx/dotenv -> ModuleNotFoundError -> "EOD report failed
+# (exit code 1)". All eod_report.py subprocesses now run under
+# sys.executable (the interpreter running bot.py, provably dependency-
+# complete). The nightly additionally marks the day as sent ONLY when the
+# report file was produced, so a dead report retries instead of being
+# silently skipped (the nightly v10.97 Accuracy Report was dead on
+# systemd boxes — nobody has seen it since the systemd move).
+BOT_VERSION = "v10.110"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -13337,15 +13347,15 @@ def check_telegram_commands(client: httpx.Client) -> None:
                 if specific_date:
                     send_telegram(client, f"Generating EOD report for {specific_date}...")
                     _eod_label = specific_date
-                    cmd = ["python3", "eod_report.py", "--date", specific_date, "--quiet"]
+                    cmd = [sys.executable, "eod_report.py", "--date", specific_date, "--quiet"]  # v10.110: venv interpreter
                 elif days:
                     send_telegram(client, f"Generating EOD report (last {days} days)...")
                     _eod_label = f"last{days}d"
-                    cmd = ["python3", "eod_report.py", "--days", str(days), "--quiet"]
+                    cmd = [sys.executable, "eod_report.py", "--days", str(days), "--quiet"]  # v10.110: venv interpreter
                 else:
                     send_telegram(client, "Generating EOD report (all data YTD)...")
                     _eod_label = "ytd"
-                    cmd = ["python3", "eod_report.py", "--all", "--quiet"]
+                    cmd = [sys.executable, "eod_report.py", "--all", "--quiet"]  # v10.110: venv interpreter
                 # v10.102: single .txt into the persistent volume, then one sendDocument
                 _eod_file = os.path.join(_VOLUME_DIR, f"eod_report_{_eod_label}.txt")
                 cmd += ["--out", _eod_file]
@@ -17386,6 +17396,12 @@ def main():
         "receipts would inflate the validation week — the 1,900 EUR "
         "stale-odds lesson); ledger stamps corners/cards_shadow_odds_src"
     )
+    log.info(
+        "v10.110 VENV INTERPRETER FIX active: /eod + nightly auto-EOD run "
+        "eod_report.py under sys.executable (systemd PATH resolved bare "
+        "'python3' to the dependency-less system python -> exit code 1); "
+        "nightly now retries until the report actually delivers"
+    )
     log.info(f"Tracking {len(LEAGUE_IDS)} leagues: {list(LEAGUE_IDS.keys())}")
     log.info(f"API keys: {len(API_KEYS)} (round-robin for rate-limit resilience, NOT quota expansion)")
     log.info(f"Signal window: {MINUTE_MIN}-{MINUTE_MAX}' | Polling: {MINUTE_MIN - PRE_WINDOW_MINUTES}-{EXTENDED_MAX}'")
@@ -17739,7 +17755,7 @@ def main():
                                     f"eod_report_auto_{today_bg}.txt",
                                 )
                                 subprocess.run(
-                                    ["python3", "eod_report.py", "--days", "1", "--quiet",
+                                    [sys.executable, "eod_report.py", "--days", "1", "--quiet",  # v10.110: venv interpreter
                                      "--out", _auto_eod_file],
                                     cwd=os.path.dirname(os.path.abspath(__file__)), timeout=120,
                                 )
@@ -17755,11 +17771,17 @@ def main():
                                         f"v10.102: auto EOD report sent as file "
                                         f"({_auto_eod_file}, {os.path.getsize(_auto_eod_file) / 1024:.1f} KB)"
                                     )
+                                    # v10.110: mark the day as sent ONLY on a real
+                                    # delivery — a failed run retries next loop
+                                    # instead of dying silently for the whole day.
+                                    eod_report_sent_date = today_bg
+                                    _save_eod_report_sent_date(today_bg)
+                                    log.info("v10.35: EOD report sent via subprocess")
                                 else:
-                                    log.warning("v10.102: auto EOD file missing/empty — report skipped")
-                                eod_report_sent_date = today_bg
-                                _save_eod_report_sent_date(today_bg)
-                                log.info("v10.35: EOD report sent via subprocess")
+                                    log.warning(
+                                        "v10.110: auto EOD file missing/empty — report "
+                                        "NOT marked sent, will retry next loop"
+                                    )
                             except Exception as e:
                                 log.warning(f"v10.33: EOD report subprocess failed: {e}")
                         # v10.44l: Auto-backup ML data to Telegram BEFORE rewrite/clear
