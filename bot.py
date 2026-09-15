@@ -350,6 +350,15 @@ FAST_SOT_WINDOW = 5 * 60  # 300 seconds
 SIGNAL_COOLDOWN_POLLS = 2   # consecutive polls below threshold to re-qualify
 SIGNAL_COOLDOWN_GPS_FLOOR = 55  # GPS_EARLY_WARNING value — below this = pressure broken
 
+# v10.115: COOLDOWN BLOCK log throttle — a stuck-in-cooldown team re-triggers
+# the block branch on EVERY poll while pressure stays above threshold (Genoa
+# Sep 15 16:48-16:59: 40+ identical "COOLDOWN BLOCK" lines at 15s cadence
+# through half-time). The blocked-outcomes LEDGER keeps full fidelity (its own
+# 10-game-minute dedupe); only the console line is rate-limited to one per
+# team/tier/signal# per 2 minutes, with the suppressed count folded into the
+# next printed line as "[N more suppressed]".
+COOLDOWN_BLOCK_LOG_EVERY = 120  # seconds between identical COOLDOWN BLOCK lines
+
 # v10.46: Minimum wall-clock gap between signals for the SAME team via the
 # pressure-buildup override. Data (Benfica 46'->47', Athletic Club): when the
 # stats API lags then catches up, SOT/xG can jump +3/+0.50 in ONE poll — the
@@ -592,6 +601,36 @@ blocked_outcomes: list[dict] = []        # v10.49: suppressed-signal candidates
 _blocked_dedupe: dict[tuple, int] = {}   # v10.49: (fid, tid, reason) -> minute bucket
 _blocked_count_today: int = 0           # v10.49: daily volume cap counter
 _blocked_count_date: str | None = None  # v10.49: date of the counter
+# v10.115: COOLDOWN BLOCK log-throttle state — key (fid, tid, tier, sig_count)
+_cooldown_block_log_last: dict[tuple, float] = {}      # key -> ts of last printed line
+_cooldown_block_log_suppressed: dict[tuple, int] = {}  # key -> lines swallowed since
+
+
+def _cooldown_block_log_allow(key: tuple, now: float) -> tuple[bool, int]:
+    """v10.115: may this COOLDOWN BLOCK line be printed now?
+
+    LOGGING ONLY — never gates signals. Returns (allow, suppressed_count):
+    the first line of a spell prints immediately; identical repeats are
+    swallowed for COOLDOWN_BLOCK_LOG_EVERY seconds and counted, and the
+    count rides the next printed line as "[N more suppressed]" — no
+    information lost, only the 15s echo spam.
+    """
+    _supp = _cooldown_block_log_suppressed.get(key, 0)
+    if now - _cooldown_block_log_last.get(key, 0.0) >= COOLDOWN_BLOCK_LOG_EVERY:
+        _cooldown_block_log_last[key] = now
+        _cooldown_block_log_suppressed[key] = 0
+        return True, _supp
+    _cooldown_block_log_suppressed[key] = _supp + 1
+    return False, 0
+
+
+def _cooldown_block_log_reset(fid: int, tid: int) -> None:
+    """v10.115: forget throttle state for a team (cooldown passed / fresh
+    signal spell) — the first block line of a new spell logs immediately."""
+    for _d in (_cooldown_block_log_last, _cooldown_block_log_suppressed):
+        for _k in [k for k in _d if k[0] == fid and k[1] == tid]:
+            del _d[_k]
+
 _poisson_calibration: dict[str, dict] = {}  # v10.49: league|source -> accumulator
 
 # --- v10.60: FIELD-AVAILABILITY CENSUS (LOGGING ONLY) ---
@@ -793,7 +832,7 @@ _goalburst_count_date: str | None = None
 # report file was produced, so a dead report retries instead of being
 # silently skipped (the nightly v10.97 Accuracy Report was dead on
 # systemd boxes — nobody has seen it since the systemd move).
-BOT_VERSION = "v10.114"
+BOT_VERSION = "v10.115"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -16108,13 +16147,21 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     )
                     # Don't clear cooldown polls — still track, but allow THIS signal
                 elif not _cd_qualified:
-                    log.info(
-                        f"  COOLDOWN BLOCK: {tname} {tier} at {minute}' — "
-                        f"GPS={gps:.0f} SOT={sot} sig#{sig_count}, "
-                        f"pressure never dropped below {SIGNAL_COOLDOWN_GPS_FLOOR} "
-                        f"for {SIGNAL_COOLDOWN_POLLS}+ polls (cd={_cd_polls}) "
-                        f"(fixture {fid})"
+                    # v10.115: throttle the LOG line only (see
+                    # COOLDOWN_BLOCK_LOG_EVERY) — the ledger write below
+                    # keeps FULL fidelity on every poll.
+                    _allow, _supp = _cooldown_block_log_allow(
+                        (fid, tid, tier, sig_count), time.time()
                     )
+                    if _allow:
+                        log.info(
+                            f"  COOLDOWN BLOCK: {tname} {tier} at {minute}' — "
+                            f"GPS={gps:.0f} SOT={sot} sig#{sig_count}, "
+                            f"pressure never dropped below {SIGNAL_COOLDOWN_GPS_FLOOR} "
+                            f"for {SIGNAL_COOLDOWN_POLLS}+ polls (cd={_cd_polls})"
+                            + (f" [{_supp} more suppressed]" if _supp else "")
+                            + f" (fixture {fid})"
+                        )
                     _track_blocked_candidate(
                         fid, tid, tname, league, minute, tier, "COOLDOWN",
                         gps, sot, ib_ratio, sh, sa, is_home_team, ml_score=ml_score,
@@ -16129,6 +16176,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     # Clear cooldown — team is now re-qualified, next repeat
                     # will need another drop-rebuild cycle.
                     del team_cooldown_polls[(fid, tid)]
+                    # v10.115: fresh spell — a later block line logs at once
+                    _cooldown_block_log_reset(fid, tid)
 
         # --- v9.5.8: First-signal-only on busy days ---
         # v10.19.3: Exception override — if pressure is EXPLODING after the 1st signal,
@@ -18194,6 +18243,13 @@ def main():
         "exotics OVERWRITE the true 1X2 (Sep 12-14 ledgers: implied sums "
         "0.45-0.78, none sane — dog flags from that window are suspect)"
     )
+    log.info(
+        "v10.115 COOLDOWN LOG THROTTLE: identical COOLDOWN BLOCK lines are "
+        "rate-limited to one per team/tier/signal# per 2 min, the suppressed "
+        "count rides the next line as [N more suppressed] (Sep 15 Genoa "
+        "half-time echo printed 40+ identical lines at 15s cadence). "
+        "Logging only — the blocked-outcomes ledger keeps full fidelity."
+    )
     log.info("=" * 60)
     log.info(
         f"v10.103 PRICE GATE active: floor {PRICE_FLOOR:.2f} \u2014 "
@@ -18725,6 +18781,10 @@ def main():
                         _goal_stats_ts.clear()
                         _goal_stats_recorded.clear()
                         goal_priority_until.clear()
+                        # v10.115: cooldown-block log throttle state (new day
+                        # = new fixtures; stale keys never linger)
+                        _cooldown_block_log_last.clear()
+                        _cooldown_block_log_suppressed.clear()
 
             # --- Fetch daily schedule (1 call/day, re-fetches on date change) ---
             has_matches = fetch_daily_active_hours(client)
