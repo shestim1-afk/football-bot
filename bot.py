@@ -683,6 +683,24 @@ _gb_alert_last: dict[int, float] = {}  # v10.90: fid -> wall-time of last LIVE b
 _goalburst_count_today: int = 0            # v10.76: daily cap counter
 _goalburst_count_date: str | None = None
 
+# v10.116: BOX-EDGE SHADOW — box-dominance stamps on every signal record.
+# Backtest (Sep 12-15, 162 resolved signals, 7.8k team-minutes): teams LOSING
+# the box-shot battle (own-opp <= -1, or share < 40%) hit just 18% full-window
+# vs 69% for dominant (>= +5); at GPS 75+ a >= 70% share DOUBLES the 15' rate.
+# Offside spike (>= 2 in 10') = 37.5% vs 25.6% inside the same GPS band.
+# RESEARCH ONLY — stamps + a log line at signal time; the signal itself,
+# tiers, gates and Telegram output are untouched. The EOD report grades the
+# would-veto counterfactual nightly; live vetoing is a SEPARATE future change
+# gated on n >= 50 stamped signals per bucket and a >= 20pp full-WR gap held
+# across >= 2 match-weeks.
+BOXEDGE_VETO_IB_DOM = -1       # own - opp shots-in-box at/below = would-veto
+BOXEDGE_VETO_IB_SHARE = 0.40   # box-shot share below (needs >= 2 total) = would-veto
+BOXEDGE_BOOST_IB_DOM = 5       # own - opp at/above = boost candidate
+BOXEDGE_BOOST_IB_SHARE = 0.85  # share at/above = boost candidate
+BOXEDGE_OFFSIDE_SPIKE = 2      # own offsides in last 10' at/above = near-miss resonance
+BOXEDGE_OPP_PRESS_GPS = 70     # opp GPS at/above while we lead/level = sit-deep veto candidate
+_boxedge_offsides_hist: dict[tuple, list[tuple[int, int]]] = {}  # (fid,tid) -> [(minute, offsides)]
+
 # --- v10: Bot Version (module-level so all functions can access it) ---
 # v10.79 — SCORER STAMPING: the FT resolver now keeps the goal-scorer names
 # already present in the /fixtures/events payloads it fetches anyway
@@ -832,7 +850,7 @@ _goalburst_count_date: str | None = None
 # report file was produced, so a dead report retries instead of being
 # silently skipped (the nightly v10.97 Accuracy Report was dead on
 # systemd boxes — nobody has seen it since the systemd move).
-BOT_VERSION = "v10.115"
+BOT_VERSION = "v10.116"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -3726,6 +3744,10 @@ def cleanup_state(live_fixture_ids: set[int]):
     for _k in list(_goalburst_fired):
         if _k[0] not in live_fixture_ids:
             del _goalburst_fired[_k]
+    # v10.116: purge BOX-EDGE offsides history for finished fixtures
+    for _k in list(_boxedge_offsides_hist):
+        if _k[0] not in live_fixture_ids:
+            del _boxedge_offsides_hist[_k]
 
 
 def find_cached_fixture(fid: int):
@@ -5393,6 +5415,26 @@ def _evaluate_fl_shadow(fid: int, tid: int, m: int, tname: str, hist: list[tuple
     try:
         # Minute window
         if not (21 <= m <= 80):
+            return
+
+        # v10.116: REPLAY GUARD — the events feed re-delivers the whole match
+        # on every fetch. When _fl_seen_sot_count resets (restart, or a
+        # truncated response tripping the re-order reset at the call site)
+        # every OLD shot counts as new and re-fires alerts minutes behind
+        # play (Sep 15 23:39: Fiorentina 40' replayed at live 77' — five
+        # duplicates in one burst; Real Madrid 33' re-sent 3h late at 23:06).
+        # A legitimate trigger leads the clock by <= ~3'; anything > 5'
+        # behind the fixture's live elapsed minute is replay noise — skip
+        # BOTH the alert and the shadow record (duplicates would inflate the
+        # Phase-2 promotion stats). Fail-open: no elapsed info = no guard.
+        _fx116 = find_cached_fixture(fid)
+        try:
+            _el116 = safe_int(str(
+                (((_fx116 or {}).get("fixture", {}) or {}).get("status", {}) or {}).get("elapsed", 0) or 0)
+            )
+        except Exception:
+            _el116 = 0
+        if _el116 and (_el116 - m) > 5:
             return
 
         # Daily cap + date rollover
@@ -15045,6 +15087,15 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             minute=minute, prev_state=None, gps_history=[], possession=0,
         )
 
+        if offsides is not None:
+            _oh116 = _boxedge_offsides_hist.setdefault((fid, tid), [])
+            if _oh116 and _oh116[-1][0] == minute:
+                _oh116[-1] = (minute, int(offsides))
+            else:
+                _oh116.append((minute, int(offsides)))
+            if len(_oh116) > 30:
+                del _oh116[: len(_oh116) - 30]
+
         # v10.36/v10.59: POST-GOAL DETECTION STATE — fetch previous goals and
         # goal minute BEFORE the gates (moved up in v10.59; nothing modifies
         # team_state between here and the goal-detection logic below).
@@ -16995,6 +17046,35 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             _dog_state_final = "winning" if _deficit_final < 0 else "chasing"
         # v10.44q: Compute previous signal time for time_since_prev_signal field
         _prev_sig_time = team_sig.get("last_signal_time", 0) if team_sig else 0
+
+        # v10.116: BOX-EDGE SHADOW stamps — research only, NEVER gates the
+        # signal (see BOXEDGE_* constants for the backtest + promotion rule).
+        _be_ib = shots_inside_box or 0
+        _be_oib = _opp_shots_inside_box or 0
+        _be_dom = _be_ib - _be_oib
+        _be_share = (_be_ib / (_be_ib + _be_oib)) if (_be_ib + _be_oib) >= 2 else None
+        _be_off10 = None
+        if offsides is not None:
+            for _m116, _v116 in reversed(_boxedge_offsides_hist.get((fid, tid), [])):
+                if _m116 <= minute - 10:
+                    _be_off10 = int(offsides) - _v116
+                    break
+        _be_xgdebt = round(xg_value - goals_now, 2) if xg_value is not None else None
+        _be_veto = (_be_dom <= BOXEDGE_VETO_IB_DOM) or (
+            _be_share is not None and _be_share < BOXEDGE_VETO_IB_SHARE)
+        _be_boost = (_be_dom >= BOXEDGE_BOOST_IB_DOM) or (
+            _be_share is not None and _be_share >= BOXEDGE_BOOST_IB_SHARE)
+        _be_opppress = bool(_opp_gps is not None and _opp_gps >= BOXEDGE_OPP_PRESS_GPS
+                            and goals_now >= opp_goals)
+        log.info(
+            f"  v10.116 BOX-EDGE SHADOW: {tname} {tier} {minute}' — "
+            f"{'WOULD-VETO' if _be_veto else 'BOOST' if _be_boost else 'KEEP'} | "
+            f"box {_be_ib}-{_be_oib} (dom {_be_dom:+d}"
+            + (f", share {_be_share * 100:.0f}%" if _be_share is not None else "")
+            + f") off10={_be_off10 if _be_off10 is not None else 'n/a'} "
+            f"xgdebt={_be_xgdebt if _be_xgdebt is not None else 'n/a'} "
+            f"oppGPS={_opp_gps:.0f} — research only, never gates"
+        )
         signal_outcomes.append({
             "fixture_id": fid,
             "team_id": tid,
@@ -17061,6 +17141,15 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "hit_grade": _grade_final_word,  # v10.95: A-GRADE / BET / NO-BET (ladder word)
             "hit_pct": _hit_pct_final,  # v10.95: the printed ladder % (ledger-grade)
             "dog_state": _dog_state_final,  # v10.95: winning / chasing / None
+            # v10.116: BOX-EDGE SHADOW stamps (research only — the EOD grades
+            # the would-veto counterfactual; promotion rule at BOXEDGE_* consts)
+            "ib_dom": _be_dom,
+            "ib_share": round(_be_share, 3) if _be_share is not None else None,
+            "offside_delta_10": _be_off10,
+            "xg_debt": _be_xgdebt,
+            "opp_press_while_leading": _be_opppress,
+            "boxedge_would_veto": _be_veto,
+            "boxedge_boost": _be_boost,
             "goals_at_signal": goals_now,
             "opponent_goals_at_signal": opp_goals,
             "is_home": is_home_sg,
@@ -18249,6 +18338,15 @@ def main():
         "count rides the next line as [N more suppressed] (Sep 15 Genoa "
         "half-time echo printed 40+ identical lines at 15s cadence). "
         "Logging only — the blocked-outcomes ledger keeps full fidelity."
+    )
+    log.info(
+        "v10.116 BOX-EDGE SHADOW + FAST-LANE REPLAY GUARD: every signal "
+        "record is stamped with box-shot dominance (dom/share), 10' offside "
+        "delta, xG debt and opp-press context — RESEARCH ONLY, never gates; "
+        "EOD grades the would-veto counterfactual nightly (Sep 12-15 "
+        "backtest: losing-box 18% full vs dominant 69%). Fast-lane events "
+        ">5' behind the live clock are now skipped — restart/HT replays "
+        "re-sent a 40' alert at live 77' five times (Sep 15 23:39)."
     )
     log.info("=" * 60)
     log.info(
