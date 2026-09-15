@@ -527,6 +527,31 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
             lines.append(f"  GPS {label}: {gh}/{g} ({gh/g*100:.0f}%) @ {go:.2f} impl {gi:.1%} "
                           f"edge {ge:+.1%} ROI {gp:+.1f}%")
 
+    # --- v10.114: SHADOW LEAGUES — trial leagues (logged, never sent) ---
+    # Austria / Switzerland / Norway / Sweden signals carry shadow_league=True
+    # in the ledger; this section grades them nightly so promotion is a data
+    # decision (n>=15 & WR>=65% at live prices), never a guess.
+    shadow = [e for e in resolved if e.get("shadow_league")]
+    if shadow:
+        lines.append("")
+        lines.append("=== SHADOW LEAGUES (trial — signals logged, NOT sent) ===")
+        by_lg: dict[str, list[dict]] = {}
+        for e in shadow:
+            by_lg.setdefault(e.get("league", "?"), []).append(e)
+        for lg, es in sorted(by_lg.items(), key=lambda kv: -len(kv[1])):
+            h = hit_count(es, "outcome_full")
+            n = len(es)
+            live_n = sum(
+                1 for e in es
+                if e.get("odds_source") in ("live", "oddsapi_live")
+            )
+            lines.append(
+                f"  {lg}: {h}/{n} ({100 * h / n:.0f}%) full-match | "
+                f"{live_n}/{n} live-priced | promote at n>=15 & WR>=65%"
+            )
+        lines.append("  (paper signals accumulate conversion stats here;")
+        lines.append("   flip the league out of SHADOW_LEAGUES to start sending)")
+
     # --- Individual signal details ---
     lines.append("")
     lines.append("=== SIGNAL DETAILS ===")
