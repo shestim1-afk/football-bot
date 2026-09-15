@@ -470,6 +470,38 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                           f"avg RR {avg(group, 'recency_ratio'):.2f} "
                           f"GPS {avg(group, 'gps'):.0f}")
 
+    # --- v10.116: BOX-EDGE SHADOW (research only — signals are never gated) ---
+    # Backtest basis (Sep 12-15, 162 resolved signals): losing the box-shot
+    # battle hit 18% full-window vs 69% for box-dominant signals. This section
+    # regrades that counterfactual on LIVE stamps every night; the live veto
+    # is a separate future change (n >= 50 stamped per bucket, >= 20pp full-WR
+    # gap held across >= 2 match-weeks).
+    stamped = [e for e in resolved if e.get("boxedge_would_veto") is not None]
+    if stamped:
+        def _wr2(g: list[dict]) -> str:
+            if not g:
+                return "n/a yet"
+            return (f"full {wr(hit_count(g, 'outcome_full'), len(g))} | "
+                    f"15m {wr(hit_count(g, 'outcome_15min'), len(g))}")
+        veto = [e for e in stamped if e.get("boxedge_would_veto")]
+        kept = [e for e in stamped if not e.get("boxedge_would_veto")]
+        boost = [e for e in stamped if e.get("boxedge_boost")]
+        offspike = [e for e in stamped if (e.get("offside_delta_10") or 0) >= 2]
+        opplead = [e for e in stamped if e.get("opp_press_while_leading")]
+        lines.append("")
+        lines.append("=== BOX-EDGE SHADOW (v10.116 — research only, never gated) ===")
+        lines.append(f"  Stamped signals: {len(stamped)} (stamps began with v10.116)")
+        lines.append(f"  would-VETO (dom<=-1 or share<40%): {_wr2(veto)}")
+        lines.append(f"  kept (rest):                    {_wr2(kept)}")
+        lines.append(f"  BOOST (dom>=+5 or share>=85%):  {_wr2(boost)}")
+        lines.append(f"  offside spike >=2 in 10':       {_wr2(offspike)}")
+        lines.append(f"  opp pressing, we lead/level:   {_wr2(opplead)}")
+        lines.append("  LIVE-VETO RULE: promote only after >=50 veto-stamped signals")
+        lines.append("  AND a >=20pp full-WR gap (veto vs kept) held across 2+ weeks")
+    else:
+        lines.append("")
+        lines.append("=== BOX-EDGE SHADOW: no stamped signals yet (v10.116 field) ===")
+
     # --- v10.36: Market / EV analysis (v10.48: chat-safe wording) ---
     # v10.77: P&L-GRADE filter — grade ONLY genuine live prices.
     # prematch_fallback stale prices (the Sep-4/Sep-6 garbage class that
