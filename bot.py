@@ -701,6 +701,40 @@ BOXEDGE_OFFSIDE_SPIKE = 2      # own offsides in last 10' at/above = near-miss r
 BOXEDGE_OPP_PRESS_GPS = 70     # opp GPS at/above while we lead/level = sit-deep veto candidate
 _boxedge_offsides_hist: dict[tuple, list[tuple[int, int]]] = {}  # (fid,tid) -> [(minute, offsides)]
 
+# v10.117: RATIO-TRIAL LIVE — three tagged trial alerts + signal stamps
+# from the Sep 12-15 ratio lab (47,611 polls, 7,526-row minute panel).
+#   OFFSIDE-PRESSURE: own offsides added in last 10' >= 2 -> 57% the team
+#     scores within 15' (baseline 21%, CI95 [45,67], 14 fixtures; 84% in
+#     the GPS<60 stratum — the pre-shot pressure phase GPS cannot see).
+#   CARD-RADAR: (a) foul debt — own fouls since own last yellow >= 5 ->
+#     37% own YC within 15' (>=6 -> 43%); (b) lead-protect — leading by
+#     1-2 past 60' -> 36% (leaders card MORE than chasers; foul VELOCITY
+#     itself is flat noise — role and debt are the signal).
+#   CORNER-CLUSTER: own corners added in last 10' >= 3 -> 34% two or more
+#     further corners within 15' AND 59% next SOT (corner engine).
+# All stats-poll derived (ZERO API cost), tagged as trials, capped, minute-
+# deduped, resolved like shadows, graded separately at EOD. They NEVER gate
+# or alter standard signals. Rollback = RATIOTRIAL_LIVE_MODE=False.
+# Promotion rule (same discipline as BOX-EDGE / fast-lane Phase-2):
+# >= 50 records per trigger AND a held edge across 2+ match-weeks.
+RATIO_TRIAL_FILE = os.path.join(_VOLUME_DIR, "ratio_trial.jsonl")  # v10.117
+ratio_trial_shadow: list[dict] = []   # v10.117: trial alert records
+RATIOTRIAL_LIVE_MODE = True           # v10.117: send tagged live alerts
+RATIOTRIAL_DAILY_CAP = 30             # combined spam guard
+RATIOTRIAL_TYPE_CAP = 12              # per-trigger-type spam guard
+RATIOTRIAL_OFFPRESS_MIN = 2           # offsides added in 10' at/above = fire
+RATIOTRIAL_CARD_DEBT = 5              # fouls since last own YC at/above = fire
+RATIOTRIAL_CORNER_VEL = 3             # corners added in 10' at/above = fire
+_ratio117_corners_hist: dict[tuple, list[tuple[int, int]]] = {}
+_ratio117_sot_hist: dict[tuple, list[tuple[int, int]]] = {}
+_ratio117_fouls_hist: dict[tuple, list[tuple[int, int]]] = {}
+_ratio117_yc_hist: dict[tuple, list[tuple[int, int]]] = {}
+_ratio117_oppsv_hist: dict[tuple, list[tuple[int, int]]] = {}
+_ratio117_fired: dict[tuple, int] = {}   # (fid,tid,trigger) -> last fired game-minute
+_ratio117_sent_today: int = 0
+_ratio117_type_sent: dict[str, int] = {}
+_ratio117_sent_date: str | None = None
+
 # --- v10: Bot Version (module-level so all functions can access it) ---
 # v10.79 — SCORER STAMPING: the FT resolver now keeps the goal-scorer names
 # already present in the /fixtures/events payloads it fetches anyway
@@ -850,7 +884,19 @@ _boxedge_offsides_hist: dict[tuple, list[tuple[int, int]]] = {}  # (fid,tid) -> 
 # report file was produced, so a dead report retries instead of being
 # silently skipped (the nightly v10.97 Accuracy Report was dead on
 # systemd boxes — nobody has seen it since the systemd move).
-BOT_VERSION = "v10.116"
+# v10.117 — RATIO-TRIAL LIVE (offside-pressure / card-radar / corner-
+# cluster): three tagged live trial alerts derived purely from the stats
+# polls (zero API cost) plus five new research stamps on every signal
+# record (corner velocity, foul debt, conversion debt, opp-GK save storm,
+# lead protection). Backtested on the Sep 12-15 ratio lab (47,611 polls,
+# 7,526-row minute panel): offside push >=2/10' -> 57% goal-in-15';
+# foul debt >=5 -> 37% next card; lead-protect 1-2 & 60'+ -> 36%;
+# corner velocity >=3/10' -> 34% 2+ more corners + 59% next SOT.
+# Trials are capped (30/day combined, 12/type), minute-deduped, persisted
+# to ratio_trial.jsonl, resolved like shadows (goal-type records get the
+# FT event-minute correction), and graded nightly by the EOD report.
+# They NEVER gate standard signals. Rollback = RATIOTRIAL_LIVE_MODE=False.
+BOT_VERSION = "v10.117"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -3748,6 +3794,15 @@ def cleanup_state(live_fixture_ids: set[int]):
     for _k in list(_boxedge_offsides_hist):
         if _k[0] not in live_fixture_ids:
             del _boxedge_offsides_hist[_k]
+    # v10.117: purge RATIO-TRIAL histories + fired-dedupe for finished fixtures
+    for _k in list(_ratio117_corners_hist):
+        if _k[0] not in live_fixture_ids:
+            del _ratio117_corners_hist[_k]
+    for _d117 in (_ratio117_sot_hist, _ratio117_fouls_hist, _ratio117_yc_hist,
+                  _ratio117_oppsv_hist, _ratio117_fired):
+        for _k in list(_d117):
+            if _k[0] not in live_fixture_ids:
+                del _d117[_k]
 
 
 def find_cached_fixture(fid: int):
@@ -4121,6 +4176,7 @@ _REDEPLOY_JSONL_FILES: list[str] = [
     "signal_outcomes.jsonl", "pressure_polls.jsonl", "blocked_outcomes.jsonl",
     "fastlane_shadow.jsonl", "goal_flash.jsonl", "surge_watch.jsonl",
     "boxburst_shadow.jsonl", "goalburst_shadow.jsonl",
+    "ratio_trial.jsonl",  # v10.117
 ]
 _REDEPLOY_JSON_FILES: list[str] = [
     "poisson_calibration.json", "field_census.json", "sot_feed_census.json",
@@ -5633,6 +5689,404 @@ def rewrite_fastlane_file() -> None:
         log.warning(f"v10.50: Failed to rewrite fast-lane shadow file: {e}")
 
 
+# ============================================================================
+# v10.117: RATIO-TRIAL — offside-pressure / card-radar / corner-cluster.
+# Stats-poll derived live trials (ZERO API cost). Records ALWAYS go to the
+# ratio_trial.jsonl ledger; the tagged Telegram send is capped separately
+# (v10.101 fast-lane discipline). Never gates standard signals.
+# ============================================================================
+
+def _load_ratio_trial() -> list[dict]:
+    """v10.117: Load ratio-trial records from JSONL (survives restarts)."""
+    entries: list[dict] = []
+    if not os.path.exists(RATIO_TRIAL_FILE):
+        return entries
+    try:
+        with open(RATIO_TRIAL_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception as e:
+        log.warning(f"v10.117: Failed to load ratio-trial file: {e}")
+    return entries
+
+
+def rewrite_ratio_trial_file() -> None:
+    """v10.117: Rewrite ratio-trial JSONL after in-place resolution updates.
+
+    Same merge discipline as rewrite_fastlane_file(): disk entries are the
+    base, in-memory entries override (they carry updated resolution status).
+    Key includes trial_type — two different triggers can fire on the SAME
+    poll (e.g. card_debt + corner_cluster) and two successive time.time()
+    calls may return an identical float; without trial_type one of the two
+    records would be silently dropped on every rewrite.
+    """
+    try:
+        disk_entries: dict[tuple, dict] = {}
+        if os.path.exists(RATIO_TRIAL_FILE):
+            with open(RATIO_TRIAL_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        key = (obj.get("fixture_id"), obj.get("team_id"),
+                               obj.get("trial_type"), obj.get("trial_time"))
+                        if None not in key:
+                            disk_entries[key] = obj
+                    except Exception:
+                        continue
+        for entry in ratio_trial_shadow:
+            key = (entry.get("fixture_id"), entry.get("team_id"),
+                   entry.get("trial_type"), entry.get("trial_time"))
+            if None not in key:
+                disk_entries[key] = entry
+        tmp = RATIO_TRIAL_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            for entry in disk_entries.values():
+                f.write(json.dumps(entry, default=str) + "\n")
+        os.replace(tmp, RATIO_TRIAL_FILE)
+    except Exception as e:
+        log.warning(f"v10.117: Failed to rewrite ratio-trial file: {e}")
+
+
+def _rt117_hist_append(hist: dict, key: tuple, minute: int, value) -> None:
+    """v10.117: Append (minute, value) with same-minute replace + 30 cap.
+
+    None values (dead API field) are skipped entirely — histories only
+    exist where the feed actually delivers the counter.
+    """
+    if value is None:
+        return
+    h = hist.setdefault(key, [])
+    if h and h[-1][0] == minute:
+        h[-1] = (minute, int(value))
+    else:
+        h.append((minute, int(value)))
+    if len(h) > 30:
+        del h[: len(h) - 30]
+
+
+def _rt117_delta10(hist: dict, key: tuple, minute: int, now_val) -> int | None:
+    """v10.117: now_val minus the counter value ~10' ago (None-safe)."""
+    if now_val is None:
+        return None
+    for m, v in reversed(hist.get(key, [])):
+        if m <= minute - 10:
+            return int(now_val) - v
+    return None
+
+
+def _rt117_fouls_since_card(fid: int, tid: int, minute: int, fouls_now) -> int | None:
+    """v10.117: own fouls committed since the own last yellow card.
+
+    No card seen in the tracked window -> total fouls so far (debt from
+    kickoff — honest approximation, polls cover the match from ~15').
+    Minute-bounded (cards/polys after `minute` are ignored) so the stamp
+    stays correct even if called with a historical minute.
+    """
+    if fouls_now is None:
+        return None
+    key = (fid, tid)
+    yh = [e for e in _ratio117_yc_hist.get(key, []) if e[0] <= minute]
+    last_card_m = None
+    for i in range(len(yh) - 1, 0, -1):
+        if yh[i][1] > yh[i - 1][1]:
+            last_card_m = yh[i][0]
+            break
+    if last_card_m is None and yh and yh[0][1] > 0:
+        last_card_m = yh[0][0]
+    if last_card_m is None:
+        return int(fouls_now)
+    for m, v in reversed(_ratio117_fouls_hist.get(key, [])):
+        if m <= last_card_m:
+            return int(fouls_now) - v
+    return int(fouls_now)
+
+
+def _ratio117_stamps(fid: int, tid: int, minute: int, corners, fouls,
+                     opp_gk_saves, sot, goals_now, opp_goals) -> dict:
+    """v10.117: RATIO stamps for signal records (research only, never gates).
+
+    offside push is NOT repeated here — v10.116 BOX-EDGE already stamps it
+    as offside_delta_10 (same number, same window).
+    """
+    return {
+        "corner_vel_10": _rt117_delta10(_ratio117_corners_hist, (fid, tid), minute, corners),
+        "fouls_since_card": _rt117_fouls_since_card(fid, tid, minute, fouls),
+        "conversion_debt": (
+            int(sot) - int(goals_now)
+            if sot is not None and goals_now is not None else None
+        ),
+        "save_storm_10": _rt117_delta10(_ratio117_oppsv_hist, (fid, tid), minute, opp_gk_saves),
+        "lead_protect_60": bool(
+            opp_goals is not None
+            and (int(goals_now) - int(opp_goals)) in (1, 2)
+            and minute >= 60
+        ),
+    }
+
+
+def _evaluate_ratio_trials(client: httpx.Client | None, fid: int, tid: int,
+                           tname: str, league: str, minute: int, gps,
+                           offsides, corners, fouls, yellow_cards,
+                           opp_gk_saves, sot, team_goals, opp_goals,
+                           is_home: bool) -> None:
+    """v10.117: RATIO-TRIAL evaluator — runs on every stats poll.
+
+    1. Updates per-team counter histories (corners / SOT / fouls / YC /
+       opp GK saves; offsides already tracked by v10.116 BOX-EDGE).
+    2. Live-resolves pending trial records for this team from counter
+       deltas (goal-type records finalize in check_fastlane_shadow's FT
+       goal-events pass — the v10.66 minute correction applies there).
+    3. Fires the three trial alerts (deduped by game-minute, capped,
+       tagged). All failures swallowed — never breaks the poll loop.
+    """
+    global _ratio117_sent_today, _ratio117_sent_date, _ratio117_type_sent
+    try:
+        key = (fid, tid)
+
+        # --- 1. histories (restart = empty = fail-safe, nothing fires) ---
+        # offsides history is SHARED with v10.116 BOX-EDGE (same-minute
+        # replace makes this append idempotent with the process_fixture_stats
+        # update — order-independent, single entry per minute either way)
+        _rt117_hist_append(_boxedge_offsides_hist, key, minute, offsides)
+        _rt117_hist_append(_ratio117_corners_hist, key, minute, corners)
+        _rt117_hist_append(_ratio117_sot_hist, key, minute, sot)
+        _rt117_hist_append(_ratio117_fouls_hist, key, minute, fouls)
+        _rt117_hist_append(_ratio117_yc_hist, key, minute, yellow_cards)
+        _rt117_hist_append(_ratio117_oppsv_hist, key, minute, opp_gk_saves)
+
+        # --- 2. live resolution of this team's pending records ---
+        any_updated = False
+        for entry in ratio_trial_shadow:
+            if (entry.get("fixture_id") != fid or entry.get("team_id") != tid
+                    or entry.get("resolved") or entry.get("outcome_15min") is not None):
+                continue
+            mins_since = minute - entry["game_minute"]
+            if mins_since <= 0:
+                continue
+            ttype = entry.get("trial_type")
+            if ttype == "offside_pressure":
+                cur, at = (team_goals or 0), (entry.get("goals_at") or 0)
+            elif ttype in ("card_debt", "card_lead_protect"):
+                cur = yellow_cards if yellow_cards is not None else entry.get("yc_at")
+                at = entry.get("yc_at")
+            else:  # corner_cluster
+                cur = corners if corners is not None else entry.get("corners_at")
+                at = entry.get("corners_at")
+            if cur is None or at is None:
+                continue
+            if int(cur) > int(at) and mins_since <= 15:
+                entry["outcome_15min"] = "HIT"
+                entry["hit_minute"] = minute
+            elif mins_since > 15:
+                entry["outcome_15min"] = "MISS"
+            if entry.get("outcome_15min") is not None:
+                # secondary research outcomes: exact added counts in window
+                entry["goals_added_15"] = (team_goals or 0) - (entry.get("goals_at") or 0)
+                entry["yc_added_15"] = (
+                    (yellow_cards if yellow_cards is not None else (entry.get("yc_at") or 0))
+                    - (entry.get("yc_at") or 0)
+                )
+                entry["corners_added_15"] = (
+                    (corners if corners is not None else (entry.get("corners_at") or 0))
+                    - (entry.get("corners_at") or 0)
+                )
+                entry["sot_added_15"] = (
+                    (sot if sot is not None else (entry.get("sot_at") or 0))
+                    - (entry.get("sot_at") or 0)
+                )
+                if ttype != "offside_pressure":
+                    # goal-type records wait for the FT goal-events pass
+                    # (v10.66 event-minute correction); counter types are
+                    # final the moment their window closes
+                    entry["resolved"] = True
+                any_updated = True
+                if entry["outcome_15min"] == "HIT":
+                    log.info(
+                        f"  v10.117 RATIO-TRIAL HIT: {tname} [{ttype}] at "
+                        f"{entry['game_minute']}' landed by {minute}' [{league}]"
+                    )
+        if any_updated:
+            rewrite_ratio_trial_file()
+
+        # --- 3. triggers ---
+        if not (15 <= minute <= 80):
+            return
+        _gps_txt = f"{gps:.0f}" if gps is not None else "?"
+        _today = time.strftime("%Y-%m-%d")
+        if _ratio117_sent_date != _today:
+            _ratio117_sent_date = _today
+            _ratio117_sent_today = 0
+            _ratio117_type_sent = {}
+
+        def _rt117_fire(ttype: str, extra: dict, msg_lines: list[str], cooldown: int) -> None:
+            # nested closure assigns the daily counters -> own global decl
+            # (without it Python scopes them locally -> UnboundLocalError)
+            global _ratio117_sent_today, _ratio117_type_sent
+            last = _ratio117_fired.get((fid, tid, ttype))
+            if last is not None and (minute - last) < cooldown:
+                return
+            _sc = (
+                "leading" if (team_goals or 0) > (opp_goals or 0)
+                else "drawing" if (team_goals or 0) == (opp_goals or 0)
+                else "chasing"
+            )
+            rec = {
+                "trial_time": time.time(),
+                "trial_clock": time.strftime("%Y-%m-%d %H:%M"),
+                "fixture_id": fid, "team_id": tid, "team_name": tname,
+                "league": league, "game_minute": minute,
+                "trial_type": ttype,
+                "gps": round(float(gps), 1) if gps is not None else None,
+                "is_home": bool(is_home),
+                # v10.117: fast-lane-compatible fields so the FT goal-events
+                # walk (check_fastlane_shadow) resolves offside_pressure
+                # records for free (goals_at_shadow / outcome_* / resolved)
+                "goals_at_shadow": team_goals or 0,
+                "goals_at": team_goals or 0, "opp_goals_at": opp_goals or 0,
+                "yc_at": yellow_cards, "fouls_at": fouls,
+                "corners_at": corners, "sot_at": sot,
+                "offsides_at": offsides, "opp_saves_at": opp_gk_saves,
+                "scoreline": _sc,
+                "outcome_5min": None, "outcome_10min": None, "outcome_15min": None,
+                "outcome_full": None, "goal_minute_5": None,
+                "goal_minute_10": None, "goal_minute_15": None,
+                "goal_minute_full": None,
+                "resolved": False, "version": BOT_VERSION, "sent_live": False,
+            }
+            rec.update(extra)
+            ratio_trial_shadow.append(rec)
+            _ratio117_fired[(fid, tid, ttype)] = minute
+            # capped live send — record always, send subject to caps
+            sent = False
+            if RATIOTRIAL_LIVE_MODE and client is not None:
+                try:
+                    if (_ratio117_sent_today < RATIOTRIAL_DAILY_CAP
+                            and _ratio117_type_sent.get(ttype, 0) < RATIOTRIAL_TYPE_CAP):
+                        _ratio117_sent_today += 1
+                        _ratio117_type_sent[ttype] = _ratio117_type_sent.get(ttype, 0) + 1
+                        sent = True
+                        send_telegram(client, "\n".join(msg_lines))
+                except Exception as e117:
+                    sent = False
+                    log.warning(f"  v10.117 ratio-trial send failed: {e117}")
+            rec["sent_live"] = sent
+            with open(RATIO_TRIAL_FILE, "a") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+            log.info(
+                f"  v10.117 RATIO-TRIAL: {tname} [{ttype}] {minute}' "
+                f"GPS={round(gps, 0) if gps is not None else '?'} {_sc} "
+                f"{team_goals}-{opp_goals} — "
+                f"{'LIVE (trial)' if sent else 'record only (capped/off)'}"
+            )
+
+        # (a) OFFSIDE-PRESSURE — offsides added in last 10' >= 2
+        _off10 = _rt117_delta10(_boxedge_offsides_hist, key, minute, offsides)
+        if _off10 is not None and _off10 >= RATIOTRIAL_OFFPRESS_MIN:
+            # soft gate: a REAL signal just fired for this team (goal-market
+            # overlap) -> skip, the standard alert already covers it
+            _sig_t = signaled_teams.get((fid, tid))
+            _recent_sig = bool(
+                _sig_t and (time.time() - (_sig_t.get("last_signal_time", 0) or 0)) < 180
+            )
+            if not _recent_sig:
+                _sv10 = _rt117_delta10(_ratio117_oppsv_hist, key, minute, opp_gk_saves)
+                _sc2 = (
+                    "leading" if (team_goals or 0) > (opp_goals or 0)
+                    else "drawing" if (team_goals or 0) == (opp_goals or 0)
+                    else "chasing"
+                )
+                _lines117 = [
+                    f"\U0001f6a9 v10.117 OFFSIDE-PRESSURE (TRIAL) — {tname} {minute}'",
+                    f"{league} | F{fid}",
+                    f"{_off10} offsides in the last 10' — line-breaking pressure",
+                    f"GPS {_gps_txt} | {_sc2} {team_goals}-{opp_goals}",
+                    "Empirical: 57% team scores within 15' (Sep 12-15 lab, n=76)",
+                ]
+                if _sv10 is not None and _sv10 >= 3:
+                    _lines117.append(
+                        f"\u26a0 keeper wall: opp GK +{_sv10} saves in 10' "
+                        "(absorbed surges scored just 2% in the lab)"
+                    )
+                _lines117.append("[trial alert — EOD grades separately; not a standard signal]")
+                _rt117_fire("offside_pressure",
+                            {"offside_push_10": _off10, "save_storm_10": _sv10},
+                            _lines117, cooldown=15)
+
+        # (b) CARD-RADAR — foul debt, else lead-protect (same market, one
+        # alert per poll; priority: debt carries the stronger lab number)
+        _fsc = _rt117_fouls_since_card(fid, tid, minute, fouls)
+        if fouls is not None and _fsc is not None and len(_ratio117_fouls_hist.get(key, [])) >= 3:
+            _gd117 = (team_goals or 0) - (opp_goals or 0)
+            if _fsc >= RATIOTRIAL_CARD_DEBT and minute >= 20:
+                _sc3 = (
+                    "leading" if _gd117 > 0 else "drawing" if _gd117 == 0 else "chasing"
+                )
+                _rt117_fire(
+                    "card_debt",
+                    {"fouls_since_card": _fsc, "gd": _gd117},
+                    [
+                        f"\U0001f7e8 v10.117 CARD-RADAR (TRIAL) — {tname} {minute}'",
+                        f"{league} | F{fid}",
+                        f"Foul debt: {_fsc} fouls since last yellow (ref evens it out)",
+                        f"GPS {_gps_txt} | {_sc3} {team_goals}-{opp_goals}",
+                        "Empirical: 37% next card within 15' (lab n=247, baseline 24%)",
+                        "Market: team cards over / next card",
+                        "[trial alert — EOD grades separately; not a standard signal]",
+                    ],
+                    cooldown=20,
+                )
+            elif _gd117 in (1, 2) and minute >= 60:
+                _rt117_fire(
+                    "card_lead_protect",
+                    {"fouls_since_card": _fsc, "gd": _gd117},
+                    [
+                        f"\U0001f7e8 v10.117 CARD-RADAR (TRIAL) — {tname} {minute}'",
+                        f"{league} | F{fid}",
+                        f"Protecting a {_gd117}-goal lead past 60' — tactical fouling window",
+                        f"GPS {_gps_txt} | leading {team_goals}-{opp_goals} | fouls since card: {_fsc}",
+                        "Empirical: 36% next card within 15' (leaders card MORE than chasers)",
+                        "Market: team cards over / next card",
+                        "[trial alert — EOD grades separately; not a standard signal]",
+                    ],
+                    cooldown=30,
+                )
+
+        # (c) CORNER-CLUSTER — corners added in last 10' >= 3 (early-biased
+        # window: 60-75' clusters died in the lab, so stop at 75')
+        _cv10 = _rt117_delta10(_ratio117_corners_hist, key, minute, corners)
+        if _cv10 is not None and _cv10 >= RATIOTRIAL_CORNER_VEL and minute <= 75:
+            _sc4 = (
+                "leading" if (team_goals or 0) > (opp_goals or 0)
+                else "drawing" if (team_goals or 0) == (opp_goals or 0)
+                else "chasing"
+            )
+            _rt117_fire(
+                "corner_cluster",
+                {"corner_vel_10": _cv10},
+                [
+                    f"\U0001f4d0 v10.117 CORNER-CLUSTER (TRIAL) — {tname} {minute}'",
+                    f"{league} | F{fid}",
+                    f"{_cv10} corners in the last 10' — clusters continue",
+                    f"GPS {_gps_txt} | {_sc4} {team_goals}-{opp_goals}",
+                    "Empirical: 34% 2+ more corners in 15' | 59% next SOT (corner engine)",
+                    "Market: team corners over / next corner",
+                    "[trial alert — EOD grades separately; not a standard signal]",
+                ],
+                cooldown=15,
+            )
+    except Exception as e:
+        log.debug(f"  v10.117 ratio-trial eval error: {e}")
+
+
 def _load_boxburst_shadow() -> list[dict]:
     """v10.75: Load box-burst shadow records from JSONL (survives restarts)."""
     entries: list[dict] = []
@@ -6243,7 +6697,7 @@ def check_fastlane_shadow(fixture: dict, client: httpx.Client = None) -> None:
     banked-goals class) resolve on ANY goal after the crossing minute —
     either team, own goals included (Over-lines settlement semantics).
     """
-    if not fastlane_shadow and not boxburst_shadow and not goalburst_shadow:
+    if not fastlane_shadow and not boxburst_shadow and not goalburst_shadow and not ratio_trial_shadow:
         return
     fid = fixture["fixture"]["id"]
     status = fixture["fixture"]["status"]["short"]
@@ -6262,14 +6716,21 @@ def check_fastlane_shadow(fixture: dict, client: httpx.Client = None) -> None:
     # v10.75: walk BOTH shadow stores (fast-lane v10.50 + box-burst v10.75)
     # with identical semantics — every existing call site resolves both.
     # v10.76: + the goal-burst store (match-level banked-goals records).
+    # v10.117: + the ratio-trial store — ONLY the goal-type records
+    # (offside_pressure) resolve here via goal events / live scoreline;
+    # card & corner records resolve from stats counter deltas on the polls
+    # (_evaluate_ratio_trials) and the EOD ledger pass.
     for _shadow_store, _shadow_kind in (
         (fastlane_shadow, "fast-lane"), (boxburst_shadow, "box-burst"),
-        (goalburst_shadow, "goal-burst"),
+        (goalburst_shadow, "goal-burst"), (ratio_trial_shadow, "ratio-trial"),
     ):
         if not _shadow_store:
             continue
         for entry in _shadow_store:
             if entry["fixture_id"] != fid or entry.get("resolved"):
+                continue
+            if (_shadow_kind == "ratio-trial"
+                    and entry.get("trial_type") != "offside_pressure"):
                 continue
 
             # v10.76: MATCH-LEVEL goal-burst records resolve on ANY goal
@@ -6398,6 +6859,7 @@ def check_fastlane_shadow(fixture: dict, client: httpx.Client = None) -> None:
         rewrite_fastlane_file()
         rewrite_boxburst_file()
         rewrite_goalburst_file()
+        rewrite_ratio_trial_file()  # v10.117
 
 
 def _update_poisson_calibration(entry: dict) -> None:
@@ -15096,6 +15558,19 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             if len(_oh116) > 30:
                 del _oh116[: len(_oh116) - 30]
 
+        # v10.117: RATIO-TRIAL evaluator — histories upkeep, live record
+        # resolution, and the three tagged trial alerts (offside-pressure /
+        # card-radar / corner-cluster). Zero API cost, never gates signals,
+        # all failures swallowed inside.
+        _evaluate_ratio_trials(
+            client, fid, tid, tname, league, minute, gps,
+            offsides=offsides, corners=corners, fouls=fouls,
+            yellow_cards=yellow_cards, opp_gk_saves=_opp_gk_saves,
+            sot=sot, team_goals=team_goals,
+            opp_goals=(sa if is_home_team else sh) or 0,
+            is_home=is_home_team,
+        )
+
         # v10.36/v10.59: POST-GOAL DETECTION STATE — fetch previous goals and
         # goal minute BEFORE the gates (moved up in v10.59; nothing modifies
         # team_state between here and the goal-detection logic below).
@@ -17075,6 +17550,24 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             f"xgdebt={_be_xgdebt if _be_xgdebt is not None else 'n/a'} "
             f"oppGPS={_opp_gps:.0f} — research only, never gates"
         )
+        # v10.117: RATIO stamps — corner velocity, card debt, conversion
+        # debt, opp-GK save storm, lead-protection. RESEARCH ONLY, never
+        # gates; the EOD grades these buckets nightly against the lab
+        # numbers (offside push is already stamped by v10.116 as
+        # offside_delta_10 — same window, same number).
+        _rt117 = _ratio117_stamps(
+            fid, tid, minute, corners=corners, fouls=fouls,
+            opp_gk_saves=_opp_gk_saves, sot=sot,
+            goals_now=goals_now, opp_goals=opp_goals,
+        )
+        log.info(
+            "  v10.117 RATIO STAMPS: "
+            f"corner10={_rt117['corner_vel_10'] if _rt117['corner_vel_10'] is not None else 'n/a'} "
+            f"fsc={_rt117['fouls_since_card'] if _rt117['fouls_since_card'] is not None else 'n/a'} "
+            f"convdebt={_rt117['conversion_debt'] if _rt117['conversion_debt'] is not None else 'n/a'} "
+            f"savestorm={_rt117['save_storm_10'] if _rt117['save_storm_10'] is not None else 'n/a'} "
+            f"leadprotect={_rt117['lead_protect_60']} — research only"
+        )
         signal_outcomes.append({
             "fixture_id": fid,
             "team_id": tid,
@@ -17150,6 +17643,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "opp_press_while_leading": _be_opppress,
             "boxedge_would_veto": _be_veto,
             "boxedge_boost": _be_boost,
+            # v10.117: RATIO stamps (research only — EOD grades the lab-found
+            # ratios on live signals; offside push lives in offside_delta_10)
+            "corner_vel_10": _rt117["corner_vel_10"],
+            "fouls_since_card": _rt117["fouls_since_card"],
+            "conversion_debt": _rt117["conversion_debt"],
+            "save_storm_10": _rt117["save_storm_10"],
+            "lead_protect_60": _rt117["lead_protect_60"],
             "goals_at_signal": goals_now,
             "opponent_goals_at_signal": opp_goals,
             "is_home": is_home_sg,
@@ -18289,6 +18789,7 @@ def main():
     # (same bug class as the v10.50 UnboundLocalError crash).
     global boxburst_shadow, _boxburst_fired, _boxburst_ib_hist, _boxburst_count_today, _boxburst_count_date
     global goalburst_shadow, _goalburst_fired, _goalburst_count_today, _goalburst_count_date  # v10.76
+    global ratio_trial_shadow  # v10.117
     # v10.62: redeploy guard — one-shot tracking check flag (main loop)
     global _redeploy_check_done
     # v10.53: goal-watch state — the daily reset block below assigns these
@@ -18347,6 +18848,18 @@ def main():
         "backtest: losing-box 18% full vs dominant 69%). Fast-lane events "
         ">5' behind the live clock are now skipped — restart/HT replays "
         "re-sent a 40' alert at live 77' five times (Sep 15 23:39)."
+    )
+    log.info(
+        "v10.117 RATIO-TRIAL LIVE: three new tagged trial alerts from the "
+        "Sep 12-15 ratio lab (47,611 polls) — OFFSIDE-PRESSURE (2+ offsides "
+        "in 10' -> 57% goal within 15' in the lab, fires even at GPS<60), "
+        "CARD-RADAR (foul debt >=5 since last yellow -> 37% next card; "
+        "lead-protect 1-2 past 60' -> 36%), CORNER-CLUSTER (3+ corners in "
+        "10' -> 34% 2+ more corners, 59% next SOT). Zero API cost, capped "
+        "30/day, records always written to ratio_trial.jsonl; signals also "
+        "get corner/card-debt/conversion/save-storm stamps. Trials never "
+        "gate standard signals; EOD grades each trigger nightly. Rollback: "
+        "RATIOTRIAL_LIVE_MODE=False."
     )
     log.info("=" * 60)
     log.info(
@@ -18568,6 +19081,24 @@ def main():
             f"v10.76: Loaded {len(_gb_loaded)} goal-burst shadow record(s) "
             f"from {GOALBURST_SHADOW_FILE} ({_gb_resolved} resolved, "
             f"{len(_goalburst_fired)} today-dedupe key(s))"
+        )
+
+    # v10.117: Load ratio-trial records + rebuild the fired-dedupe map for
+    # today's records so a mid-match restart cannot re-fire a trigger that
+    # already fired earlier today (same discipline as box-burst / goal-burst).
+    _rt_loaded = _load_ratio_trial()
+    if _rt_loaded:
+        ratio_trial_shadow = _rt_loaded
+        _today_key = time.strftime("%Y-%m-%d")
+        for _rt_e in _rt_loaded:
+            if str(_rt_e.get("trial_clock", ""))[:10] == _today_key:
+                _ratio117_fired[( _rt_e.get("fixture_id"), _rt_e.get("team_id"),
+                                  _rt_e.get("trial_type"))] = _rt_e.get("game_minute") or 0
+        _rt_resolved = sum(1 for e in _rt_loaded if e.get("resolved"))
+        log.info(
+            f"v10.117: Loaded {len(_rt_loaded)} ratio-trial record(s) "
+            f"from {RATIO_TRIAL_FILE} ({_rt_resolved} resolved, "
+            f"{len(_ratio117_fired)} today-dedupe key(s))"
         )
 
     # v10.44m: Rebuild signaled_teams from file so cooldown works after redeploy
