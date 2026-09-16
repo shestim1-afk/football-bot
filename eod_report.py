@@ -103,6 +103,17 @@ def get_shadow_date_key(entry: dict) -> str:
     return ""
 
 
+def get_ratio_trial_date_key(entry: dict) -> str:
+    """v10.117: Extract YYYY-MM-DD from a ratio_trial entry."""
+    clock = entry.get("trial_clock", "")
+    if clock:
+        return clock[:10]
+    ts = entry.get("trial_time", 0)
+    if ts:
+        return datetime.fromtimestamp(ts, tz=BULGARIA_TZ).strftime("%Y-%m-%d")
+    return ""
+
+
 def filter_by_date(entries: list[dict], target_date: str, date_fn) -> list[dict]:
     """Filter entries to a specific date string YYYY-MM-DD."""
     return [e for e in entries if date_fn(e) == target_date]
@@ -930,6 +941,175 @@ def analyze_fastlane(shadows: list[dict], day_signals: list[dict]) -> list[str]:
 
 
 # ============================================================
+# v10.117: RATIO-TRIAL ANALYSIS (tagged trial alerts — never gate signals)
+# ============================================================
+
+def _rt117_series(day_polls: list[dict]) -> dict:
+    """v10.117: (fid, tid) -> poll list sorted by minute."""
+    series: dict = defaultdict(list)
+    for p in day_polls:
+        fid, tid, m = p.get("fixture_id"), p.get("team_id"), p.get("minute")
+        if fid is None or tid is None or m is None:
+            continue
+        series[(fid, tid)].append(p)
+    for k in series:
+        series[k].sort(key=lambda p: p.get("minute", 0))
+    return series
+
+
+def _rt117_value_at(seq: list[dict], field: str, minute: int) -> int | None:
+    """v10.117: max-smoothed counter value at the latest poll <= minute.
+
+    field='own_goals' resolves the team's own scoreline (goal outcomes).
+    """
+    best = None
+    for p in seq:
+        if p.get("minute", 0) > minute:
+            break
+        if field == "own_goals":
+            v = (p.get("score_home") if p.get("is_home") else p.get("score_away")) or 0
+        else:
+            v = p.get(field)
+        if v is not None:
+            best = v if best is None else max(best, v)
+    return best
+
+
+def _rt117_added(seq: list[dict], field: str, m0: int, m1: int):
+    """v10.117: max-smoothed increase of a counter in (m0, m1].
+
+    Returns (added, covered) — covered=False when the ledger never observes
+    the window tail (bot drops fixtures ~85'), i.e. the outcome is censored.
+    """
+    at0 = _rt117_value_at(seq, field, m0)
+    mx = None
+    for p in seq:
+        pm = p.get("minute", 0)
+        if pm <= m0:
+            continue
+        if pm > m1:
+            break
+        v = ((p.get("score_home") if p.get("is_home") else p.get("score_away")) or 0) \
+            if field == "own_goals" else p.get(field)
+        if v is not None:
+            mx = v if mx is None else max(mx, v)
+    last_m = seq[-1].get("minute", 0) if seq else 0
+    covered = last_m >= m1
+    if at0 is None or mx is None:
+        return (None, covered)
+    return (max(0, mx - at0), covered)
+
+
+def analyze_ratio_trials(trials: list[dict], day_signals: list[dict],
+                         day_polls: list[dict]) -> list[str]:
+    """v10.117: Grade the RATIO-TRIAL alerts + the signal-time ratio stamps.
+
+    Trials are tagged live alerts (offside-pressure / card-radar /
+    corner-cluster) derived from the Sep 12-15 ratio lab. The bot resolves
+    most records live; this pass closes anything still pending from the
+    polls ledger (counter deltas, censored windows reported honestly),
+    then grades per trigger and regrades the signal-stamp buckets nightly
+    against the lab numbers. Promotion to standard signalling needs
+    >= 50 records per trigger AND a held edge across 2+ match-weeks.
+    """
+    lines = ["", "=== v10.117 RATIO-TRIAL (offside-pressure / card-radar / corner-cluster) ==="]
+
+    # --- resolve still-pending records from the polls ledger ---
+    series = _rt117_series(day_polls) if day_polls else {}
+    n_censored = 0
+    for e in trials:
+        if e.get("outcome_15min") is not None:
+            continue
+        seq = series.get((e.get("fixture_id"), e.get("team_id")))
+        if not seq:
+            n_censored += 1
+            continue
+        m0, m1 = e.get("game_minute") or 0, (e.get("game_minute") or 0) + 15
+        ttype = e.get("trial_type")
+        field = {
+            "offside_pressure": "own_goals",
+            "card_debt": "yellow_cards",
+            "card_lead_protect": "yellow_cards",
+            "corner_cluster": "corners",
+        }.get(ttype, "own_goals")
+        added, covered = _rt117_added(seq, field, m0, m1)
+        if not covered or added is None:
+            n_censored += 1
+            continue
+        e["outcome_15min"] = "HIT" if added > 0 else "MISS"
+        e["resolved"] = True
+        # research extras from the ledger close
+        e["goals_added_15"] = _rt117_added(seq, "own_goals", m0, m1)[0] or 0
+        e["yc_added_15"] = _rt117_added(seq, "yellow_cards", m0, m1)[0] or 0
+        e["corners_added_15"] = _rt117_added(seq, "corners", m0, m1)[0] or 0
+        e["sot_added_15"] = _rt117_added(seq, "sot", m0, m1)[0] or 0
+
+    # --- per-trigger grades ---
+    if not trials:
+        lines.append("  no trial records yet (v10.117 field)")
+    else:
+        graded = [e for e in trials if e.get("outcome_15min") in ("HIT", "MISS")]
+        sent = [e for e in trials if e.get("sent_live")]
+        lines.append(
+            f"  records: {len(trials)} ({len(sent)} sent live, "
+            f"{len(graded)} graded, {n_censored} censored-window)"
+        )
+        for ttype, label in [
+            ("offside_pressure", "OFFSIDE-PRESSURE (2+ offsides/10')"),
+            ("card_debt", "CARD-RADAR debt (5+ fouls since card)"),
+            ("card_lead_protect", "CARD-RADAR lead-protect (1-2 & 60'+)"),
+            ("corner_cluster", "CORNER-CLUSTER (3+ corners/10')"),
+        ]:
+            grp = [e for e in graded if e.get("trial_type") == ttype]
+            if not grp:
+                lines.append(f"  {label}: none yet")
+                continue
+            h15 = hit_count(grp, "outcome_15min")
+            extra = ""
+            if ttype == "corner_cluster":
+                c2 = sum(1 for e in grp if (e.get("corners_added_15") or 0) >= 2)
+                s1 = sum(1 for e in grp if (e.get("sot_added_15") or 0) >= 1)
+                extra = (f" | 2+ corners {c2}/{len(grp)} ({c2/len(grp)*100:.0f}%)"
+                         f" | next SOT {s1}/{len(grp)} ({s1/len(grp)*100:.0f}%)")
+            if ttype == "offside_pressure":
+                hf = hit_count(grp, "outcome_full")
+                extra = f" | full {wr(hf, len(grp))}"
+            lines.append(
+                f"  {label}: 15' {wr(h15, len(grp))} (n={len(grp)}){extra}"
+            )
+        lines.append("  LAB BASELINES: offside 57% / card debt 37% / protect 36% / corners 34%+59% SOT")
+        lines.append("  PROMOTION RULE: >= 50 records per trigger AND a held edge across 2+ match-weeks")
+
+    # --- signal-time ratio stamps (v10.117 fields on signal records) ---
+    resolved = [s for s in day_signals if s.get("outcome_full") in ("HIT", "MISS")]
+    stamped = [s for s in resolved if s.get("corner_vel_10") is not None
+               or s.get("fouls_since_card") is not None]
+    if stamped:
+        def _bucket(fn, label) -> None:
+            grp = [s for s in stamped if fn(s)]
+            rest = [s for s in stamped if not fn(s)]
+            if not grp or not rest:
+                return
+            lines.append(
+                f"  {label}: 15' {wr(hit_count(grp, 'outcome_15min'), len(grp))} "
+                f"| full {wr(hit_count(grp, 'outcome_full'), len(grp))} "
+                f"(n={len(grp)}) vs rest "
+                f"{wr(hit_count(rest, 'outcome_15min'), len(rest))} / "
+                f"{wr(hit_count(rest, 'outcome_full'), len(rest))} (n={len(rest)})"
+            )
+        lines.append("  --- signal stamps (lab: offside>=2 71% full; convdebt>=4.5 +8pp; savestorm -19pp) ---")
+        _bucket(lambda s: (s.get("offside_delta_10") or 0) >= 2, "offside push >=2/10'")
+        _bucket(lambda s: (s.get("corner_vel_10") or 0) >= 2, "corner vel >=2/10'")
+        _bucket(lambda s: (s.get("fouls_since_card") or 0) >= 5, "foul debt >=5")
+        _bucket(lambda s: (s.get("conversion_debt") or -9) >= 4.5, "conversion debt >=4.5")
+        _bucket(lambda s: (s.get("save_storm_10") or 0) >= 2, "save storm >=2 (veto?)")
+        _bucket(lambda s: bool(s.get("lead_protect_60")), "lead-protect 60'+")
+    else:
+        lines.append("  no v10.117 signal stamps yet (stamps began with v10.117)")
+    return lines
+
+
+# ============================================================
 # v10.49: FALSE-NEGATIVE (BLOCKED-SIGNAL) ANALYSIS
 # ============================================================
 
@@ -1246,6 +1426,7 @@ def main():
     all_polls = load_jsonl(os.path.join(args.data_dir, "pressure_polls.jsonl"))
     all_blocked = load_jsonl(os.path.join(args.data_dir, "blocked_outcomes.jsonl"))  # v10.49
     all_shadow = load_jsonl(os.path.join(args.data_dir, "fastlane_shadow.jsonl"))  # v10.50
+    all_ratio = load_jsonl(os.path.join(args.data_dir, "ratio_trial.jsonl"))  # v10.117
 
     # Apply dedup to outcomes globally
     all_outcomes = deduplicate_signals(all_outcomes)
@@ -1256,17 +1437,20 @@ def main():
         day_polls = all_polls
         day_blocked = all_blocked  # v10.49
         day_shadow = all_shadow  # v10.50
+        day_ratio = all_ratio  # v10.117
     elif args.days:
         day_signals = filter_by_date_range(all_outcomes, args.days, get_date_key)
         day_polls = filter_by_date_range(all_polls, args.days, get_poll_date_key)
         day_blocked = filter_by_date_range(all_blocked, args.days, get_blocked_date_key)  # v10.49
         day_shadow = filter_by_date_range(all_shadow, args.days, get_shadow_date_key)  # v10.50
+        day_ratio = filter_by_date_range(all_ratio, args.days, get_ratio_trial_date_key)  # v10.117
         date_label = f"last {args.days} days"
     else:
         day_signals = filter_by_date(all_outcomes, target_date, get_date_key)
         day_polls = filter_by_date(all_polls, target_date, get_poll_date_key)
         day_blocked = filter_by_date(all_blocked, target_date, get_blocked_date_key)  # v10.49
         day_shadow = filter_by_date(all_shadow, target_date, get_shadow_date_key)  # v10.50
+        day_ratio = filter_by_date(all_ratio, target_date, get_ratio_trial_date_key)  # v10.117
         date_label = target_date
 
     # Generate report
@@ -1274,7 +1458,7 @@ def main():
     now_bg = datetime.now(BULGARIA_TZ)
     report_lines.append(f"EOD REPORT: {date_label}")
     report_lines.append(f"Generated: {now_bg.strftime('%Y-%m-%d %H:%M')} Bulgaria")
-    report_lines.append(f"Data: {args.data_dir} ({len(all_outcomes)} total outcomes, {len(all_polls)} total polls, {len(all_blocked)} blocked candidates, {len(all_shadow)} fast-lane shadows)")
+    report_lines.append(f"Data: {args.data_dir} ({len(all_outcomes)} total outcomes, {len(all_polls)} total polls, {len(all_blocked)} blocked candidates, {len(all_shadow)} fast-lane shadows, {len(all_ratio)} ratio trials)")
     report_lines.append("=" * 60)
 
     # --- Per-day breakdown (only in --all mode) ---
@@ -1316,6 +1500,10 @@ def main():
         # v10.50: fast-lane shadow section — what would events-feed firing have done?
         report_lines.append("")
         report_lines.append(analyze_fastlane(day_shadow, day_signals))
+        # v10.117: ratio-trial section — offside-pressure / card-radar /
+        # corner-cluster trials + the signal-time ratio stamps
+        report_lines.append("")
+        report_lines.append(analyze_ratio_trials(day_ratio, day_signals, day_polls))
 
     if not args.signals_only:
         report_lines.append("")
