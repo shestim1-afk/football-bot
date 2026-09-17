@@ -896,7 +896,22 @@ _ratio117_sent_date: str | None = None
 # to ratio_trial.jsonl, resolved like shadows (goal-type records get the
 # FT event-minute correction), and graded nightly by the EOD report.
 # They NEVER gate standard signals. Rollback = RATIOTRIAL_LIVE_MODE=False.
-BOT_VERSION = "v10.117"
+# v10.118 — NIGHT-ONE RATIO-TRIAL POST-MORTEM (Sep 16 ledger audit):
+# (1) added-count stamps (*_added_15) were frozen at the FIRST rise poll
+#     instead of the full 15' window — every live-HIT corner record
+#     stamped "+1" while true windows added 2-8 more (EOD's 2+-corners
+#     0/11 vs ledger-true ~35-50%, next-SOT 36% vs true ~82%); stamps now
+#     refresh every poll while the window is open, max-merged.
+# (2) counter-type records now finalize at window CLOSE (resolved=True),
+#     not at first HIT — the precondition for (1).
+# (3) counter histories are MAX-SMOOTHED (v10.100 phantom-goal lesson:
+#     5 YC / 6 corner / 13 SOT feed dips in one night) — a dip can no
+#     longer false-fire a delta trigger or leave a dipped resolution
+#     baseline (the false-HIT vector behind the card-debt 9/31 vs
+#     ledger-true 0/19 divergence under investigation).
+# Triggers, thresholds, caps, HIT timing and the goal-type FT walk are
+# byte-identical to v10.117.
+BOT_VERSION = "v10.118"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -5759,16 +5774,27 @@ def rewrite_ratio_trial_file() -> None:
 def _rt117_hist_append(hist: dict, key: tuple, minute: int, value) -> None:
     """v10.117: Append (minute, value) with same-minute replace + 30 cap.
 
-    None values (dead API field) are skipped entirely — histories only
-    exist where the feed actually delivers the counter.
+    v10.118: MAX-SMOOTHED — cumulative counters are monotonic in reality;
+    any decrease is a feed flap (the v10.100 phantom-goal lesson applied
+    to cards/corners/fouls/offsides; night one census: 5 YC / 6 corner /
+    13 SOT / 2 offside drops in one evening). The stored value never
+    drops below the last EARLIER-minute value, so a dip can neither
+    false-fire a delta trigger nor leave a dipped resolution baseline
+    (the false-HIT vector: at captured on a dip, cur back at the true
+    count reads as a rise). None values (dead API field) are skipped.
     """
     if value is None:
         return
     h = hist.setdefault(key, [])
+    v = int(value)
     if h and h[-1][0] == minute:
-        h[-1] = (minute, int(value))
+        if len(h) >= 2:
+            v = max(v, h[-2][1])
+        h[-1] = (minute, v)
     else:
-        h.append((minute, int(value)))
+        if h:
+            v = max(v, h[-1][1])
+        h.append((minute, v))
     if len(h) > 30:
         del h[: len(h) - 30]
 
@@ -5864,62 +5890,91 @@ def _evaluate_ratio_trials(client: httpx.Client | None, fid: int, tid: int,
         _rt117_hist_append(_ratio117_oppsv_hist, key, minute, opp_gk_saves)
 
         # --- 2. live resolution of this team's pending records ---
+        # v10.118 RESTRUCTURE (night-one post-mortem): (a) added-count
+        # stamps are refreshed on EVERY poll while the 15' window is open
+        # and max-merged — v10.117 froze them at the FIRST rise poll, so
+        # a cluster that added 3 more corners stamped "+1" and the EOD's
+        # 2+-corners / next-SOT metrics read artificially low (0/11 vs
+        # the ledger-true ~35-50%); (b) counter-type records finalize
+        # (resolved=True) only when the window CLOSES, not at first HIT;
+        # (c) HIT detection itself is unchanged (first rise, <= 15').
         any_updated = False
         for entry in ratio_trial_shadow:
             if (entry.get("fixture_id") != fid or entry.get("team_id") != tid
-                    or entry.get("resolved") or entry.get("outcome_15min") is not None):
+                    or entry.get("resolved")):
                 continue
             mins_since = minute - entry["game_minute"]
             if mins_since <= 0:
                 continue
             ttype = entry.get("trial_type")
-            if ttype == "offside_pressure":
-                cur, at = (team_goals or 0), (entry.get("goals_at") or 0)
-            elif ttype in ("card_debt", "card_lead_protect"):
-                cur = yellow_cards if yellow_cards is not None else entry.get("yc_at")
-                at = entry.get("yc_at")
-            else:  # corner_cluster
-                cur = corners if corners is not None else entry.get("corners_at")
-                at = entry.get("corners_at")
-            if cur is None or at is None:
-                continue
-            if int(cur) > int(at) and mins_since <= 15:
-                entry["outcome_15min"] = "HIT"
-                entry["hit_minute"] = minute
-            elif mins_since > 15:
-                entry["outcome_15min"] = "MISS"
-            if entry.get("outcome_15min") is not None:
-                # secondary research outcomes: exact added counts in window
-                entry["goals_added_15"] = (team_goals or 0) - (entry.get("goals_at") or 0)
-                entry["yc_added_15"] = (
-                    (yellow_cards if yellow_cards is not None else (entry.get("yc_at") or 0))
-                    - (entry.get("yc_at") or 0)
-                )
-                entry["corners_added_15"] = (
-                    (corners if corners is not None else (entry.get("corners_at") or 0))
-                    - (entry.get("corners_at") or 0)
-                )
-                entry["sot_added_15"] = (
-                    (sot if sot is not None else (entry.get("sot_at") or 0))
-                    - (entry.get("sot_at") or 0)
-                )
-                if ttype != "offside_pressure":
-                    # goal-type records wait for the FT goal-events pass
-                    # (v10.66 event-minute correction); counter types are
-                    # final the moment their window closes
-                    entry["resolved"] = True
-                any_updated = True
-                if entry["outcome_15min"] == "HIT":
-                    log.info(
-                        f"  v10.117 RATIO-TRIAL HIT: {tname} [{ttype}] at "
-                        f"{entry['game_minute']}' landed by {minute}' [{league}]"
-                    )
+
+            # (a) full-window added-count refresh (max-merge, flap-safe:
+            # a dipped poll computes a negative delta and keeps the max)
+            if mins_since <= 15:
+                _g118 = (team_goals or 0) - (entry.get("goals_at") or 0)
+                _yc118 = ((yellow_cards if yellow_cards is not None
+                           else (entry.get("yc_at") or 0))
+                          - (entry.get("yc_at") or 0))
+                _co118 = ((corners if corners is not None
+                           else (entry.get("corners_at") or 0))
+                          - (entry.get("corners_at") or 0))
+                _so118 = ((sot if sot is not None else (entry.get("sot_at") or 0))
+                          - (entry.get("sot_at") or 0))
+                if (_g118 > (entry.get("goals_added_15") or 0)
+                        or _yc118 > (entry.get("yc_added_15") or 0)
+                        or _co118 > (entry.get("corners_added_15") or 0)
+                        or _so118 > (entry.get("sot_added_15") or 0)):
+                    entry["goals_added_15"] = max(entry.get("goals_added_15") or 0, _g118)
+                    entry["yc_added_15"] = max(entry.get("yc_added_15") or 0, _yc118)
+                    entry["corners_added_15"] = max(entry.get("corners_added_15") or 0, _co118)
+                    entry["sot_added_15"] = max(entry.get("sot_added_15") or 0, _so118)
+                    any_updated = True
+
+            # (b) HIT/MISS detection — only while the outcome is unset
+            if entry.get("outcome_15min") is None:
+                if ttype == "offside_pressure":
+                    cur, at = (team_goals or 0), (entry.get("goals_at") or 0)
+                elif ttype in ("card_debt", "card_lead_protect"):
+                    cur = yellow_cards if yellow_cards is not None else entry.get("yc_at")
+                    at = entry.get("yc_at")
+                else:  # corner_cluster
+                    cur = corners if corners is not None else entry.get("corners_at")
+                    at = entry.get("corners_at")
+                if cur is not None and at is not None:
+                    if int(cur) > int(at) and mins_since <= 15:
+                        entry["outcome_15min"] = "HIT"
+                        entry["hit_minute"] = minute
+                        any_updated = True
+                        log.info(
+                            f"  v10.117 RATIO-TRIAL HIT: {tname} [{ttype}] at "
+                            f"{entry['game_minute']}' landed by {minute}' [{league}]"
+                        )
+                    elif mins_since > 15:
+                        entry["outcome_15min"] = "MISS"
+                        any_updated = True
+
+            # (c) finalize counter-type records at window close
+            if (mins_since > 15 and entry.get("outcome_15min") is not None
+                    and ttype != "offside_pressure"):
+                entry["resolved"] = True
         if any_updated:
             rewrite_ratio_trial_file()
 
         # --- 3. triggers ---
         if not (15 <= minute <= 80):
             return
+
+        def _sm117(hist: dict, key: tuple, minute: int, raw):
+            """v10.118: max-smoothed current value for a fire-record
+            baseline — the hist was appended moments ago, so its last
+            entry IS this minute's smoothed value; raw fallback when the
+            feed skipped this counter this poll (None-safe)."""
+            if raw is None:
+                return None
+            h = hist.get(key)
+            if h and h[-1][0] == minute:
+                return h[-1][1]
+            return raw
         _gps_txt = f"{gps:.0f}" if gps is not None else "?"
         _today = time.strftime("%Y-%m-%d")
         if _ratio117_sent_date != _today:
@@ -5952,8 +6007,13 @@ def _evaluate_ratio_trials(client: httpx.Client | None, fid: int, tid: int,
                 # records for free (goals_at_shadow / outcome_* / resolved)
                 "goals_at_shadow": team_goals or 0,
                 "goals_at": team_goals or 0, "opp_goals_at": opp_goals or 0,
-                "yc_at": yellow_cards, "fouls_at": fouls,
-                "corners_at": corners, "sot_at": sot,
+                # v10.118: resolution baselines from the MAX-SMOOTHED hist
+                # (just appended above) — a baseline captured on a feed dip
+                # made the recovery look like a rise = false HIT
+                "yc_at": _sm117(_ratio117_yc_hist, key, minute, yellow_cards),
+                "fouls_at": fouls,
+                "corners_at": _sm117(_ratio117_corners_hist, key, minute, corners),
+                "sot_at": _sm117(_ratio117_sot_hist, key, minute, sot),
                 "offsides_at": offsides, "opp_saves_at": opp_gk_saves,
                 "scoreline": _sc,
                 "outcome_5min": None, "outcome_10min": None, "outcome_15min": None,
@@ -15550,13 +15610,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         )
 
         if offsides is not None:
-            _oh116 = _boxedge_offsides_hist.setdefault((fid, tid), [])
-            if _oh116 and _oh116[-1][0] == minute:
-                _oh116[-1] = (minute, int(offsides))
-            else:
-                _oh116.append((minute, int(offsides)))
-            if len(_oh116) > 30:
-                del _oh116[: len(_oh116) - 30]
+            # v10.118: single max-smoothed writer (raw append fed dips
+            # into the shared hist — the evaluator's helper now owns it)
+            _rt117_hist_append(_boxedge_offsides_hist, (fid, tid), minute, offsides)
 
         # v10.117: RATIO-TRIAL evaluator — histories upkeep, live record
         # resolution, and the three tagged trial alerts (offside-pressure /
@@ -18850,14 +18906,18 @@ def main():
         "re-sent a 40' alert at live 77' five times (Sep 15 23:39)."
     )
     log.info(
-        "v10.117 RATIO-TRIAL LIVE: three new tagged trial alerts from the "
-        "Sep 12-15 ratio lab (47,611 polls) — OFFSIDE-PRESSURE (2+ offsides "
-        "in 10' -> 57% goal within 15' in the lab, fires even at GPS<60), "
-        "CARD-RADAR (foul debt >=5 since last yellow -> 37% next card; "
-        "lead-protect 1-2 past 60' -> 36%), CORNER-CLUSTER (3+ corners in "
-        "10' -> 34% 2+ more corners, 59% next SOT). Zero API cost, capped "
-        "30/day, records always written to ratio_trial.jsonl; signals also "
-        "get corner/card-debt/conversion/save-storm stamps. Trials never "
+        "v10.118 RATIO-TRIAL LIVE + NIGHT-ONE FIXES: three tagged trial "
+        "alerts from the Sep 12-15 ratio lab (47,611 polls) — OFFSIDE-"
+        "PRESSURE (2+ offsides in 10' -> 57% goal within 15' in the lab, "
+        "fires even at GPS<60), CARD-RADAR (foul debt >=5 since last "
+        "yellow -> 37% next card; lead-protect 1-2 past 60' -> 36%), "
+        "CORNER-CLUSTER (3+ corners in 10' -> 34% 2+ more corners, 59% "
+        "next SOT). Zero API cost, capped 30/day, records always written "
+        "to ratio_trial.jsonl. v10.118: added-count stamps now cover the "
+        "FULL 15' window (night one froze them at the first rise — EOD "
+        "undercounted 2+-corners/next-SOT), counter records finalize at "
+        "window close, and all counter histories are max-smoothed (feed "
+        "dips can no longer false-fire or false-resolve). Trials never "
         "gate standard signals; EOD grades each trigger nightly. Rollback: "
         "RATIOTRIAL_LIVE_MODE=False."
     )
