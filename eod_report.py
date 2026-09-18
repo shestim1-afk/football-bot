@@ -526,6 +526,20 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
         return (e.get("odds_source") in ("live", "oddsapi_live", "manual")
                 and not e.get("odds_suspect"))
 
+    def _over_true(e) -> bool:
+        """v10.119: market-TRUE Over settlement — the bet the bot prices is
+        Over(total_at_signal + 0.5); a real book settles that on ANY goal
+        after the signal (signalled team's OR the opponent's). The
+        pre-v10.119 EOD settled on outcome_full (signalled team scored)
+        and undercounted market wins by ~20pp (Sep 12-17 lab ledger:
+        48/234 signals won on the opponent's goal). Missing FT data ->
+        False (conservative)."""
+        ft = e.get("pred_actual_total_goals")
+        if ft is None:
+            return False
+        tot = (e.get("goals_at_signal") or 0) + (e.get("opponent_goals_at_signal") or 0)
+        return bool(ft > tot)
+
     with_odds_all = [e for e in resolved if e.get("odds_over_odds") is not None]
     with_odds = [e for e in with_odds_all if _pnl_grade(e)]
     stale_n = len(with_odds_all) - len(with_odds)
@@ -545,15 +559,24 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                      + ") ===")
         avg_over = avg(with_odds, "odds_over_odds")
         avg_impl = avg(with_odds, "odds_over_implied")
-        hits_odds = [e for e in with_odds if e.get("outcome_full") == "HIT"]
-        empirical_wr = len(hits_odds) / len(with_odds) if with_odds else 0
+        # v10.119: settle on the market-TRUE rule (any goal), keep the old
+        # bot convention as a secondary line so old reports stay comparable.
+        true_wins = sum(1 for e in with_odds if _over_true(e))
+        bot_wins = sum(1 for e in with_odds if e.get("outcome_full") == "HIT")
+        empirical_wr = true_wins / len(with_odds) if with_odds else 0
         lines.append(f" Avg Over price: {avg_over:.2f} | Avg implied: {avg_impl:.1%}")
-        lines.append(f"  Empirical full WR: {empirical_wr:.1%}")
+        lines.append(f"  Empirical TRUE WR (any goal settles): {empirical_wr:.1%}")
+        lines.append(f"  (bot convention, signalled team: {bot_wins / len(with_odds):.1%};"
+                     f" opponent-goal leg: {(true_wins - bot_wins) / len(with_odds):.1%})")
         edge = empirical_wr - avg_impl
         lines.append(f"  Edge vs market: {edge:+.1%} ({'+EV' if edge > 0 else '-EV'})")
-        # ROI calculation (flat 1 unit stake)
-        profit = sum(1 if e.get("outcome_full") == "HIT" else -1 for e in with_odds)
-        lines.append(f"  Flat ROI: {profit / len(with_odds) * 100:+.1f}% ({profit:+d} units)")
+        # v10.119: odds-weighted flat ROI (1-unit stakes: win +(odds-1),
+        # lose -1). The old +/-1 tally ignored the odds and overstated
+        # wins at short prices (1.06 pays +0.06, not +1).
+        profit = sum((e.get("odds_over_odds") or 2.0) - 1.0 if _over_true(e) else -1.0
+                     for e in with_odds)
+        lines.append(f"  Flat ROI (odds-weighted): {profit / len(with_odds) * 100:+.1f}%"
+                     f" ({profit:+.2f} units)")
 
         # By GPS range with odds
         for label, lo, hi in [("55-64", 55, 65), ("65-74", 65, 75),
@@ -562,13 +585,112 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
             if len(group) < 2:
                 continue
             g = len(group)
-            gh = hit_count(group, "outcome_full")
+            gh = sum(1 for e in group if _over_true(e))     # v10.119 TRUE settle
             go = avg(group, "odds_over_odds")
             gi = avg(group, "odds_over_implied")
             ge = gh / g - gi if g else 0
-            gp = (sum(1 if e.get("outcome_full") == "HIT" else -1 for e in group)) / g * 100
+            gp = (sum((e.get("odds_over_odds") or 2.0) - 1.0 if _over_true(e) else -1.0
+                      for e in group)) / g * 100
             lines.append(f"  GPS {label}: {gh}/{g} ({gh/g*100:.0f}%) @ {go:.2f} impl {gi:.1%} "
                           f"edge {ge:+.1%} ROI {gp:+.1f}%")
+
+    # --- v10.119: OVER EDGE RESEARCH — cohort stamps, NEVER gates ---
+    # Sep 12-17 lab ledger (234 signals): minute<=45 converts 69% vs 45%
+    # late (survives Bonferroni); sub-1.35 priced Overs were the only
+    # negative paper-P&L bucket. This section tracks the two candidate
+    # rules nightly on the CUMULATIVE ledger so promotion stays a data
+    # decision (n>=50 & edge held 2+ match-weeks), same standard as the
+    # ratio-trials. Paper (prematch) prices are included and labelled —
+    # they are an upper bound, not a live-price result (v10.109 lesson).
+    _cum = [s for s in (all_signals or [])
+            if s.get("outcome_full") in ("HIT", "MISS")]
+    _cum_priced = [e for e in _cum if e.get("odds_over_odds")]
+
+    def _edge_row(label: str, es: list) -> None:
+        if not es:
+            lines.append(f"  {label:24s} n=0")
+            return
+        w = sum(1 for e in es if _over_true(e))
+        im = avg(es, "odds_over_implied")
+        roi_u = sum((e.get("odds_over_odds") or 2.0) - 1.0 if _over_true(e) else -1.0
+                    for e in es)
+        lines.append(f"  {label:24s} n={len(es):3d} | TRUE {w}/{len(es)} ({w/len(es):.0%})"
+                     f" | impl {im:.0%} | edge {w/len(es) - im:+.0%}"
+                     f" | ROI {roi_u/len(es):+.0%} ({roi_u:+.1f}u)")
+
+    if _cum_priced:
+        lines.append("")
+        lines.append("=== OVER EDGE RESEARCH (v10.119 — stamps, never gates) ===")
+        lines.append(f"  cumulative priced: {len(_cum_priced)}"
+                     " (paper prematch + live; P&L section above is live-only)")
+        _edge_row("EARLY only (min<=45)",
+                  [e for e in _cum_priced if (e.get("game_minute") or 0) <= 45])
+        _edge_row("LATE only (min>45)",
+                  [e for e in _cum_priced if (e.get("game_minute") or 0) > 45])
+        _edge_row("FLOOR only (odds>=1.35)",
+                  [e for e in _cum_priced if (e.get("odds_over_odds") or 0) >= 1.35])
+        _edge_row("CHEAP only (odds<1.35)",
+                  [e for e in _cum_priced if (e.get("odds_over_odds") or 0) < 1.35])
+        _edge_row("EARLY + FLOOR",
+                  [e for e in _cum_priced
+                   if (e.get("game_minute") or 0) <= 45
+                   and (e.get("odds_over_odds") or 0) >= 1.35])
+        _edge_row("ALL priced (baseline)", _cum_priced)
+        lines.append("  promote a rule at n>=50 & edge held 2+ match-weeks")
+
+    # --- v10.119: CARDS & CORNERS EDGE — lean grading + receipt P&L ---
+    # The lean is settled at FT vs the line (mkt_*_ft_result, stamped by
+    # the v10.80 resolution path). The recorded mkt_* odds are PREMATCH —
+    # paper P&L is an upper bound (v10.109 lesson). Real prices come from
+    # /price cards|corners manual receipts (P&L-grade within 15 min of the
+    # signal); receipts are graded by the same FT stamps and counted
+    # separately here. No API feed carries these markets live (measured:
+    # api-sports live = zero bookmakers on this plan; the-odds-api has no
+    # cards/corners markets) — the manual receipt IS the capture path.
+    for _kind, _word in (("cards", "CARDS"), ("corners", "CORNERS")):
+        _graded = [e for e in _cum if e.get(f"mkt_{_kind}_ft_result") in ("HIT", "MISS")]
+        if not _graded:
+            continue
+        _hits = sum(1 for e in _graded if e.get(f"mkt_{_kind}_ft_result") == "HIT")
+        lines.append("")
+        lines.append(f"=== {_word} EDGE (v10.119) ===")
+        lines.append(f"  lean graded (cumulative): {_hits}/{len(_graded)}"
+                     f" ({_hits/len(_graded):.0%})")
+        for _side in ("OVER", "UNDER"):
+            _sb = [e for e in _graded if e.get(f"mkt_{_kind}_lean") == _side]
+            if _sb:
+                _sh = sum(1 for e in _sb if e.get(f"mkt_{_kind}_ft_result") == "HIT")
+                lines.append(f"  {_side:5s}: {_sh}/{len(_sb)} ({_sh/len(_sb):.0%})")
+        _pnl = 0.0
+        _npr = 0
+        for e in _graded:
+            _side = e.get(f"mkt_{_kind}_lean")
+            _odd = (e.get(f"mkt_{_kind}_over_odds") if _side == "OVER"
+                    else e.get(f"mkt_{_kind}_under_odds"))
+            if not _odd or _odd <= 1.0:
+                continue
+            _npr += 1
+            _pnl += (_odd - 1.0) if e.get(f"mkt_{_kind}_ft_result") == "HIT" else -1.0
+        if _npr:
+            lines.append(f"  paper P&L (prematch odds, UPPER BOUND): {_pnl:+.1f}u"
+                         f" on {_npr} priced ({_pnl/_npr:+.0%})")
+        _rec_live = [e for e in _graded if e.get(f"{_kind}_shadow_odds")
+                     and e.get(f"{_kind}_shadow_side")
+                     and e.get(f"{_kind}_shadow_odds_src") in ("manual", "live")]
+        _rec_all = [e for e in _graded if e.get(f"{_kind}_shadow_odds")
+                    and e.get(f"{_kind}_shadow_side")]
+        if _rec_live:
+            _rw = sum(1 for e in _rec_live if e.get(f"mkt_{_kind}_ft_result") == "HIT")
+            lines.append(f"  REAL receipts (/price {_kind}): {len(_rec_live)}"
+                         f" ({_rw} won) — live/manual provenance")
+        elif _rec_all:
+            # v10.105-era freezes carry no src stamp (= prematch prices);
+            # v10.109 stopped that class. They stay an upper bound, NOT truth.
+            lines.append(f"  REAL receipts (/price {_kind}): 0 ({len(_rec_all)}"
+                         " prematch-frozen v10.105 shadows, no src stamp)")
+        else:
+            lines.append(f"  REAL receipts (/price {_kind}): 0 — freeze your"
+                         " book's live price to make this real")
 
     # --- v10.114: SHADOW LEAGUES — trial leagues (logged, never sent) ---
     # Austria / Switzerland / Norway / Sweden signals carry shadow_league=True
