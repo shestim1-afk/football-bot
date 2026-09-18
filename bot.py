@@ -911,7 +911,25 @@ _ratio117_sent_date: str | None = None
 #     ledger-true 0/19 divergence under investigation).
 # Triggers, thresholds, caps, HIT timing and the goal-type FT walk are
 # byte-identical to v10.117.
-BOT_VERSION = "v10.118"
+# v10.119 — HONEST MEASUREMENT PASS (EOD only; zero betting logic touched):
+# (1) TRUE settlement: the MARKET/EV section settled the priced Over on
+#     outcome_full (signalled team scored) while a real book settles
+#     Over(total+0.5) on ANY goal — the Sep 12-17 ledger carries 48/234
+#     (20.5%) opponent-goal wins the old EOD graded MISS. Every WR/edge/
+#     ROI line now uses the market rule; the bot convention stays as a
+#     secondary line so old reports remain comparable.
+# (2) odds-weighted flat ROI replaces the +/-1 tally (a 1.06 win pays
+#     +0.06u, not +1u).
+# (3) OVER EDGE RESEARCH section: EARLY(min<=45) / FLOOR(odds>=1.35)
+#     cohort stamps on the cumulative ledger — the Sep 12-17 lab measured
+#     69% vs 45% early/late (Bonferroni-proof) and sub-1.35 Overs as the
+#     only negative paper bucket. Stamps only; promotion needs n>=50 &
+#     2-week stability (ratio-trial standard).
+# (4) CARDS & CORNERS EDGE section: lean WR (FT vs line) + paper P&L
+#     (prematch odds = upper bound) + /price receipts as the real subset.
+#     No feed carries these markets live (measured), so the manual
+#     receipt is the capture path — /price cards|corners already exists.
+BOT_VERSION = "v10.119"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
