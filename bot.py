@@ -676,7 +676,9 @@ _fl_shadow_count_date: str | None = None
 # The events lane sees shot storms 30-60s before the stats lane, and the
 # goal_proximity trigger is the 'goals come in bursts' pattern the stats
 # path suppresses on purpose (post-goal cooldown). Rollback is one flag.
-FASTLANE_LIVE_MODE = True
+# v10.124: MUTED — shadow records + EOD grading continue (ledger write
+# sits before this gate); Telegram trial alerts OFF until graduation.
+FASTLANE_LIVE_MODE = False
 FASTLANE_LIVE_DAILY_CAP = 30             # hard spam guard for the trial
 _fl_live_sent_today: int = 0
 _fl_live_sent_date: str | None = None
@@ -729,7 +731,7 @@ _boxedge_offsides_hist: dict[tuple, list[tuple[int, int]]] = {}  # (fid,tid) -> 
 # >= 50 records per trigger AND a held edge across 2+ match-weeks.
 RATIO_TRIAL_FILE = os.path.join(_VOLUME_DIR, "ratio_trial.jsonl")  # v10.117
 ratio_trial_shadow: list[dict] = []   # v10.117: trial alert records
-RATIOTRIAL_LIVE_MODE = True           # v10.117: send tagged live alerts
+RATIOTRIAL_LIVE_MODE = False          # v10.124: MUTED (user Sep 19) — records + EOD grading continue
 RATIOTRIAL_DAILY_CAP = 30             # combined spam guard
 RATIOTRIAL_TYPE_CAP = 12              # per-trigger-type spam guard
 RATIOTRIAL_OFFPRESS_MIN = 2           # offsides added in 10' at/above = fire
@@ -1008,6 +1010,61 @@ _ratio117_sent_date: str | None = None
 #     (3) zero_zero 90-POCKET sub-flag scoped to 21-35' only (verified
 #         95.7% 22/23; the wider 21-40' 0-0 slice is 87.5% 28/32).
 #     EOD analyze_pockets re-cut to grade exactly these rules.
+# v10.126 — CARDS LINE RESTORED + INTEGER LINES (user request Sep 19:
+#     "keep the cards line but instead 8.5 write 9 same for corner ...
+#     can you list current corner as it is with card it has current
+#     card"):
+#     (1) CARDS line back in the message, same plain format as
+#         corners: 'Cards: 3 · line 5 → UNDER' (current count shown).
+#     (2) INTEGER line display everywhere (market lines + pocket
+#         badges): half-lines show the decisive threshold — 8.5
+#         renders as 'line 9', 4.5 as 'line 5'; OVER = 'FT total 9+',
+#         UNDER = 'FT total below 9' (both exactly correct at x.5).
+#     LEDGER DISCIPLINE: mkt_*_line stamps keep the REAL book line
+#         (8.5) — EOD grading, shadow paper-bet freeze and the live-
+#         edit render path unchanged; display-only cut on top of
+#         v10.124 (muted trials) and v10.125 (simplified messages).
+# v10.125 — SIGNAL MESSAGE SIMPLIFICATION (user request Sep 19:
+#     "can you simplify the messages?"):
+#     (1) NO manual /price anywhere: the v10.111 NO-LIVE-PRICE
+#         invitation and the v10.123 pocket receipt hints are REMOVED
+#         ('i dont want to type manual /price so exclude that
+#         feature, it must be automatic'). The /price COMMAND stays
+#         functional for optional power use; messages never nag.
+#     (2) Price text LIVE-ONLY: the BET line renders solely when a
+#         live feed produced a price (no 'no price captured', no
+#         'pre ref', no break-even hint; VALUE/no-edge verdict rides
+#         the live line).
+#     (3) FORM / H2H / referee line removed ('the form info i dont
+#         need it inside the message'); _form_ctx still feeds
+#         cards_mod + calibration + ledger.
+#     (4) CARDS current-count line removed ('the cards info also');
+#         the CARDS-POCKET badge still surfaces >=90% cells.
+#     (5) Market line plain: 'Corners: 1 · line 8.5 → UNDER' (no %,
+#         no min-odds, no degenerate 'under 100%').
+#     (6) Pocket badges concrete per user spec: live count + line +
+#         direction + FT meaning — 'CORNERS 90% POCKET — 1 now ·
+#         line 8.5 → UNDER (FT total below 8.5) · ledger 91% (10/11)'.
+#     LEDGER DISCIPLINE: every mkt_*/pred_*/odds_* stamp, the shadow
+#     paper-bet freeze, EOD grading and the live-edit single-render
+#     path are UNCHANGED — display-only cut.
+# v10.124 — TRIALS MUTED (user request Sep 19: "mute them since they
+#     are still trials so I don't receive Telegram messages but keep
+#     them silently in the ledger"):
+#     (1) FASTLANE_LIVE_MODE=False + RATIOTRIAL_LIVE_MODE=False — the
+#         tagged trial alerts (FAST-LANE TRIAL, offside-pressure,
+#         card-radar, corner-cluster) stop sending to Telegram.
+#     (2) LEDGER COLLECTION UNCHANGED: fastlane_shadow.jsonl and
+#         ratio_trial.jsonl records are written BEFORE the send gate
+#         (verified: shadow append at the v10.50/v10.117 write sites) —
+#         EOD grading (analyze_fastlane / analyze_ratio_trials) and the
+#         promotion bars (n>=50/trigger, edge held 2+ match-weeks) run
+#         exactly as before; journalctl proof: "virtual, NOT sent" /
+#         "record only (capped/off)" lines.
+#     (3) G2/G3 goal-burst alerts are LIVE GRADUATES (not trials) and
+#         keep sending; core signals, pocket badges, goals board, /price
+#         receipts untouched.
+#     (4) Rollback symmetric: flip either flag back to True.
 # v10.123 — BOARD REDEPLOY FIX + POCKET RECEIPTS (user request Sep 19:
 #     "why on each redeploy I receive the goals board?" + "yes" to
 #     real-grade corner/card pockets):
@@ -1027,7 +1084,7 @@ _ratio117_sent_date: str | None = None
 #         not |proj-line|.
 #     (4) EOD LEDGER POCKETS P&L split into REAL RECEIPTS (manual
 #         /price freezes) vs prematch paper (upper bound) per rule.
-BOT_VERSION = "v10.123"
+BOT_VERSION = "v10.126"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -10967,90 +11024,121 @@ _CARDS_OVER_5170_V122 = (1.00, 7, 7)     # cards OVER 51-70' rule
 _CARDS_AVG_ODDS_V122 = 1.84
 
 
-def _pocket_badges_122(minute, mkt_extras) -> str:
-    """v10.122: STRICT >=90% corner/cards pocket badge lines.
+def _mkt_line_txt(line) -> str:
+    """v10.126: INTEGER line display (user request Sep 19: 'instead
+    8.5 write 9') — half-lines show the decisive integer threshold
+    (8.5 -> 9, 4.5 -> 5), so 'UNDER (FT total below 9)' and 'OVER
+    (FT total 9+)' are both exactly right at a x.5 line. Integer and
+    unusual lines fall back to {line:g}. DISPLAY ONLY — the ledger
+    stamps keep the real book line (mkt_*_line) so EOD grading and
+    the shadow paper-bet freeze are untouched."""
+    try:
+        _v = float(line)
+    except (TypeError, ValueError):
+        return f"{line}"
+    if abs(_v - math.floor(_v) - 0.5) < 1e-9:
+        return str(int(math.floor(_v)) + 1)
+    return f"{_v:g}"
 
-    Only periods whose Sep 12-18 ledger WR reached 90%+ are badged
-    (user request: "flag it when the period is 90% winrate and more"):
-      corners OVER  61'+  (94.7% 18/19; 71'+ band 100% 11/11)
-      corners UNDER 51-60' (90.9% 10/11) and 71'+ (90.0% 9/10)
-      cards  UNDER 60'+  (100% 11/11; any-lean 60'+ 93.8% 15/16)
-      cards  OVER  51-70' (100% 7/7)
-    The sub-90 slices (corners OVER 51-60' 85.7%, corners UNDER 61-70'
-    72.7%, cards late OVER 71'+ 75%) deliberately get NO badge. One
-    line per matched pocket with plain ledger numbers and avg paper
-    win odds — display-only, no advice, no gating. The 90-POCKET
-    (SHADOW-90) badge is rendered separately in the send path.
-    Defensive: ANY failure returns "".
+
+def _pocket_badges_122(minute, mkt_extras) -> str:
+    """v10.125: PLAIN pocket badges (user request Sep 19: 'what does
+    corner pocket under lean mean? it should be current corners number
+    and under or over that number').
+
+    Each badge states the bet in concrete terms — the live count, the
+    book line, the direction, and what FT must land:
+      CORNERS 90% POCKET — 1 now · line 9 → UNDER (FT total below 9)
+        · ledger 91% (10/11)
+    v10.126: half-lines display the integer threshold (8.5 -> 9) —
+    'line 9' + 'FT total below 9' / 'FT total 9+' stay exactly right.
+    Eligibility and numbers are IDENTICAL to v10.122 (strict >=90%
+    cells only; sub-90 slices stay un-badged). The manual /price
+    receipt hints are REMOVED (v10.125: price text appears only when
+    a live feed produced a price). Display-only, no advice, no
+    gating; the 90-POCKET (SHADOW-90) badge renders separately in
+    the send path. Defensive: ANY failure returns "".
     """
     try:
         _m = int(minute or 0)
         _ex = mkt_extras or {}
         out = []
-        _cl = (_ex.get("mkt_corners_lean") or "").upper()
-        if "OVER" in _cl and _m >= 61:
+        _cn = _ex.get("mkt_corners_now")
+        _cl = _ex.get("mkt_corners_line")
+        _kn = _ex.get("mkt_cards_now")
+        _kl = _ex.get("mkt_cards_line")
+
+        def _ctx(now, line):
+            if now is None and line is None:
+                return ""
+            if now is None:
+                return f" \u2014 line {_mkt_line_txt(line)}"
+            if line is None:
+                return f" \u2014 {now} now"
+            return f" \u2014 {now} now \u00b7 line {_mkt_line_txt(line)}"
+
+        def _ft(line, side):
+            if line is None:
+                return side
+            try:
+                _v = float(line)
+            except (TypeError, ValueError):
+                _v = None
+            if _v is not None and abs(_v - math.floor(_v) - 0.5) < 1e-9:
+                # v10.126: x.5 line -> integer threshold phrasing
+                # (8.5: over wins at 9+, under at <=8 -> 'below 9')
+                _thr = int(math.floor(_v)) + 1
+                if side == "OVER":
+                    return f"{side} (FT total {_thr}+)"
+                return f"{side} (FT total below {_thr})"
+            _cmp = "above" if side == "OVER" else "below"
+            return f"{side} (FT total {_cmp} {_mkt_line_txt(line)})"
+
+        _cl_up = (_ex.get("mkt_corners_lean") or "").upper()
+        if "OVER" in _cl_up and _m >= 61:
             if _m >= 71:
                 _wr, _h, _n = _CORNER_OVER_71_V122
                 _rwr, _rh, _rn = _CORNER_OVER_61_V122
                 out.append(
-                    f"\n\U0001f3af CORNER-POCKET — OVER lean 71'+ ledger "
-                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
-                    f"\u00b7 61'+ rule {int(round(_rwr * 100))}% ({_rh}/{_rn}) "
-                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
+                    f" \u00b7 71'+ ledger {int(round(_wr * 100))}% ({_h}/{_n})"
+                    f" \u00b7 61'+ rule {int(round(_rwr * 100))}% ({_rh}/{_rn})"
                 )
             else:
                 _wr, _h, _n = _CORNER_OVER_61_V122
-                _cwr, _ch, _cn = _CORNER_OVER_51_CUM_V122
+                _cwr, _ch, _ccn = _CORNER_OVER_51_CUM_V122
                 out.append(
-                    f"\n\U0001f3af CORNER-POCKET — OVER lean 61'+ ledger "
-                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
-                    f"\u00b7 51'+ cum {int(round(_cwr * 100))}% ({_ch}/{_cn}) "
-                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
+                    f" \u00b7 61'+ ledger {int(round(_wr * 100))}% ({_h}/{_n})"
+                    f" \u00b7 51'+ cum {int(round(_cwr * 100))}% ({_ch}/{_ccn})"
                 )
-        elif "UNDER" in _cl:
+        elif "UNDER" in _cl_up:
             if 51 <= _m <= 60:
                 _wr, _h, _n = _CORNER_UNDER_5160_V122
                 out.append(
-                    f"\n\U0001f3af CORNER-POCKET — UNDER lean 51-60' ledger "
-                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
-                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
+                    f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
             elif _m >= 71:
                 _wr, _h, _n = _CORNER_UNDER_71_V122
                 out.append(
-                    f"\n\U0001f3af CORNER-POCKET — UNDER lean 71'+ ledger "
-                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
-                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
+                    f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
-        _kl = (_ex.get("mkt_cards_lean") or "").upper()
-        if "UNDER" in _kl and _m >= 60:
+        _kl_up = (_ex.get("mkt_cards_lean") or "").upper()
+        if "UNDER" in _kl_up and _m >= 60:
             _wr, _h, _n = _CARDS_UNDER_60_V122
             _awr, _ah, _an = _CARDS_ANY_60_V122
             out.append(
-                f"\n\U0001f3af CARDS-POCKET — UNDER lean 60'+ ledger "
-                f"{int(round(_wr * 100))}% ({_h}/{_n}) "
-                f"\u00b7 any lean 60'+ {int(round(_awr * 100))}% ({_ah}/{_an}) "
-                f"\u00b7 avg paper odds {_CARDS_AVG_ODDS_V122:.2f}"
+                f"\n\U0001f3af CARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'UNDER')}"
+                f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
+                f" \u00b7 any lean 60'+ {int(round(_awr * 100))}% ({_ah}/{_an})"
             )
-        elif "OVER" in _kl and 51 <= _m <= 70:
+        elif "OVER" in _kl_up and 51 <= _m <= 70:
             _wr, _h, _n = _CARDS_OVER_5170_V122
             out.append(
-                f"\n\U0001f3af CARDS-POCKET — OVER lean 51-70' ledger "
-                f"{int(round(_wr * 100))}% ({_h}/{_n}) "
-                f"\u00b7 avg paper odds {_CARDS_AVG_ODDS_V122:.2f}"
-            )
-        # v10.123: receipt invitations — no live corners/cards feed
-        # exists (feed-2 = goals totals only), so the USER's book price
-        # via /price IS the real price. One hint per matched market.
-        if any("CORNER-POCKET" in _l for _l in out):
-            out.append(
-                "\n    reply /price corners 1.95 \u2192 freezes YOUR book "
-                "price (EOD grades this pocket at it)"
-            )
-        if any("CARDS-POCKET" in _l for _l in out):
-            out.append(
-                "\n    reply /price cards 1.90 \u2192 freezes YOUR book "
-                "price (EOD grades this pocket at it)"
+                f"\n\U0001f3af CARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'OVER')}"
+                f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
             )
         return "".join(out)
     except Exception:
@@ -12642,6 +12730,11 @@ def _build_market_block(
     when leaning UNDER, so the actionable number was missing).
     v10.98 wording: '🟨 Cards 2 so far / line 4.5 → over 62% (min odds
     1.61)' — every piece labeled in plain words (user request Sep 13).
+    v10.125: the CARDS line no longer renders and the CORNERS line
+    is direction-only ('🚩 Corners: 1 · line 8.5 → UNDER') — user
+    request Sep 19. Ledger extras unchanged.
+    v10.126: CARDS line restored (same plain format) and lines
+    display integer thresholds (8.5 -> 9) — user Sep 19.
 
     TEXT-ONLY change vs v10.80: the extras dict (mkt_* ledger fields),
     the record schema and the FT grading (mkt_*_ft_result) are
@@ -12669,39 +12762,24 @@ def _build_market_block(
 
     def _compact(emoji: str, label: str, now: int | None,
                  line: float | None, p_over: float | None) -> str:
-        """v10.98: one bit per market, SELF-EXPLANATORY (user request
-        Sep 13: 'how do I know cards are 0 so far and why is the line
-        3.5') —
-        '🟨 Cards 0 so far / line 3.5 → under 95% (min odds 1.05)'.
-
-        Every piece is labeled in plain words now: the live count so
-        far, the bookmaker's O/U line, the leaned side's probability
-        and the minimum live price at which the bet is still break-even
-        (0.95 x 1.05 ≈ 1). Lean side shows its own probability (over =
-        P(over), under = 1 - P(over)) + its break-even price; NEUTRAL
-        shows the raw over-probability as information. Same maths, same
-        inputs, same single render path (byte-stable live edits
-        preserved); only the wording changed vs v10.96/97.
+        """v10.126: PLAIN market line — '🚩 Corners: 1 · line 9 → UNDER'
+        and '🟨 Cards: 3 · line 5 → UNDER' (user request Sep 19: keep
+        the cards line; instead 8.5 write 9). The live count, the
+        integer-threshold line and the lean DIRECTION. Same inputs,
+        same ledger extras (mkt_*_line keeps the REAL book line),
+        same single render path (byte-stable live edits preserved).
         """
         if now is None:
-            return f"{emoji} {label}: n/a"
+            return ""
         if line is None:
-            return f"{emoji} {label}: {now} so far"
-        _base = f"{emoji} {label} {now} so far / line {line:g}"
+            return f"{emoji} {label}: {now}"
+        _base = f"{emoji} {label}: {now} \u00b7 line {_mkt_line_txt(line)}"
         if p_over is None:
             return _base
         lean = _mkt_lean(p_over)
-        if lean == "OVER" and p_over > 1e-9:
-            return (
-                f"{_base} \u2192 over {p_over * 100:.0f}% "
-                f"(min odds {1.0 / p_over:.2f})"
-            )
-        if lean == "UNDER" and p_over < 1.0 - 1e-9:
-            return (
-                f"{_base} \u2192 under {(1.0 - p_over) * 100:.0f}% "
-                f"(min odds {1.0 / (1.0 - p_over):.2f})"
-            )
-        return f"{_base} \u00b7 over {p_over * 100:.0f}%"
+        if lean in ("OVER", "UNDER"):
+            return f"{_base} \u2192 {lean}"
+        return _base
 
     try:
         # v10.95: ONE line, both markets — the counts auto-update via the
@@ -12740,6 +12818,9 @@ def _build_market_block(
             if p_c is not None and p_c > 1e-9:
                 extras["mkt_cards_fair_over"] = round(1.0 / p_c, 2)
             extras["mkt_cards_lean"] = _mkt_lean(p_c)
+        # v10.126: CARDS LINE RESTORED (user Sep 19: 'keep the cards
+        # line ... with card it has current card') — same plain format
+        # as corners: current count + integer line + direction.
         parts.append(_compact("\U0001f7e8", "Cards", cards_now, cards_line, p_c))
 
         # --- CORNERS ---
@@ -13318,27 +13399,25 @@ def _build_odds_value_block(
             and odds_data.get("odds_source") == "live"
             and not odds_data.get("suspect")
         )
-        # v10.95: ONE line — 'BET Over 1.5 — book 1.12 (Bet365 · pre ref)
-        # → bet only if LIVE ≥ 1.56'. The team-to-score and BTTS fair
-        # prices stay in the ledger (pred_team_scores_cal / p_btts);
-        # the live-value verdict and best-book price ride the same line.
-        _book_bit = "no price captured"
-        if odds_data and odds_data.get("over_odds"):
-            _src_tag = "LIVE" if _mkt_live else "pre ref"
-            _sus = " \u26a0\ufe0f ignore price" if odds_data.get("suspect") else ""
+        # v10.125: LIVE-ONLY price line (user Sep 19: 'i dont want to
+        # type manual /price ... if it has no live price - better not
+        # even mention that info, appear only if it has live price').
+        # Prematch refs, 'no price captured' and the break-even hint
+        # no longer render; the ledger stamps (odds_*, pred_*) are
+        # UNCHANGED — everything below still computes as v10.95/120.
+        lines = []
+        if _mkt_live and odds_data and odds_data.get("over_odds"):
             _book_bit = (
                 f"book {float(odds_data['over_odds']):.2f} "
-                f"({odds_data.get('bookmaker') or '?'} \u00b7 {_src_tag}{_sus})"
+                f"({odds_data.get('bookmaker') or '?'} \u00b7 LIVE)"
             )
-            if _mkt_live:
-                ev_pct = (float(odds_data["over_odds"]) * p_any_v2 - 1.0) * 100.0  # v10.120: v2 EV
-                if ev_pct >= 3.0:
-                    _book_bit += f" \u00b7 VALUE +{ev_pct:.0f}%"
-                elif ev_pct <= -3.0:
-                    _book_bit += " \u00b7 no edge"
+            ev_pct = (float(odds_data["over_odds"]) * p_any_v2 - 1.0) * 100.0  # v10.120: v2 EV
+            if ev_pct >= 3.0:
+                _book_bit += f" \u00b7 VALUE +{ev_pct:.0f}%"
+            elif ev_pct <= -3.0:
+                _book_bit += " \u00b7 no edge"
             if (
-                _mkt_live
-                and odds_data.get("over_best")
+                odds_data.get("over_best")
                 and odds_data.get("live_books")
                 and float(odds_data["over_best"]) > float(odds_data["over_odds"])
             ):
@@ -13346,10 +13425,9 @@ def _build_odds_value_block(
                     f" \u00b7 best {float(odds_data['over_best']):.2f} "
                     f"@{odds_data.get('over_best_book') or '?'}"
                 )
-        lines = [
-            f"\n\U0001f4b0 BET Over {any_line:.1f} \u2014 {_book_bit} "
-            f"\u2192 bet only if LIVE \u2265 {be_any:.2f}"
-        ]
+            lines = [
+                f"\n\U0001f4b0 BET Over {any_line:.1f} \u2014 {_book_bit}"
+            ]
 
         # v10.120: edge bookkeeping — model P (v2) minus implied P when a
         # P&L-grade live price exists; feeds the NO_EDGE gate + the ledger.
@@ -17837,19 +17915,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 )
         except Exception as _p90e121:
             log.debug(f"  v10.121 90-pocket badge skipped: {_p90e121}")
-        # v10.111: manual-price invitation when neither live feed produced
-        # a price for the message (api-sports empty AND feed-2 empty/absent).
-        try:
-            if _odds_msg is None or (
-                (_odds_msg.get("odds_source") or "") not in ("live", "oddsapi_live")
-            ):
-                msg += (
-                    "\n\U0001f64b NO LIVE PRICE \u2014 reply to this message with"
-                    "\n    /price 1.85   (the Over price in YOUR book app)"
-                    "\nand it becomes the P&L-grade receipt price."
-                )
-        except Exception:
-            pass
+        # v10.125: the v10.111 manual-price invitation is REMOVED (user
+        # Sep 19: 'i dont want to type manual /price so exclude that
+        # feature, it must be automatic; if it has no live price -
+        # better not even mention that info'). Price text now appears
+        # ONLY when a live feed produced a price (the BET line above).
 
         # v10.94: DOG FLAG + A-GRADE COMPOSITE — the two ledger classes
         # the user asked to see in the signal. The 1X2 prices ride the
@@ -17898,18 +17968,10 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         except Exception as _de94:
             log.debug(f"  v10.94 dog/a-grade line skipped: {_de94}")
 
-        # v10.97: FORM / H2H / REFEREE context line — ONE compact
-        # transparency line showing the inputs behind the adjusted
-        # percentages (over-goals, FT, cards). Empty (no line at all)
-        # when the fixture has no cached context: the message then reads
-        # exactly as v10.96. Prediction-only, never a gate.
-        try:
-            _fc97_line = _form_ctx_line(fid, tname, is_home_sg,
-                                         home["name"], away["name"])
-            if _fc97_line:
-                msg += _fc97_line
-        except Exception as _fc97e:
-            log.debug(f"  v10.97 form context line skipped: {_fc97e}")
+        # v10.125: the FORM/H2H/REFEREE line no longer renders (user
+        # Sep 19: 'the form info i dont need it inside the message').
+        # _form_ctx is still fetched upstream and still feeds cards_mod
+        # + the calibration + ledger stamps; only the display is gone.
 
         # v10.96: FT WIN/DRAW/LOSS line (user request, Sep 12: "prediction
         # if it's going to be a win for either team or a draw with a
@@ -19607,6 +19669,14 @@ def main():
         )
     except Exception:
         pass
+    # v10.124: trials muted — one boot line so the Telegram silence is
+    # verifiable from journalctl (ledger collection still active).
+    log.info(
+        "v10.124: TRIALS MUTED — FASTLANE_LIVE_MODE=%s "
+        "RATIOTRIAL_LIVE_MODE=%s (shadow ledgers + EOD grading continue; "
+        "journal shows 'virtual, NOT sent' / 'record only (capped/off)')"
+        % (FASTLANE_LIVE_MODE, RATIOTRIAL_LIVE_MODE)
+    )
     log.info(
         "v10.112 TOPSCORER PARSE FIX active: /players/topscorers nests the "
         "club INSIDE statistics[] — v10.98 read a top-level 'team' key "
