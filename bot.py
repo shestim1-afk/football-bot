@@ -505,6 +505,16 @@ _GB_META: dict[str, tuple] = {    # class -> (trigger, bet_target, bet_desc, his
 # cells) — powers the break-even line in the live goal-burst alert:
 # break-even = 1 / rate (G2: 1/0.841 = 1.19).
 _GB_CONT_RATE: dict[str, float] = {"G1": 0.625, "G2": 0.841, "G3": 0.757}
+# v10.121: ledger cross-check of the class continuation rates — the Sep
+# 12-18 signal_outcomes states (fixture-deduped first signal in each
+# class state, any-goal-by-FT) reproduce the lab numbers: G2 88%
+# (38/43), G3 78% (7/9); G1 has no states in the ledger. Printed in the
+# live alert beside the lab line — display-only, no gating.
+_GB_LEDGER_V121: dict[str, str] = {
+    "G1": "no G1 states in ledger yet",
+    "G2": "next-goal 88% (38/43)",
+    "G3": "next-goal 78% (7/9)",
+}
 _shadow_tags: dict[str, int] = {}  # session-scoped would-suppress counters (heartbeat)
 # (d): STOP-mode renewal probe — api_get() raises BEFORE any call once
 # quota_remaining <= 0, which made STOP a dead-end: the bot could never see
@@ -959,7 +969,46 @@ _ratio117_sent_date: str | None = None
 #     (armed, n, WR) from the shadow90 ledger — arming needs n>=100 AND
 #     WR>=90%. When armed AND enabled the bot logs a DRY-RUN line (no
 #     order placement — no bookmaker API exists in this build).
-BOT_VERSION = "v10.120"
+# v10.121 — LEDGER POCKET BADGES (user request Sep 19: "flag the 90%
+#     signals inside the signal so I know when to bet"). The three
+#     measured pockets from the Sep 12-18 ledger (n=278; 230
+#     corner-resolvable, 108 card-resolvable) become VISIBLE badges in
+#     the Telegram signal message — DISPLAY-ONLY: never gates, never
+#     bets, never blocks a send; the EOD grades each pocket nightly:
+#     (1) 90-POCKET badge: the SHADOW-90 rule (21-40' + SOT>=3/CRITICAL,
+#         any-goal 93.5% n=46) printed with its live sub-flags (SOT>=4:
+#         100% n=16; 0-0: 96% n=23; GPS>=80: 95% n=22) and the bet
+#         frame (Over total @ live >= 1.20). Same rule the shadow90
+#         ledger stamps use — now also human-visible.
+#     (2) CORNER-POCKET badge: corners-lean OVER at 51'+ — band stats
+#         51-60' 86% (18/21), 61-70' 88% (7/8), 71'+ 100% (11/11;
+#         cumulative 51'+ 90% n=40, avg paper win odds 1.89).
+#     (3) CARDS-POCKET badge: any cards lean at 60'+ — 94% (15/16,
+#         avg paper win odds 1.84).
+#     (4) GOAL-BURST alerts gain a ledger-check line (G2 88% 38/43,
+#         G3 78% 7/9 — signal-state dedup) beside the lab numbers.
+#     EOD: new analyze_pockets section = the badges' scoreboard (day +
+#     cumulative). Market-block live-edit prefix is re-captured AFTER
+#     the badges so editMessageText refreshes never drop them (the
+#     byte-stability contract is preserved for non-pocket signals).
+# v10.122 — STRICT >=90% POCKET BADGES (user request Sep 20: "which corner
+#     or card bet time period reaches 90% winrate and more — flag it").
+#     Re-graded every corner/cards period x direction on the Sep 12-18
+#     ledger; ONLY periods with WR >= 90% are badged now (Sep 20
+#     sep20_90periods.py scan):
+#     (1) CORNER-POCKET fires on: OVER lean 61'+ (94.7% 18/19; the 71'+
+#         band is 100% 11/11, 51'+ cumulative 90% 36/40); UNDER lean
+#         51-60' (90.9% 10/11) and UNDER lean 71'+ (90.0% 9/10).
+#         The old 51-60' OVER band (85.7%) is NO LONGER badged — it
+#         never reached 90.
+#     (2) CARDS-POCKET fires on: UNDER lean 60'+ (100% 11/11; any-lean
+#         60'+ context 93.8% 15/16) and OVER lean 51-70' (100% 7/7 —
+#         every historical case rode a corners lean on the same
+#         signal). Late OVER 71'+ (75% 3/4) is NOT badged.
+#     (3) zero_zero 90-POCKET sub-flag scoped to 21-35' only (verified
+#         95.7% 22/23; the wider 21-40' 0-0 slice is 87.5% 28/32).
+#     EOD analyze_pockets re-cut to grade exactly these rules.
+BOT_VERSION = "v10.122"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -6531,6 +6580,7 @@ def _goalburst_send_alert(entry: dict, label: str) -> None:
                 f"maxGPS {entry['max_gps']:.0f} — "
                 f"{'BLIND class (no pressure signal fired)' if entry['gps_blind'] else 'pressure already lit'}\n"
                 f"bet frame: {entry['bet_desc']} — informational, compare the live O-line price\n"
+                f"ledger-check (Sep 12-18 signals): {_GB_LEDGER_V121.get(entry.get('gb_class') or '', 'n/a')}\n"
                 f"\U0001f4b0 {_odds_line} | break-even {_be} — bet only above\n"
                 f"[{BOT_VERSION}]"
             ))
@@ -10857,7 +10907,11 @@ def _shadow90_rule(minute, sot, tier, gps=None, cur_total=None):
         flags = []
         if _s >= 4:
             flags.append("sot4")
-        if cur_total == 0:
+        if cur_total == 0 and _m <= 35:
+            # v10.121a scope fix: the verified pocket is 21-35' + 0-0
+            # (95.7%, 22/23); the wider 21-40' 0-0 slice is only 87.5%
+            # (28/32) — never badge the wider window with the tighter
+            # number (Sep 20 session check).
             flags.append("zero_zero")
         try:
             if gps is not None and float(gps) >= 80.0:
@@ -10867,6 +10921,108 @@ def _shadow90_rule(minute, sot, tier, gps=None, cur_total=None):
         return "core", flags
     except Exception:
         return None, []
+
+
+# v10.121: LEDGER POCKETS — the measured pockets the signal badges
+# advertise (Sep 12-18 ledger backtest; re-verify at the next
+# recalibration pass). DISPLAY-ONLY numbers: (wr, hits, n) tuples with
+# pushes already excluded from n. The EOD analyze_pockets section is
+# their scoreboard; the badges never gate, never bet.
+# v10.122: STRICT >=90% re-cut — same ledger, every period x direction
+# re-graded (scripts/sep20_90periods.py); only >=90% slices are badged.
+_S90_POCKET_V121 = (0.935, 43, 46)       # 21-40' SOT>=3/CRIT any-goal
+_S90_SUB_V121 = {
+    "sot4": (1.00, 16, 16),
+    "zero_zero": (0.957, 22, 23),        # 21-35' only (v10.122 scope)
+    "gps80": (0.955, 21, 22),
+}
+_CORNER_OVER_61_V122 = (0.947, 18, 19)    # corners OVER 61'+ rule
+_CORNER_OVER_71_V122 = (1.00, 11, 11)    # corners OVER 71'+ band
+_CORNER_OVER_51_CUM_V122 = (0.90, 36, 40)  # corners OVER 51'+ cumulative
+_CORNER_UNDER_5160_V122 = (0.909, 10, 11)  # corners UNDER 51-60'
+_CORNER_UNDER_71_V122 = (0.90, 9, 10)      # corners UNDER 71'+
+_CORNER_AVG_ODDS_V122 = 1.89
+_CARDS_UNDER_60_V122 = (1.00, 11, 11)     # cards UNDER 60'+ rule
+_CARDS_ANY_60_V122 = (0.938, 15, 16)     # cards any lean 60'+ (context)
+_CARDS_OVER_5170_V122 = (1.00, 7, 7)     # cards OVER 51-70' rule
+_CARDS_AVG_ODDS_V122 = 1.84
+
+
+def _pocket_badges_122(minute, mkt_extras) -> str:
+    """v10.122: STRICT >=90% corner/cards pocket badge lines.
+
+    Only periods whose Sep 12-18 ledger WR reached 90%+ are badged
+    (user request: "flag it when the period is 90% winrate and more"):
+      corners OVER  61'+  (94.7% 18/19; 71'+ band 100% 11/11)
+      corners UNDER 51-60' (90.9% 10/11) and 71'+ (90.0% 9/10)
+      cards  UNDER 60'+  (100% 11/11; any-lean 60'+ 93.8% 15/16)
+      cards  OVER  51-70' (100% 7/7)
+    The sub-90 slices (corners OVER 51-60' 85.7%, corners UNDER 61-70'
+    72.7%, cards late OVER 71'+ 75%) deliberately get NO badge. One
+    line per matched pocket with plain ledger numbers and avg paper
+    win odds — display-only, no advice, no gating. The 90-POCKET
+    (SHADOW-90) badge is rendered separately in the send path.
+    Defensive: ANY failure returns "".
+    """
+    try:
+        _m = int(minute or 0)
+        _ex = mkt_extras or {}
+        out = []
+        _cl = (_ex.get("mkt_corners_lean") or "").upper()
+        if "OVER" in _cl and _m >= 61:
+            if _m >= 71:
+                _wr, _h, _n = _CORNER_OVER_71_V122
+                _rwr, _rh, _rn = _CORNER_OVER_61_V122
+                out.append(
+                    f"\n\U0001f3af CORNER-POCKET — OVER lean 71'+ ledger "
+                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
+                    f"\u00b7 61'+ rule {int(round(_rwr * 100))}% ({_rh}/{_rn}) "
+                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                )
+            else:
+                _wr, _h, _n = _CORNER_OVER_61_V122
+                _cwr, _ch, _cn = _CORNER_OVER_51_CUM_V122
+                out.append(
+                    f"\n\U0001f3af CORNER-POCKET — OVER lean 61'+ ledger "
+                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
+                    f"\u00b7 51'+ cum {int(round(_cwr * 100))}% ({_ch}/{_cn}) "
+                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                )
+        elif "UNDER" in _cl:
+            if 51 <= _m <= 60:
+                _wr, _h, _n = _CORNER_UNDER_5160_V122
+                out.append(
+                    f"\n\U0001f3af CORNER-POCKET — UNDER lean 51-60' ledger "
+                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
+                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                )
+            elif _m >= 71:
+                _wr, _h, _n = _CORNER_UNDER_71_V122
+                out.append(
+                    f"\n\U0001f3af CORNER-POCKET — UNDER lean 71'+ ledger "
+                    f"{int(round(_wr * 100))}% ({_h}/{_n}) "
+                    f"\u00b7 avg paper odds {_CORNER_AVG_ODDS_V122:.2f}"
+                )
+        _kl = (_ex.get("mkt_cards_lean") or "").upper()
+        if "UNDER" in _kl and _m >= 60:
+            _wr, _h, _n = _CARDS_UNDER_60_V122
+            _awr, _ah, _an = _CARDS_ANY_60_V122
+            out.append(
+                f"\n\U0001f3af CARDS-POCKET — UNDER lean 60'+ ledger "
+                f"{int(round(_wr * 100))}% ({_h}/{_n}) "
+                f"\u00b7 any lean 60'+ {int(round(_awr * 100))}% ({_ah}/{_an}) "
+                f"\u00b7 avg paper odds {_CARDS_AVG_ODDS_V122:.2f}"
+            )
+        elif "OVER" in _kl and 51 <= _m <= 70:
+            _wr, _h, _n = _CARDS_OVER_5170_V122
+            out.append(
+                f"\n\U0001f3af CARDS-POCKET — OVER lean 51-70' ledger "
+                f"{int(round(_wr * 100))}% ({_h}/{_n}) "
+                f"\u00b7 avg paper odds {_CARDS_AVG_ODDS_V122:.2f}"
+            )
+        return "".join(out)
+    except Exception:
+        return ""
 
 
 # (6) v10.120: AUTO-BET STUB — no order-placement code exists in this
@@ -17570,6 +17726,30 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 _s90_price120 = float(_odds_msg["over_odds"])
         except Exception:
             _s90_price120 = None
+        # v10.121: 90-POCKET BADGE — the SHADOW-90 rule made VISIBLE in the
+        # message (user request: "flag the 90% signals so I know when to
+        # bet"). Ledger-verified numbers + the bet frame; the pocket
+        # itself is NEVER bet by the bot (EOD grades it, arming bars
+        # live in the SHADOW-90 EOD section). Sits BEFORE the market
+        # block -> inside the live-edit prefix, never dropped on refresh.
+        try:
+            if _s90_rule:
+                _wr121, _h121, _n121 = _S90_POCKET_V121
+                _bits121 = [f"{int(round(_wr121 * 100))}% any-goal ({_h121}/{_n121})"]
+                for _fl121, (_fwr, _fh, _fn) in _S90_SUB_V121.items():
+                    if _fl121 in _s90_flags:
+                        _bits121.append(
+                            f"{_fl121.replace('zero_zero', '0-0').replace('_', '-')}:"
+                            f" {int(round(_fwr * 100))}% ({_fh}/{_fn})"
+                        )
+                msg += (
+                    "\n\U0001f3af 90-POCKET — 21-40' + SOT>=3/CRIT: "
+                    + " \u00b7 ".join(_bits121)
+                    + "\n    bet frame: Over total (next goal) @ live >= "
+                    f"{SHADOW90_PRICE_MIN:.2f} \u2014 EOD grades it, bot never bets"
+                )
+        except Exception as _p90e121:
+            log.debug(f"  v10.121 90-pocket badge skipped: {_p90e121}")
         # v10.111: manual-price invitation when neither live feed produced
         # a price for the message (api-sports empty AND feed-2 empty/absent).
         try:
@@ -17768,6 +17948,18 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                          for k, v in _shadow105.items() if v))
                     + " (paper, EOD-graded)"
                 )
+            # v10.121: CORNER/CARDS pocket badges ride the message BEFORE
+            # the market block, then the live-edit prefix is re-captured —
+            # editMessageText refreshes rebuild the last chunk from the
+            # prefix + a new block, so the badges survive every edit.
+            # v10.122: strict >=90% pockets only (see _pocket_badges_122).
+            try:
+                _pocket_txt_122 = _pocket_badges_122(minute, _mkt_extras)
+                if _pocket_txt_122:
+                    msg += _pocket_txt_122
+                    _msg_prefix_80 = msg
+            except Exception as _pe122:
+                log.debug(f"  v10.122 pocket badge skipped: {_pe122}")
             if _mkt_block:
                 msg += _mkt_block
         except Exception as _me80:
