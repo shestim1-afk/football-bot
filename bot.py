@@ -1008,7 +1008,26 @@ _ratio117_sent_date: str | None = None
 #     (3) zero_zero 90-POCKET sub-flag scoped to 21-35' only (verified
 #         95.7% 22/23; the wider 21-40' 0-0 slice is 87.5% 28/32).
 #     EOD analyze_pockets re-cut to grade exactly these rules.
-BOT_VERSION = "v10.122"
+# v10.123 — BOARD REDEPLOY FIX + POCKET RECEIPTS (user request Sep 19:
+#     "why on each redeploy I receive the goals board?" + "yes" to
+#     real-grade corner/card pockets):
+#     (1) GOALS BOARD once-per-day marker hardened: atomic write
+#         (tmp + os.replace) so a torn write can never lose the marker;
+#         write/read failures now log WARNINGs (silent except-swallow
+#         could hide an unwritable /data); the auto-send trigger logs
+#         the marker date vs today so a re-send is diagnosable from
+#         the logs; startup logs the marker state.
+#     (2) CORNER/CARDS-POCKET badges now invite the real-price
+#         receipt: "reply /price corners|cards <odds>" under the badge.
+#         No live corners/cards feed exists (feed-2 = goals totals
+#         only; api-sports live odds had zero coverage — the v10.111
+#         verdict), so YOUR book price via /price IS the live price.
+#     (3) /price corners|cards margin gate bypassed for pocket signals
+#         (_pocket_eligible_123) — the >=90% rule is the bet reason,
+#         not |proj-line|.
+#     (4) EOD LEDGER POCKETS P&L split into REAL RECEIPTS (manual
+#         /price freezes) vs prematch paper (upper bound) per rule.
+BOT_VERSION = "v10.123"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -11020,9 +11039,43 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                 f"{int(round(_wr * 100))}% ({_h}/{_n}) "
                 f"\u00b7 avg paper odds {_CARDS_AVG_ODDS_V122:.2f}"
             )
+        # v10.123: receipt invitations — no live corners/cards feed
+        # exists (feed-2 = goals totals only), so the USER's book price
+        # via /price IS the real price. One hint per matched market.
+        if any("CORNER-POCKET" in _l for _l in out):
+            out.append(
+                "\n    reply /price corners 1.95 \u2192 freezes YOUR book "
+                "price (EOD grades this pocket at it)"
+            )
+        if any("CARDS-POCKET" in _l for _l in out):
+            out.append(
+                "\n    reply /price cards 1.90 \u2192 freezes YOUR book "
+                "price (EOD grades this pocket at it)"
+            )
         return "".join(out)
     except Exception:
         return ""
+
+
+def _pocket_eligible_123(kind: str, minute, lean) -> bool:
+    """v10.123: True when a corners/cards lean sits inside one of the
+    v10.122 >=90% pocket rules. Such signals may freeze a manual
+    /price receipt WITHOUT the generic |proj-line| margin gate — the
+    pocket rule is the bet reason, not the projection margin. Mirrors
+    _pocket_badges_122 exactly (keep the two in sync)."""
+    try:
+        _m = int(minute or 0)
+        _l = (lean or "").upper()
+        if kind == "corners":
+            return (("OVER" in _l and _m >= 61)
+                    or ("UNDER" in _l and 51 <= _m <= 60)
+                    or ("UNDER" in _l and _m >= 71))
+        if kind == "cards":
+            return (("UNDER" in _l and _m >= 60)
+                    or ("OVER" in _l and 51 <= _m <= 70))
+        return False
+    except Exception:
+        return False
 
 
 # (6) v10.120: AUTO-BET STUB — no order-placement code exists in this
@@ -12120,22 +12173,42 @@ def _gb_today() -> str:
 
 
 def _gb_sent_date() -> str:
-    """Load the persisted sent-marker (redeploy-proof, EOD pattern)."""
+    """Load the persisted sent-marker (redeploy-proof, EOD pattern).
+    v10.123: read failures log a WARNING (silent except-swallow could
+    hide an unwritable /data and re-send the board every redeploy)."""
     try:
         if os.path.exists(GOALSBOARD_SENT_FILE):
             with open(GOALSBOARD_SENT_FILE, "r", encoding="utf-8") as f:
                 return f.read().strip()
-    except Exception:
-        pass
+    except Exception as _gbre:
+        log.warning(
+            "v10.123: goals board marker unreadable (%s) — %s"
+            % (GOALSBOARD_SENT_FILE, _gbre)
+        )
     return ""
 
 
 def _gb_mark_sent() -> None:
+    """v10.123: ATOMIC marker write (tmp + os.replace) — a torn write
+    can never leave a half-written/missing marker (which would re-send
+    the board on every redeploy). Write failures log WARNINGs."""
+    _tmp123 = GOALSBOARD_SENT_FILE + ".tmp"
     try:
-        with open(GOALSBOARD_SENT_FILE, "w", encoding="utf-8") as f:
+        with open(_tmp123, "w", encoding="utf-8") as f:
             f.write(_gb_today())
-    except Exception:
-        pass
+        os.replace(_tmp123, GOALSBOARD_SENT_FILE)
+    except Exception as _gbwe:
+        log.warning(
+            "v10.123: goals board marker write FAILED (%s) — %s "
+            "the board WILL re-send on the next restart until this is "
+            "fixed (check /data writability)"
+            % (GOALSBOARD_SENT_FILE, _gbwe)
+        )
+        try:
+            if os.path.exists(_tmp123):
+                os.remove(_tmp123)
+        except Exception:
+            pass
 
 
 def _gb_total_lambda(l5_h: dict | None, l5_a: dict | None,
@@ -12421,6 +12494,14 @@ def _maybe_send_goals_board(client: httpx.Client) -> None:
             return
         if fast_monitored:
             return  # a monitored match is live — defer, retry next pass
+        # v10.123: the re-send diagnostic line — every auto-send now
+        # logs WHY it fired (marker date vs today + the file path), so
+        # a board arriving after a redeploy is explainable from logs.
+        log.info(
+            "v10.123: goals board auto-send triggered — marker=%s today=%s "
+            "(%s)" % (_gb_sent_date() or "none", _gb_today(),
+                      GOALSBOARD_SENT_FILE)
+        )
         _gb_start_report(client, manual=False)
     except Exception as _e:
         log.debug(f"v10.99: goals board hook skipped: {_e}")
@@ -14801,7 +14882,11 @@ def _price_apply_shadow(entry: dict, kind: str, odds: float) -> str:
         margin = abs(float(proj) - float(line))
     except (TypeError, ValueError):
         margin = None
-    if proj is None or margin is None or margin < SHADOW_MIN_MARGIN:
+    # v10.123: pocket signals (the >=90% v10.122 rules) freeze WITHOUT
+    # the margin gate — the pocket rule is the bet reason, not |proj-
+    # line|. The receipt hint rides the badge in the signal message.
+    _pk123 = _pocket_eligible_123(kind, minute, lean)
+    if not _pk123 and (proj is None or margin is None or margin < SHADOW_MIN_MARGIN):
         return (f"\u274c {word} shadow cell needs |proj \u2212 line| \u2265 "
                 f"{SHADOW_MIN_MARGIN:g} (this signal: proj {proj} vs line "
                 f"{line}) \u2014 outside the strongest cell.")
@@ -14812,8 +14897,10 @@ def _price_apply_shadow(entry: dict, kind: str, odds: float) -> str:
     rewrite_outcomes_file()
     return (f"\U0001f7e1 SHADOW BET FROZEN \u2014 {word} {lean} "
             f"{_fmt_g(line)} @ {odds:.2f} (manual price) \u00b7 "
-            f"{entry.get('team_name')} {entry.get('game_minute')}\u2019\n"
-            "\u2192 paper trade, EOD-graded at the real price")
+            f"{entry.get('team_name')} {entry.get('game_minute')}\u2019"
+            + (" \u00b7 \U0001f3af pocket rule (>=90% ledger cell)"
+               if _pk123 else "")
+            + "\n\u2192 paper trade, EOD-graded at the real price")
 
 
 def _handle_price_command(client: httpx.Client, text: str,
@@ -19503,6 +19590,23 @@ def main():
         "our tracked leagues), so real prices need a second feed or a "
         "human eye; this version has both"
     )
+    # v10.123: goals-board once-per-day marker state at boot — the FIRST
+    # place to look when the board re-sends after a redeploy. If this
+    # says "skip" and a board still arrives, the marker write is failing
+    # (see the WARNING from _gb_mark_sent); if it says "send", the boot
+    # simply preceded today's first successful send (bot was down or
+    # redeployed before 10:00 Sofia).
+    try:
+        log.info(
+            "v10.123: goals board marker=%s today=%s -> %s (%s)"
+            % (_gb_sent_date() or "none", _gb_today(),
+               "SKIP (already sent today)"
+               if _gb_sent_date() == _gb_today()
+               else "send once after 10:00 Sofia",
+               GOALSBOARD_SENT_FILE)
+        )
+    except Exception:
+        pass
     log.info(
         "v10.112 TOPSCORER PARSE FIX active: /players/topscorers nests the "
         "club INSIDE statistics[] — v10.98 read a top-level 'team' key "
