@@ -1151,6 +1151,104 @@ def analyze_shadow90(day_signals: list[dict], all_outcomes: list[dict]) -> list[
     return lines
 
 
+def analyze_pockets(day_signals: list[dict], all_outcomes: list[dict]) -> list[str]:
+    """v10.122: LEDGER POCKETS — STRICT >=90% badge scoreboard.
+
+    The v10.122 badges only advertise periods whose Sep 12-18 ledger
+    WR reached 90%+ (every period x direction re-graded Sep 20). This
+    EOD section grades EXACTLY those rules nightly from the standard
+    fields (signal minute + lean + FT totals — no ledger stamps):
+      corners OVER  61'+      (94.7% 18/19; 71'+ band 100% 11/11)
+      corners UNDER 51-60'    (90.9% 10/11) / 71'+ (90.0% 9/10)
+      cards  UNDER  60'+      (100% 11/11; any-lean 60'+ 93.8% 15/16)
+      cards  OVER  51-70'     (100% 7/7)
+    Day row + cumulative row per rule with paper P&L at the recorded
+    market odds (prematch freezes = upper bound, the usual caveat).
+    This is the scoreboard for the badges the user bets manually on
+    — the bot itself never bets."""
+    lines = ["", "=== LEDGER POCKETS (>=90% rules — v10.122 badge scoreboard) ==="]
+
+    def _pocket_rows(signals, market, lo, hi, leans):
+        rows = []
+        for s in signals:
+            try:
+                m = int(s.get("game_minute") or 0)
+                lean = (s.get(f"mkt_{market}_lean") or "").upper()
+                if m < lo or m > hi or not any(x in lean for x in leans):
+                    continue
+                line_v = s.get(f"mkt_{market}_line")
+                ftt = s.get(f"ft_{market}_total")
+                if line_v is None or ftt is None:
+                    continue
+                if "OVER" in lean:
+                    res = "W" if ftt > line_v else ("P" if ftt == line_v else "L")
+                else:
+                    res = "W" if ftt < line_v else ("P" if ftt == line_v else "L")
+                rows.append((s, res))
+            except Exception:
+                continue
+        return rows
+
+    def _wr(rows):
+        graded = [r for _, r in rows if r != "P"]
+        if not graded:
+            return "n/a"
+        w = sum(1 for r in graded if r == "W")
+        return f"{100 * w / len(graded):.0f}% ({w}/{len(graded)})"
+
+    def _cnt(rows):
+        return sum(1 for _, r in rows if r != "P")
+
+    def _pnl(rows, market):
+        pnl = 0.0
+        priced = 0
+        for s, res in rows:
+            if res == "P":
+                continue
+            odds = (s.get(f"mkt_{market}_over_odds")
+                    if (s.get(f"mkt_{market}_lean") or "").upper() == "OVER"
+                    else s.get(f"mkt_{market}_under_odds"))
+            if not odds:
+                continue
+            priced += 1
+            pnl += (float(odds) - 1.0) if res == "W" else -1.0
+        return pnl, priced
+
+    # v10.122: exactly the rules the badges advertise (strict >=90%).
+    _RULES = [
+        ("corners", "CORNER OVER 61'+  (badge rule)", 61, 200, ("OVER",)),
+        ("corners", "CORNER OVER 71'+  (band)", 71, 200, ("OVER",)),
+        ("corners", "CORNER UNDER 51-60' (badge rule)", 51, 60, ("UNDER",)),
+        ("corners", "CORNER UNDER 71'+ (badge rule)", 71, 200, ("UNDER",)),
+        ("cards", "CARDS UNDER 60'+  (badge rule)", 60, 200, ("UNDER",)),
+        ("cards", "CARDS any lean 60'+ (context)", 60, 200, ("OVER", "UNDER")),
+        ("cards", "CARDS OVER 51-70' (badge rule)", 51, 70, ("OVER",)),
+    ]
+    _any_day = False
+    for market, label, lo, hi, leans in _RULES:
+        d_rows = _pocket_rows(day_signals, market, lo, hi, leans)
+        a_rows = _pocket_rows(all_outcomes, market, lo, hi, leans)
+        if d_rows:
+            _any_day = True
+        lines.append(
+            f"  {label}: day {_cnt(d_rows)} graded, "
+            f"WR {_wr(d_rows)} | cumulative {_wr(a_rows)}"
+        )
+        if a_rows:
+            pnl_a, pr_a = _pnl(a_rows, market)
+            lines.append(
+                f"    cumulative paper P&L {pnl_a:+.2f}u on {pr_a} priced "
+                "(prematch odds = upper bound)"
+            )
+    if not _any_day:
+        lines.append("  (no pocket-eligible signals today)")
+    lines.append(
+        "  NOTE: badges are display-only; these rows are their scoreboard "
+        "— manual betting stays the user's call."
+    )
+    return lines
+
+
 # ============================================================
 # v10.117: RATIO-TRIAL ANALYSIS (tagged trial alerts — never gate signals)
 # ============================================================
@@ -1715,6 +1813,10 @@ def main():
         # AUTO-BET arming bars (cumulative ledger)
         report_lines.append("")
         report_lines.append(analyze_shadow90(day_signals, all_outcomes))
+        # v10.121: ledger pockets scoreboard — the corner 51+' OVER /
+        # cards 60'+ badges (display-only in bot.py) get graded here
+        report_lines.append("")
+        report_lines.append(analyze_pockets(day_signals, all_outcomes))
         # v10.117: ratio-trial section — offside-pressure / card-radar /
         # corner-cluster trials + the signal-time ratio stamps
         report_lines.append("")
