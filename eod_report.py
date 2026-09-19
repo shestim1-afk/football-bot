@@ -1062,6 +1062,95 @@ def analyze_fastlane(shadows: list[dict], day_signals: list[dict]) -> list[str]:
     return lines
 
 
+def analyze_shadow90(day_signals: list[dict], all_outcomes: list[dict]) -> list[str]:
+    """v10.120: SHADOW-90 — the 21-40' SOT>=3/CRITICAL any-goal pocket.
+
+    The user's 90%-winrate strategy, run as PAPER ONLY (never bet, never
+    sent — stamped on the outcome record at signal time). Graded with the
+    MARKET rule: HIT = any goal in the match after the signal minute
+    (pred_actual_total_goals > goals at signal). Reports the sub-slices
+    (sot4 / zero_zero / gps80 / price_ok), the priced paper P&L for the
+    price_ok subset, and the AUTO-BET arming bars computed on the
+    cumulative ledger (n >= 100 AND WR >= 90%).
+    """
+    lines = ["", "=== SHADOW-90 PAPER STRATEGY (21-40' pocket, never bet) ==="]
+    stamped = [s for s in day_signals if s.get("shadow90") and s.get("shadow90_rule")]
+    if not stamped:
+        lines.append("  (no shadow90-stamped signals today)")
+        lines.append("  arming bars: see cumulative line below (stamps start v10.120)")
+        return lines
+    lines.append(f"  Stamped signals: {len(stamped)}")
+
+    def _mkt_hit(s: dict):
+        try:
+            ft = s.get("pred_actual_total_goals")
+            at = (s.get("goals_at_signal") or 0) + (s.get("opponent_goals_at_signal") or 0)
+            if ft is None or at is None:
+                return None
+            return ft > at
+        except Exception:
+            return None
+
+    resolved = [(s, _mkt_hit(s)) for s in stamped]
+    resolved = [(s, h) for s, h in resolved if h is not None]
+    if not resolved:
+        lines.append("  none resolved yet — market-rule grades appear after FT")
+        return lines
+    n = len(resolved)
+    h = sum(1 for _, x in resolved if x)
+    lines.append(f"  Resolved: {n} | any goal after signal: {h}/{n} ({100 * h / n:.0f}%)")
+
+    # Sub-slices the bot stamps at signal time
+    for flag in ("sot4", "zero_zero", "gps80"):
+        sub = [(s, x) for s, x in resolved if flag in (s.get("shadow90_flags") or [])]
+        if sub:
+            f_h = sum(1 for _, x in sub if x)
+            lines.append(f"    +{flag}: {f_h}/{len(sub)} ({100 * f_h / len(sub):.0f}%)")
+
+    # price_ok subset — live price >= 1.20 at signal: paper P&L, flat 1u
+    priced = [(s, x) for s, x in resolved
+              if s.get("shadow90_price_ok") and s.get("shadow90_live_price")]
+    if priced:
+        p_h = sum(1 for _, x in priced if x)
+        pnl = sum(
+            (float(s["shadow90_live_price"]) - 1.0) if x else -1.0
+            for s, x in priced
+        )
+        lines.append(
+            f"    +price_ok (live >= 1.20): {p_h}/{len(priced)} "
+            f"({100 * p_h / len(priced):.0f}%) | paper P&L {pnl:+.2f}u flat 1u"
+        )
+
+    # AUTO-BET arming bars on the CUMULATIVE ledger
+    try:
+        cum = [(s, _mkt_hit(s)) for s in all_outcomes
+               if s.get("shadow90") and s.get("shadow90_rule")]
+        cum = [(s, x) for s, x in cum if x is not None]
+        cn = len(cum)
+        ch = sum(1 for _, x in cum if x)
+        cwr = (ch / cn) if cn else 0.0
+        armed = cn >= 100 and cwr >= 0.90
+        lines.append("")
+        lines.append("  AUTO-BET ARMING BARS (cumulative, need BOTH):")
+        lines.append(
+            f"    volume: {cn}/100 resolved shadow90: "
+            f"{'PASS' if cn >= 100 else 'accumulating'}"
+        )
+        lines.append(
+            f"    win rate: {ch}/{cn} ({100 * cwr:.0f}%) vs 90% target: "
+            f"{'PASS' if cwr >= 0.90 else 'below'}"
+        )
+        lines.append(
+            "    status: "
+            + ("ARMED (AUTO_BET_ENABLED switch still False — dry-run only)"
+               if armed else "not armed — shadow continues, NO bets")
+        )
+    except Exception as e:
+        lines.append(f"  (cumulative arming calc skipped: {e})")
+    lines.append("  NOTE: paper measurement only — the bot never bets this pocket.")
+    return lines
+
+
 # ============================================================
 # v10.117: RATIO-TRIAL ANALYSIS (tagged trial alerts — never gate signals)
 # ============================================================
@@ -1622,6 +1711,10 @@ def main():
         # v10.50: fast-lane shadow section — what would events-feed firing have done?
         report_lines.append("")
         report_lines.append(analyze_fastlane(day_shadow, day_signals))
+        # v10.120: shadow-90 paper strategy — the 21-40' any-goal pocket +
+        # AUTO-BET arming bars (cumulative ledger)
+        report_lines.append("")
+        report_lines.append(analyze_shadow90(day_signals, all_outcomes))
         # v10.117: ratio-trial section — offside-pressure / card-radar /
         # corner-cluster trials + the signal-time ratio stamps
         report_lines.append("")
