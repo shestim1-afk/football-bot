@@ -1200,19 +1200,44 @@ def analyze_pockets(day_signals: list[dict], all_outcomes: list[dict]) -> list[s
         return sum(1 for _, r in rows if r != "P")
 
     def _pnl(rows, market):
-        pnl = 0.0
-        priced = 0
+        """v10.123: P&L split into REAL RECEIPTS vs prematch paper.
+
+        A row graded at a frozen manual /price receipt
+        ({market}_shadow_odds_src == manual|live) counts as REAL — the
+        user's actual book price; everything else uses the prematch
+        paper odds (upper bound, the usual caveat). Returns
+        (pnl_real, priced_real, pnl_paper, priced_paper)."""
+        pnl_r = pnl_p = 0.0
+        pr_r = pr_p = 0
         for s, res in rows:
             if res == "P":
                 continue
-            odds = (s.get(f"mkt_{market}_over_odds")
-                    if (s.get(f"mkt_{market}_lean") or "").upper() == "OVER"
-                    else s.get(f"mkt_{market}_under_odds"))
+            odds = None
+            real = False
+            if (s.get(f"{market}_shadow_odds_src") or "") in ("manual", "live"):
+                try:
+                    odds = float(s.get(f"{market}_shadow_odds"))
+                    real = True
+                except (TypeError, ValueError):
+                    odds = None
+            if not odds:
+                odds = (s.get(f"mkt_{market}_over_odds")
+                        if (s.get(f"mkt_{market}_lean") or "").upper() == "OVER"
+                        else s.get(f"mkt_{market}_under_odds"))
             if not odds:
                 continue
-            priced += 1
-            pnl += (float(odds) - 1.0) if res == "W" else -1.0
-        return pnl, priced
+            try:
+                odds = float(odds)
+            except (TypeError, ValueError):
+                continue
+            win = (odds - 1.0) if res == "W" else -1.0
+            if real:
+                pnl_r += win
+                pr_r += 1
+            else:
+                pnl_p += win
+                pr_p += 1
+        return pnl_r, pr_r, pnl_p, pr_p
 
     # v10.122: exactly the rules the badges advertise (strict >=90%).
     _RULES = [
@@ -1235,11 +1260,17 @@ def analyze_pockets(day_signals: list[dict], all_outcomes: list[dict]) -> list[s
             f"WR {_wr(d_rows)} | cumulative {_wr(a_rows)}"
         )
         if a_rows:
-            pnl_a, pr_a = _pnl(a_rows, market)
-            lines.append(
-                f"    cumulative paper P&L {pnl_a:+.2f}u on {pr_a} priced "
-                "(prematch odds = upper bound)"
-            )
+            pnl_r, pr_r, pnl_p, pr_p = _pnl(a_rows, market)
+            _bits123 = []
+            if pr_r:
+                _bits123.append(f"REAL receipts {pnl_r:+.2f}u on {pr_r}")
+            if pr_p:
+                _bits123.append(f"prematch paper {pnl_p:+.2f}u on {pr_p} "
+                                "(upper bound)")
+            if _bits123:
+                lines.append(
+                    "    cumulative P&L: " + " | ".join(_bits123)
+                )
     if not _any_day:
         lines.append("  (no pocket-eligible signals today)")
     lines.append(
