@@ -929,7 +929,37 @@ _ratio117_sent_date: str | None = None
 #     (prematch odds = upper bound) + /price receipts as the real subset.
 #     No feed carries these markets live (measured), so the manual
 #     receipt is the capture path — /price cards|corners already exists.
-BOT_VERSION = "v10.119"
+# v10.120 — MODEL RECAL + EDGE GATE + SHADOW-90 (user request Sep 19):
+# (1) RECALIBRATION: the Sep 12-18 ledger (n=278) shows the team-scores
+#     prediction UNDERSOLD itself in every bucket (pred 49% vs actual 58%;
+#     worst bucket pred 45% vs actual 60%). New _recal_p bucket tables
+#     (_TEAM_SCORES_RECAL / _ANY_GOAL_RECAL) applied on top of the shipped
+#     chain; v2 fair prices + EV use the recalibrated numbers. Old fields
+#     (pred_team_scores / _cal) recorded untouched beside the v2 ones so
+#     EOD grades old vs new head-to-head.
+# (2) MINUTE WEIGHTING: _team_scores_empirical recalibrated with the 7-band
+#     measured table (21-30' 82% / 31-40' 67% / 41-50' 62% / 51-60' 50% /
+#     61-70' 40% / 71-80' 38%) — the v10.78 4-band table was the scheduled
+#     2-week recalibration, this IS it.
+# (3) EDGE GATE: _apply_price_gate extended with a
+#     model-P minus implied-P check (EDGE_MIN_P=0.05): a live price whose
+#     implied P is within 5pts of the model P demotes BET -> NO_BET with
+#     gate NO_EDGE (a line on the message). House rule kept: odds never
+#     block the SEND, only demote the BET label. Kills the Sep-16-style
+#     live-priced late Over class (50% WR on 1.68 avg).
+# (4) FAST-LANE FEATURE: compute_goal_predictions gains fl_burst (1.0-1.18)
+#     — a goal-proximity / SOT-burst shadow within 180s lifts the signal
+#     team lambda (the graded trial: 21-60' full 100%). Recorded as
+#     fl_burst_applied in the ledger.
+# (5) SHADOW-90: signals in 21-40' with SOT>=3 or CRITICAL (ledger: 93.5%
+#     any-goal-after-signal, n=46) are stamped shadow90_* on the outcome
+#     record — NOT bet, NOT sent, graded in the EOD (any goal after the
+#     signal, market rule). Sub-flags: sot4 / zero_zero / gps80 / price_ok.
+# (6) AUTO-BET STUB: AUTO_BET_ENABLED=False. auto_bet_status() reports
+#     (armed, n, WR) from the shadow90 ledger — arming needs n>=100 AND
+#     WR>=90%. When armed AND enabled the bot logs a DRY-RUN line (no
+#     order placement — no bookmaker API exists in this build).
+BOT_VERSION = "v10.120"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -2411,6 +2441,7 @@ def compute_goal_predictions(
     form_mod_sig: float = 1.0,
     form_mod_opp: float = 1.0,
     h2h_mod: float | None = None,
+    fl_burst: float = 1.0,  # v10.120: fast-lane burst lift (1.0 = none)
 ) -> dict:
     """Compute over/under goal probabilities for the full match.
     
@@ -2427,6 +2458,11 @@ def compute_goal_predictions(
     v10.86: the final lambdas are then deflated by minute-banded empirical
     factors (PROJECTION_CAL_DEFLATE_SIG/OPP) measured on the settled ledger
     — the raw chain over-projects remaining goals, especially late.
+    v10.120: fl_burst (1.0-1.18) lifts the signal team lambda when a
+    fast-lane goal-proximity/SOT-burst trigger fired within 180s (graded
+    trial: 21-60' team-scores-by-FT 100%). Applied BEFORE the v10.86
+    deflate so the empirical correction still governs; recorded as
+    fl_burst_applied in the ledger for head-to-head grading.
     Returns dict with projected xG, over/under probs, and input features
     for future ML training.
     """
@@ -2507,6 +2543,21 @@ def compute_goal_predictions(
             proj_xg_signal *= REDCARD_LAMBDA_UP ** (-_net)
         _rc_applied = True
     
+    # v10.120: FAST-LANE BURST LIFT — a goal-proximity / SOT-burst shadow
+    # within 180s means the pressing team is mid-burst; lift its remaining
+    # lambda by a bounded factor (default lift 1.15, hard-capped 1.18).
+    # PREDICTION-ONLY: never a gate, never GPS input. Applied BEFORE the
+    # v10.86 deflate so the empirical correction still governs the total.
+    _fl_applied = False
+    try:
+        _fb = float(fl_burst)
+        if _fb > 1.001:
+            _fb = min(_fb, 1.18)
+            proj_xg_signal *= _fb
+            _fl_applied = True
+    except Exception:
+        pass
+
     # v10.86: EMPIRICAL CALIBRATION DEFLATE (see PROJECTION_CAL_DEFLATE_*).
     # Prediction ONLY — never a gate, never GPS input. Applied last so the
     # whole chain (rate -> remaining -> hotness -> scoreline -> reds ->
@@ -2633,6 +2684,9 @@ def compute_goal_predictions(
         "remaining_minutes": round(remaining, 0),
         "goal_diff_at_signal": goal_diff,
         "current_total_goals": current_total_goals,
+        # v10.120: fast-lane burst echo — whether the fl_burst lift fired
+        "fl_burst_applied": _fl_applied,
+        "fl_burst_value": round(float(fl_burst), 3),
     }
 
 
@@ -10696,24 +10750,157 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     return result
 
 
-def _team_scores_empirical(minute: int) -> float:
-    """v10.78: landed 'signaled team scored after signal' rate per minute
-    band, measured from the user's OWN ledger (Sep 6-8: 98/164 = 59.8% in
-    the 21-55 window; sub-bands 61.4% / 65.3% / 45.7%; 35.1% at 56'+).
-    The signal team is empirically nearly the SOLE source of future goals
-    (P(team)/P(any) ~= 0.98) — a lambda-split understates it. Bands are
-    thin (n~40-60): RECALIBRATE after ~2 weeks of records.
-    """
-    if minute <= 35:
-        return 0.614
-    if minute <= 45:
-        return 0.653
-    if minute <= 55:
-        return 0.457
-    return 0.351
-
-
 _TEAM_SCORES_FALLBACK = 0.575  # pooled 21-55 rate (98/164)
+
+# ============================================================
+# v10.120: MODEL RECALIBRATION + SHADOW-90 + AUTO-BET STUB
+# ============================================================
+# All four requested model points, measured on the Sep 12-18 ledger
+# (n=278 resolved): (1) bucket recalibration, (2) minute-band empirical
+# refresh, (3) edge gate, (4) fast-lane burst feature — plus the
+# SHADOW-90 paper strategy (NOT bet, EOD-graded) and the gated
+# AUTO-BET stub (never places orders — there is no bookmaker API in
+# this build; it only reports arming status).
+
+# (2) v10.120: MINUTE-BAND EMPIRICAL — the scheduled recalibration of
+# _team_scores_empirical, now with the Sep 12-18 measured bands
+# (team-scores-by-FT per signal minute; n=40-81 per band). Replaces
+# the v10.78 4-band table (Sep 6-8 data, docstring said "RECALIBRATE
+# after ~2 weeks" — this is that pass). Early signals convert far
+# better than late ones: remaining time is the dominant factor.
+_TEAM_SCORES_EMPIRICAL_V120 = [
+    (20, 0.60),   # 0-20'   3/5    (thin — floor at pooled rate)
+    (30, 0.825),  # 21-30'  33/40  THE sweet spot
+    (40, 0.674),  # 31-40'  29/43
+    (50, 0.617),  # 41-50'  50/81
+    (60, 0.50),   # 51-60'  21/42
+    (70, 0.40),   # 61-70'  14/35
+    (95, 0.375),  # 71-80'  12/32
+]
+
+
+def _team_scores_empirical(minute: int) -> float:
+    """v10.120: recalibrated landed 'signaled team scored after signal'
+    rate per minute band, measured from the user's OWN ledger Sep 12-18
+    (n=278; bands n=40-81 except the thin 0-20' tail). The signal team
+    remains nearly the sole source of future goals; the gradient is
+    dominated by REMAINING TIME (82% at 21-30' -> 38% at 71-80').
+    RECALIBRATE again after ~2 more weeks of records.
+    """
+    try:
+        m = int(minute)
+    except Exception:
+        return _TEAM_SCORES_FALLBACK
+    for _bound, _rate in _TEAM_SCORES_EMPIRICAL_V120:
+        if m <= _bound:
+            return _rate
+    return 0.375
+
+
+# (1) v10.120: BUCKET RECALIBRATION — the Sep 12-18 ledger shows the
+# shipped prediction UNDERSOLD itself in every bucket (avg pred 49%,
+# actual 58%; team-scores worst bucket pred 45% vs actual 60%). Table
+# maps (predicted bucket upper bound -> measured actual rate). Applied
+# on top of the shipped chain to produce v2 fair prices; the raw and
+# v10.78-cal numbers stay in the ledger so EOD grades old vs new.
+_TEAM_SCORES_RECAL = [
+    (0.30, 0.37), (0.40, 0.41), (0.50, 0.60),
+    (0.60, 0.60), (0.70, 0.74), (0.80, 0.76), (1.01, 0.80),
+]
+_ANY_GOAL_RECAL = [
+    (0.65, 0.74), (0.82, 0.85), (0.92, 0.90), (1.01, 0.92),
+]
+
+
+def _recal_p(p: float, table: list[tuple[float, float]]) -> float:
+    """v10.120: map a shipped probability onto the measured bucket rate.
+    Piecewise-constant, clamped to [0.02, 0.97] — never 0/1, so a fair
+    price always exists. Defensive: ANY failure returns the input p."""
+    try:
+        _p = float(p)
+        for _bound, _rate in table:
+            if _p < _bound:
+                return min(max(_rate, 0.02), 0.97)
+        return min(max(table[-1][1], 0.02), 0.97)
+    except Exception:
+        return p
+
+
+# (3) v10.120: EDGE GATE threshold — demote BET -> NO_BET when the live
+# price's implied P is within this margin of the model P (no edge left
+# to harvest). Env-overridable; 0 disables (pure v10.103 behaviour).
+EDGE_MIN_P = float(os.environ.get("EDGE_MIN_P", "0.05"))
+
+# (5) v10.120: SHADOW-90 paper strategy — the best any-goal pocket from
+# the Sep 12-18 bracket scan. Stamps on the outcome record; the EOD
+# grades it with the MARKET rule (any goal after the signal). NEVER a
+# bet, NEVER blocks/alters the send — pure post-hoc measurement, the
+# SHADOW_LEAGUES / shadow-market precedent.
+SHADOW90_MIN_LO = 21      # bracket lower bound (inclusive)
+SHADOW90_MIN_HI = 40      # bracket upper bound (inclusive)
+SHADOW90_MIN_SOT = 3      # SOT>=3 OR tier CRITICAL enters the core rule
+SHADOW90_PRICE_MIN = 1.20  # price_ok flag: live over price >= this
+
+
+def _shadow90_rule(minute, sot, tier, gps=None, cur_total=None):
+    """v10.120: returns (rule, flags) for a SHADOW-90 eligible signal, else
+    (None, []). rule is the core rule name, flags the sub-slices the EOD
+    reports separately (sot4 / zero_zero / gps80 / price_ok appended by
+    the caller when the live price is known)."""
+    try:
+        _m = int(minute or 0)
+        _s = int(sot or 0)
+        if not (SHADOW90_MIN_LO <= _m <= SHADOW90_MIN_HI):
+            return None, []
+        if not (_s >= SHADOW90_MIN_SOT or (tier or "") == "CRITICAL"):
+            return None, []
+        flags = []
+        if _s >= 4:
+            flags.append("sot4")
+        if cur_total == 0:
+            flags.append("zero_zero")
+        try:
+            if gps is not None and float(gps) >= 80.0:
+                flags.append("gps80")
+        except Exception:
+            pass
+        return "core", flags
+    except Exception:
+        return None, []
+
+
+# (6) v10.120: AUTO-BET STUB — no order-placement code exists in this
+# build (no bookmaker API). The stub reports arming status from the
+# shadow90 ledger and logs a DRY-RUN line; real automation would need
+# a betting-exchange API + risk limits wired in a later version.
+AUTO_BET_ENABLED = False           # master switch — DRY-RUN logging only
+AUTO_BET_MIN_N = 100               # resolved shadow90 records needed
+AUTO_BET_MIN_WR = 0.90             # any-goal-after-signal WR needed
+
+
+def auto_bet_status(records=None):
+    """v10.120: (armed, n_resolved, wr) over the shadow90-stamped ledger.
+    armed = n >= AUTO_BET_MIN_N AND wr >= AUTO_BET_MIN_WR. Reads the
+    in-memory signal_outcomes when records is None; defensive always."""
+    try:
+        rows = records if records is not None else signal_outcomes
+        n = 0
+        hits = 0
+        for r in rows:
+            if not (r.get("shadow90") and r.get("shadow90_rule")):
+                continue
+            _ft = r.get("pred_actual_total_goals")
+            _at = (r.get("goals_at_signal") or 0) + (r.get("opponent_goals_at_signal") or 0)
+            if _ft is None or _at is None:
+                continue
+            n += 1
+            if _ft > _at:
+                hits += 1
+        wr = (hits / n) if n else 0.0
+        return (n >= AUTO_BET_MIN_N and wr >= AUTO_BET_MIN_WR, n, wr)
+    except Exception:
+        return False, 0, 0.0
+
 
 # ============================================================
 # v10.80: CARDS & CORNERS MARKET BLOCK
@@ -12746,7 +12933,9 @@ def _drift_watch_tick(client, fixtures_now: dict) -> None:
         log.warning(f"  DRIFT tick failed (watches preserved): {_te}")
 
 
-def _apply_price_gate(bet_flag: str, odds_msg: dict | None) -> tuple[str, str, float | None]:
+def _apply_price_gate(
+    bet_flag: str, odds_msg: dict | None, model_p: float | None = None,
+) -> tuple[str, str, float | None]:
     """v10.103: demote BET -> NO_BET when the live price is drained.
 
     Pure function on the fast-pass odds capture. Returns
@@ -12756,6 +12945,13 @@ def _apply_price_gate(bet_flag: str, odds_msg: dict | None) -> tuple[str, str, f
       'NA'      — no P&L-grade live price (missing / suspect /
                   prematch-fallback): the gate does not speak and the
                   v10.91 minute rule stands alone.
+    v10.120: EDGE GATE — when model_p (the recalibrated any-goal P for
+    the priced line) is supplied, a live price whose implied P is within
+    EDGE_MIN_P of the model demotes BET -> NO_BET with 'NO_EDGE': the
+    market has already priced this goal and there is nothing to harvest
+    (the Sep-16 live class: 50% WR on 1.68 avg). DRAINED still fires
+    first (a drained price is also edgeless). House rule untouched: the
+    gate NEVER blocks the send, it only demotes the BET label.
     Fully defensive: ANY internal failure returns ('NA', None).
     """
     try:
@@ -12768,6 +12964,15 @@ def _apply_price_gate(bet_flag: str, odds_msg: dict | None) -> tuple[str, str, f
             live = float(odds_msg["over_odds"])
             if live < PRICE_FLOOR:
                 return ("NO_BET" if bet_flag == "BET" else bet_flag), "DRAINED", live
+            # v10.120: edge check — implied P within EDGE_MIN_P of model P
+            if (
+                model_p is not None
+                and EDGE_MIN_P > 0.0
+                and model_p > 0.02
+            ):
+                implied = 1.0 / live if live > 0 else 1.0
+                if (model_p - implied) < EDGE_MIN_P:
+                    return ("NO_BET" if bet_flag == "BET" else bet_flag), "NO_EDGE", live
             return bet_flag, "OK", live
     except Exception:
         pass
@@ -12789,6 +12994,12 @@ def _price_gate_line(gate: str, live: float | None) -> str:
                 f"\n\u2705 PRICE ZONE: live {live:.2f} \u2265 "
                 f"{PRICE_FLOOR:.2f} floor \u2014 price hasn't caught up to "
                 f"the pressure (Sep 12-13 ledger: +8-13 pts edge)."
+            )
+        if gate == "NO_EDGE":
+            return (
+                f"\n\U0001f539 NO EDGE: live {live:.2f} already carries the "
+                f"model's goal chance (edge < {EDGE_MIN_P:.0%}) \u2014 paper "
+                f"only. DRY-RUN gate (v10.120)."
             )
     except Exception:
         pass
@@ -12852,8 +13063,15 @@ def _build_odds_value_block(
             if minute is not None else _TEAM_SCORES_FALLBACK
         )
         p_team = min(0.5 * p_team_model + 0.5 * _p_emp, p_any * 0.98)
-        be_any = 1.0 / p_any
-        be_team = (1.0 / p_team) if p_team > 1e-9 else None
+        # v10.120: BUCKET RECALIBRATION — map the shipped probabilities
+        # onto the measured Sep 12-18 bucket rates (the model undersold
+        # itself in every bucket). v2 numbers drive the displayed break-
+        # even + EV; the shipped ones stay in the ledger for head-to-head
+        # grading in the EOD accuracy report.
+        p_any_v2 = _recal_p(p_any, _ANY_GOAL_RECAL)
+        p_team_v2 = min(_recal_p(p_team, _TEAM_SCORES_RECAL), p_any_v2 * 0.98)
+        be_any = 1.0 / p_any_v2   # v10.120: v2 break-even shown in the bet line
+        be_team = (1.0 / p_team_v2) if p_team_v2 > 1e-9 else None
 
         # --- market side (source-honest labels) ---
         ev_pct = None
@@ -12876,7 +13094,7 @@ def _build_odds_value_block(
                 f"({odds_data.get('bookmaker') or '?'} \u00b7 {_src_tag}{_sus})"
             )
             if _mkt_live:
-                ev_pct = (float(odds_data["over_odds"]) * p_any - 1.0) * 100.0
+                ev_pct = (float(odds_data["over_odds"]) * p_any_v2 - 1.0) * 100.0  # v10.120: v2 EV
                 if ev_pct >= 3.0:
                     _book_bit += f" \u00b7 VALUE +{ev_pct:.0f}%"
                 elif ev_pct <= -3.0:
@@ -12896,10 +13114,25 @@ def _build_odds_value_block(
             f"\u2192 bet only if LIVE \u2265 {be_any:.2f}"
         ]
 
+        # v10.120: edge bookkeeping — model P (v2) minus implied P when a
+        # P&L-grade live price exists; feeds the NO_EDGE gate + the ledger.
+        _edge_p = None
+        if _mkt_live and odds_data.get("over_odds"):
+            try:
+                _live_o = float(odds_data["over_odds"])
+                if _live_o > 0:
+                    _edge_p = round(p_any_v2 - (1.0 / _live_o), 3)
+            except Exception:
+                _edge_p = None
+
         extras = {
             "pred_team_scores": round(p_team_model, 3),
             "pred_team_scores_cal": round(p_team, 3),
             "odds_ev_pct": round(ev_pct, 1) if ev_pct is not None else None,
+            # v10.120: v2 recalibrated numbers + the model-vs-market edge
+            "pred_team_scores_v2": round(p_team_v2, 3),
+            "pred_any_goal_v2": round(p_any_v2, 3),
+            "edge_p": _edge_p,
         }
         return "\n".join(lines), extras
     except Exception:
@@ -17156,6 +17389,17 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # fixture has no cached context — cap hit, cold fixture, quota
         # guard — so the predictions then run exactly as v10.96).
         _fmod97, _fmodo97, _h2h97 = _form_ctx_goal_mods(fid, is_home_sg)
+        # v10.120: FAST-LANE BURST FEATURE — a goal-proximity / SOT-burst
+        # shadow for THIS (fixture, team) within 180s lifts the signal
+        # team's remaining lambda (graded trial: 21-60' full 100%). The
+        # _fl_shadow_dedupe stamp is the last fast-lane trigger wall-time.
+        _fl_burst120 = 1.0
+        try:
+            _fl_stamp120 = _fl_shadow_dedupe.get((fid, tid))
+            if _fl_stamp120 and (time.time() - float(_fl_stamp120)) <= 180.0:
+                _fl_burst120 = 1.15
+        except Exception:
+            _fl_burst120 = 1.0
         _goal_pred = compute_goal_predictions(
             minute=minute,
             signal_team_xg=xg_value,
@@ -17171,6 +17415,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             form_mod_sig=_fmod97,   # v10.97: last-5 form + H2H (prediction-only)
             form_mod_opp=_fmodo97,
             h2h_mod=_h2h97,
+            fl_burst=_fl_burst120,   # v10.120: fast-lane burst lift
         )
         _current_goals = (sh or 0) + (sa or 0)
 
@@ -17248,7 +17493,19 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # rides the message under the odds block. NA (missing / suspect /
         # prematch-fallback price) keeps the v10.91 minute rule — the gate
         # never blocks on absent data.
-        bet_flag, _price_gate, _price_live = _apply_price_gate(bet_flag, _odds_msg)
+        # v10.120: EDGE GATE — model_p is the recalibrated any-goal P (v2)
+        # from the odds-value block; a live price already carrying it
+        # demotes BET -> NO_EDGE. Gate never blocks the send.
+        _model_p120 = None
+        try:
+            _pv2 = (_odds_extras or {}).get("pred_any_goal_v2")
+            if _pv2 is not None:
+                _model_p120 = float(_pv2)
+        except Exception:
+            _model_p120 = None
+        bet_flag, _price_gate, _price_live = _apply_price_gate(
+            bet_flag, _odds_msg, model_p=_model_p120
+        )
         if _price_gate == "DRAINED":
             log.info(
                 f"  PRICE GATE: F{fid} {tname} {minute}' \u2014 live "
@@ -17263,6 +17520,56 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     _price_live, _current_goals
                 )
         msg += _price_gate_line(_price_gate, _price_live)
+
+        # v10.120: SHADOW-90 STAMP — the 21-40' SOT>=3/CRITICAL any-goal
+        # pocket (Sep 12-18 ledger: 93.5%, n=46) measured on every signal,
+        # NOT bet and NOT sent: pure ledger stamps the EOD grades with the
+        # market rule (any goal after the signal). Auto-bet stays a stub —
+        # when the arming bars (n>=100 & WR>=90%) are met AND the master
+        # switch is on, a DRY-RUN line logs what WOULD have been bet.
+        _s90_rule = None
+        _s90_flags = []
+        try:
+            _s90_rule, _s90_flags = _shadow90_rule(
+                minute, sot, tier, gps=gps, cur_total=_current_goals
+            )
+            if _s90_rule:
+                _s90_price = None
+                if (
+                    _odds_msg is not None
+                    and (_odds_msg.get("odds_source") or "") in ("live", "oddsapi_live")
+                    and not _odds_msg.get("suspect")
+                    and _odds_msg.get("over_odds")
+                ):
+                    _s90_price = float(_odds_msg["over_odds"])
+                    if _s90_price >= SHADOW90_PRICE_MIN:
+                        _s90_flags.append("price_ok")
+                _armed120, _n120, _wr120 = auto_bet_status()
+                log.info(
+                    f"  v10.120 SHADOW-90: F{fid} {tname} {minute}' rule={_s90_rule} "
+                    f"flags={_s90_flags or '-'} live={_s90_price or '-'} "
+                    f"| auto-bet {(_n120, round(_wr120, 3))} "
+                    f"{'ARMED' if _armed120 else 'accumulating'}"
+                )
+                if AUTO_BET_ENABLED and _armed120 and _s90_price \
+                        and "price_ok" in _s90_flags:
+                    log.info(
+                        f"  v10.120 AUTO-BET DRY-RUN: would bet Over "
+                        f"(any goal after signal) F{fid} {tname} {minute}' "
+                        f"@ {_s90_price:.2f} — NO order placed (no bookmaker "
+                        f"API in this build)"
+                    )
+        except Exception as _s90e:
+            log.debug(f"  v10.120 shadow-90 stamp skipped: {_s90e}")
+            _s90_rule, _s90_flags = None, []
+        _s90_price120 = None
+        try:
+            if _s90_rule and _odds_msg is not None \
+                    and (_odds_msg.get("odds_source") or "") in ("live", "oddsapi_live") \
+                    and not _odds_msg.get("suspect") and _odds_msg.get("over_odds"):
+                _s90_price120 = float(_odds_msg["over_odds"])
+        except Exception:
+            _s90_price120 = None
         # v10.111: manual-price invitation when neither live feed produced
         # a price for the message (api-sports empty AND feed-2 empty/absent).
         try:
@@ -17553,7 +17860,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # message verdict above is what the user acted on;
         # price_gate_final grades the gate itself at EOD and enables the
         # counterfactual ("what would the harder fetch have said?").
-        _, _price_gate_final, _price_live_final = _apply_price_gate("BET", _odds_data)
+        _, _price_gate_final, _price_live_final = _apply_price_gate(
+            "BET", _odds_data, model_p=_model_p120  # v10.120: edge gate re-grade
+        )
 
         # v10.94: LEDGER-GRADE dog/a-grade — recompute from the FINAL
         # odds (the post-send fallback may carry the 1X2 the fast pass
@@ -17784,6 +18093,26 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "pred_team_scores_cal": _odds_extras.get("pred_team_scores_cal"),
             "odds_ev_pct": _odds_extras.get("odds_ev_pct"),
             "odds_in_msg": bool(_odds_msg is not None),
+            # v10.120: RECALIBRATED v2 numbers + the model-vs-market edge,
+            # so the EOD grades shipped-vs-v2 head-to-head and the NO_EDGE
+            # demotions against the resolved outcomes.
+            "pred_team_scores_v2": _odds_extras.get("pred_team_scores_v2"),
+            "pred_any_goal_v2": _odds_extras.get("pred_any_goal_v2"),
+            "edge_p": _odds_extras.get("edge_p"),
+            # v10.120: FAST-LANE BURST echo — whether the lambda lift fired
+            # (goal-proximity/SOT-burst shadow within 180s of the signal).
+            "fl_burst_applied": bool(_fl_burst120 > 1.001),
+            # v10.120: SHADOW-90 stamps — the 21-40' any-goal pocket, paper
+            # only; EOD grades with the market rule (any goal after the
+            # signal) and reports the AUTO-BET arming bars.
+            "shadow90": bool(_s90_rule is not None),
+            "shadow90_rule": _s90_rule,
+            "shadow90_flags": _s90_flags or None,
+            "shadow90_live_price": _s90_price120,
+            "shadow90_price_ok": (
+                bool(_s90_price120 is not None and _s90_price120 >= SHADOW90_PRICE_MIN)
+                if _s90_price120 is not None else None
+            ),
             # v10.80: CARDS & CORNERS market fields — the v1 heuristic shown
             # in the Telegram block, recorded so FT labels grade every lean
             # (mkt_*_ft_result) and the calibration backtest has full state.
