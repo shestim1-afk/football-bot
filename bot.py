@@ -135,6 +135,10 @@ LEAGUE_IDS = {
     # BOTH raw names are plain 'Super Liga' — the ID overrides below
     # disambiguate (same class as the 78/218 Bundesliga collision).
     286: "Super Liga (Serbia)", 332: "Super Liga (Slovakia)",
+    # v10.127b: Poland Ekstraklasa = 106 — feed-verified from a
+    # full WEEK of UNTRACKED lines (Sep 12-19). Unique raw name
+    # (no collision); country suffix keeps the naming uniform.
+    106: "Ekstraklasa (Poland)",
 }
 
 # v10.114: shadow-league config. LEAGUE_NAME_OVERRIDES disambiguates API
@@ -153,6 +157,9 @@ LEAGUE_NAME_OVERRIDES = {
     # SHADOW_LEAGUES membership (name-only matching cannot tell them
     # apart, the same lesson as Bundesliga 78 vs 218).
     286: "Super Liga (Serbia)", 332: "Super Liga (Slovakia)",
+    # v10.127b: Poland 106 — unique raw name 'Ekstraklasa'; the
+    # country suffix keeps the shadow-set naming pattern uniform.
+    106: "Ekstraklasa (Poland)",
 }
 SHADOW_LEAGUES = {
     "Bundesliga (Austria)", "Super League (Switzerland)",
@@ -161,6 +168,9 @@ SHADOW_LEAGUES = {
     # logged + EOD-graded, never sent; promote at n>=15 & WR>=65%
     # live-priced (flip = remove the name from this set).
     "Super Liga (Serbia)", "Super Liga (Slovakia)",
+    # v10.127b: Poland (league 106, feed-verified Sep 12-19) —
+    # same trial pattern; promote at n>=15 & WR>=65% live-priced.
+    "Ekstraklasa (Poland)",
 }
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
@@ -1027,7 +1037,8 @@ _ratio117_sent_date: str | None = None
 #     (3) zero_zero 90-POCKET sub-flag scoped to 21-35' only (verified
 #         95.7% 22/23; the wider 21-40' 0-0 slice is 87.5% 28/32).
 #     EOD analyze_pockets re-cut to grade exactly these rules.
-# v10.127 — SHADOW LEAGUES +2: SERBIA & SLOVAKIA (user request Sep 19:
+# v10.127 — SHADOW LEAGUES +3: SERBIA & SLOVAKIA & POLAND + EOD SUBPROCESS
+#     HARDENING (user request Sep 19:
 #     "yes serbian and slovakian as well, if it is having good
 #     winrate"): league 286 (Super Liga Serbia — feed proof Sep 19:
 #     Radnik Surdulica vs FK Partizan) and league 332 (Super Liga
@@ -1046,6 +1057,25 @@ _ratio117_sent_date: str | None = None
 #     floors as the other four shadow leagues), no preseeded team IDs
 #     (the cache auto-fills from league fixtures); discovery, polling,
 #     signal gates, EOD grading untouched.
+# v10.127b ADDITIONS (Sep 20, pre-deploy — v10.127 was never shipped):
+#     (1) POLAND joins the shadow set — league 106 Ekstraklasa,
+#     feed-verified from a full week of UNTRACKED lines (Sep 12-19:
+#     Slask Wroclaw, Gornik Zabrze, Legia, Raków, Widzew, GKS
+#     Katowice, Motor Lublin...; 2-4 matches/day Fri-Mon). Unique
+#     raw name, the country suffix keeps the shadow-set naming
+#     uniform.
+#     (2) EOD SUBPROCESS HARDENING — the 2026-09-20 '/eod' for Sep
+#     19 died at the 120s cap; root cause profiled locally on the
+#     REAL ledger: one busy day = ~40k pressure_polls lines (~80MB)
+#     whose full json.loads peaks ~500MB RSS, starving the child on
+#     the small prod instance (the 18:43:57 Sep 19 service restart
+#     lands exactly 120s into the auto-EOD window — same signature).
+#     Fix: eod_report.py window-loads only the target day's poll
+#     lines (regex ts pre-filter, membership provably unchanged —
+#     byte-identical report verified on real Sep 18 data; ~500MB ->
+#     tens of MB peak); both bot-side subprocess timeouts 120s ->
+#     300s; elapsed + polls-file-size logged on every run, success
+#     AND failure, so journalctl shows the true cost from now on.
 # v10.126 — CARDS LINE RESTORED + INTEGER LINES (user request Sep 19:
 #     "keep the cards line but instead 8.5 write 9 same for corner ...
 #     can you list current corner as it is with card it has current
@@ -15148,8 +15178,8 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     "  \u2192 auto-sent every morning before kickoffs\n\n"
                     "\U0001f9ea SHADOW LEAGUES (v10.114)\n"
                     "Austria / Switzerland / Norway / Sweden / Serbia /\n"
-                    "Slovakia are trial-tracked: signals logged + EOD-\n"
-                    "graded but NOT sent, until the nightly 'SHADOW\n"
+                    "Slovakia / Poland are trial-tracked: signals logged +\n"
+                    "EOD-graded but NOT sent, until the nightly 'SHADOW\n"
                     "LEAGUES' section proves them (n>=15 & WR>=65% at\n"
                     "live prices)\n\n"
                     "\u26a1 SURGE WATCH & GOAL FLASHES\n"
@@ -15322,10 +15352,15 @@ def check_telegram_commands(client: httpx.Client) -> None:
                 _eod_file = os.path.join(_VOLUME_DIR, f"eod_report_{_eod_label}.txt")
                 cmd += ["--out", _eod_file]
                 try:
+                    _eod_t0 = time.time()  # v10.127b: elapsed diagnostics
                     result = subprocess.run(
                         cmd,
                         cwd=os.path.dirname(os.path.abspath(__file__)),
-                        timeout=120,
+                        timeout=300,  # v10.127b: 120->300 (Sep 20 timeout)
+                    )
+                    log.info(
+                        "v10.127: /eod subprocess done in %.1fs (rc=%s)"
+                        % (time.time() - _eod_t0, result.returncode)
                     )
                     if result.returncode != 0:
                         send_telegram(client, f"EOD report failed (exit code {result.returncode}).")
@@ -15347,6 +15382,18 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     else:
                         send_telegram(client, "EOD report produced no file (no data for that period?).")
                 except Exception as e:
+                    _polls_mb = 0.0
+                    try:
+                        _polls_mb = os.path.getsize(
+                            os.path.join(_VOLUME_DIR, "pressure_polls.jsonl")
+                        ) / 1048576.0
+                    except OSError:
+                        pass
+                    log.warning(
+                        "v10.127: /eod subprocess FAILED after %.1fs: %s "
+                        "(pressure_polls.jsonl = %.1f MB)"
+                        % (time.time() - _eod_t0, e, _polls_mb)
+                    )
                     send_telegram(client, f"EOD report error: {e}")
 
             elif text == "/outcomes":
@@ -19717,12 +19764,21 @@ def main():
     # v10.127: shadow leagues +2 — one boot line so Telegram silence
     # for Serbia/Slovakia is verifiable from journalctl.
     log.info(
-        "v10.127: SHADOW LEAGUES +2 — Serbia (286) + Slovakia (332) "
+        "v10.127: SHADOW LEAGUES +3 — Serbia (286) + Slovakia (332) + "
+        "Poland (106) "
         "trial-tracked (IDs verified from own live feed Sep 19: Radnik "
         "Surdulica vs FK Partizan 286, Komarno vs Slovan Bratislava 332; "
+        "Ekstraklasa 106 verified from the full Sep 12-19 UNTRACKED week; "
         "both raw names 'Super Liga', disambiguated by ID overrides). "
         "Signals logged + EOD-graded, never sent; promote at n>=15 & "
         "WR>=65% at live prices (flip out of SHADOW_LEAGUES)"
+    )
+    # v10.127b: EOD subprocess hardening — see changelog.
+    log.info(
+        "v10.127: EOD HARDENING — eod_report.py window-loads only the "
+        "target day's polls (~500MB -> tens of MB peak RSS on busy "
+        "days), subprocess timeouts 120s->300s, elapsed + polls-size "
+        "logged per run on every EOD subprocess call"
     )
     log.info(
         "v10.112 TOPSCORER PARSE FIX active: /players/topscorers nests the "
@@ -20103,10 +20159,15 @@ def main():
                                     _VOLUME_DIR,
                                     f"eod_report_auto_{today_bg}.txt",
                                 )
+                                _auto_eod_t0 = time.time()  # v10.127b: elapsed
                                 subprocess.run(
                                     [sys.executable, "eod_report.py", "--days", "1", "--quiet",  # v10.110: venv interpreter
                                      "--out", _auto_eod_file],
-                                    cwd=os.path.dirname(os.path.abspath(__file__)), timeout=120,
+                                    cwd=os.path.dirname(os.path.abspath(__file__)), timeout=300,  # v10.127b: 120->300 (Sep 20 timeout)
+                                )
+                                log.info(
+                                    "v10.127: auto EOD subprocess done in %.1fs"
+                                    % (time.time() - _auto_eod_t0)
                                 )
                                 if os.path.exists(_auto_eod_file) and os.path.getsize(_auto_eod_file) > 0:
                                     with open(_auto_eod_file, "rb") as f:
@@ -20132,7 +20193,18 @@ def main():
                                         "NOT marked sent, will retry next loop"
                                     )
                             except Exception as e:
-                                log.warning(f"v10.33: EOD report subprocess failed: {e}")
+                                _apolls_mb = 0.0
+                                try:
+                                    _apolls_mb = os.path.getsize(
+                                        os.path.join(_VOLUME_DIR, "pressure_polls.jsonl")
+                                    ) / 1048576.0
+                                except OSError:
+                                    pass
+                                log.warning(
+                                    "v10.33: EOD report subprocess failed after "
+                                    "%.1fs: %s (pressure_polls.jsonl = %.1f MB)"
+                                    % (time.time() - _auto_eod_t0, e, _apolls_mb)
+                                )
                         # v10.44l: Auto-backup ML data to Telegram BEFORE rewrite/clear
                         # v10.44n: Now runs after retry, so fewer unresolved entries in backup
                         try:
