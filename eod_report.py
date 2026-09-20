@@ -834,6 +834,77 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
             _rw = sum(1 for e in _real_set if _over_true(e)) / len(_real_set)
             lines.append(f"  illusion gap: {(_pw - _rw) * 100:+.0f}pp "
                          f"(paper WR - live WR; trust the live row)")
+        # v10.130: LIVE WINDOW — the enforced ledger. v10.130
+        # hard-vetoes the BET advice after minute 45 (message +
+        # bet_flag); this table shows the window split on the
+        # P&L-grade rows: cumulative minute bands, steam buckets
+        # (steam_ratio stamped at capture from v10.130; older rows use
+        # the prematch fixture-join fallback), and the day's would-be
+        # late-bet P&L (the savings line).
+        if _real_set:
+            lines.append("")
+            lines.append("=== LIVE WINDOW (v10.130 — enforced ledger) ===")
+            _edge_row("live <=45' (allowed)",
+                      [e for e in _real_set if (e.get("game_minute") or 0) <= 45])
+            _edge_row("live 46-60' (vetoed)",
+                      [e for e in _real_set
+                       if 46 <= (e.get("game_minute") or 0) <= 60])
+            _edge_row("live 61-75' (vetoed)",
+                      [e for e in _real_set
+                       if 61 <= (e.get("game_minute") or 0) <= 75])
+            _edge_row("live 76+' (vetoed)",
+                      [e for e in _real_set if (e.get("game_minute") or 0) >= 76])
+            _pre_ref130 = {}
+            for _e in _cum_priced:
+                if (_e.get("odds_source") or "") == "prematch_fallback":
+                    _fx = _e.get("fixture_id")
+                    _ln = str(_e.get("odds_over_line"))
+                    _od = _e.get("odds_over_odds")
+                    if _fx is not None and _od:
+                        _pre_ref130[(_fx, _ln)] = _od
+
+            def _steam_of130(e):
+                _v = e.get("steam_ratio")
+                if _v is not None:
+                    try:
+                        return float(_v)
+                    except Exception:
+                        return None
+                _pm = _pre_ref130.get((e.get("fixture_id"),
+                                       str(e.get("odds_over_line"))))
+                if not _pm:
+                    return None
+                try:
+                    return float(e.get("odds_over_odds")) / float(_pm)
+                except Exception:
+                    return None
+
+            for _lbl, _fn in (
+                ("steam <=0.97 (top)", lambda x: x is not None and x <= 0.97),
+                ("steam >1.03 (value)", lambda x: x is not None and x > 1.03),
+            ):
+                _edge_row(_lbl, [e for e in _real_set if _fn(_steam_of130(e))])
+            _unk130 = sum(1 for e in _real_set if _steam_of130(e) is None)
+            if _unk130:
+                lines.append(f"  steam unknown: {_unk130} row(s) (no prematch ref)")
+            _day_late130 = [
+                e for e in (signals or [])
+                if (e.get("odds_source") or "") in ("live", "oddsapi_live", "manual")
+                and not e.get("odds_suspect")
+                and (e.get("game_minute") or 0) > 45
+                and e.get("odds_over_odds")
+                and e.get("outcome_full") in ("HIT", "MISS")
+            ]
+            if _day_late130:
+                _dp130 = sum(
+                    (e.get("odds_over_odds") or 2.0) - 1.0
+                    if _over_true(e) else -1.0
+                    for e in _day_late130)
+                lines.append(
+                    f"  veto savings (day scope): {len(_day_late130)} late live"
+                    f" bet(s) suppressed, would-be P&L {_dp130:+.2f}u")
+            else:
+                lines.append("  veto savings (day scope): no late live-priced bets")
 
     # --- v10.119: CARDS & CORNERS EDGE — lean grading + receipt P&L ---
     # The lean is settled at FT vs the line (mkt_*_ft_result, stamped by
@@ -2004,7 +2075,7 @@ def main():
     all_polls, _polls_total, _archived_days = load_polls_multisource(
         args.data_dir, _polls_window)
     print(
-        "[eod v10.129] load: %d outcomes, %d poll records, %d total "
+        "[eod v10.130] load: %d outcomes, %d poll records, %d total "
         "lines (%d poll days on disk), windowed=%s, %.1fs"
         % (len(all_outcomes), len(all_polls), _polls_total,
            len(_archived_days), _polls_window is not None,
@@ -2154,7 +2225,7 @@ def main():
                 / 1024.0)
         except Exception:
             _rss_mb = -1.0
-    print("[eod v10.129] done in %.1fs, rss=%.0f MB"
+    print("[eod v10.130] done in %.1fs, rss=%.0f MB"
           % (time.time() - _t_load0, _rss_mb), file=sys.stderr)
 
     # Write JSON report
