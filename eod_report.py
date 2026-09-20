@@ -693,7 +693,8 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                          " book's live price to make this real")
 
     # --- v10.114: SHADOW LEAGUES — trial leagues (logged, never sent) ---
-    # Austria / Switzerland / Norway / Sweden signals carry shadow_league=True
+    # Austria / Switzerland / Norway / Sweden + Serbia / Slovakia (v10.127)
+    # signals carry shadow_league=True
     # in the ledger; this section grades them nightly so promotion is a data
     # decision (n>=15 & WR>=65% at live prices), never a guess.
     shadow = [e for e in resolved if e.get("shadow_league")]
