@@ -1037,6 +1037,36 @@ _ratio117_sent_date: str | None = None
 #     (3) zero_zero 90-POCKET sub-flag scoped to 21-35' only (verified
 #         95.7% 22/23; the wider 21-40' 0-0 slice is 87.5% 28/32).
 #     EOD analyze_pockets re-cut to grade exactly these rules.
+# v10.129 — POLLS ROTATION + HONEST-PRICE EOD (Sep 21):
+#     (1) GROWTH FIX. The live pressure_polls.jsonl reached 123MB /
+#     62k lines (Sep 14-20) because the v10.44n backup-and-truncate
+#     never recovered from ONE failed Telegram upload (60s timeout,
+#     in-memory raw.read() gzip = the Sep-20 OOM class). Rotation:
+#     every completed Sofia day is streamed out to
+#     data/polls/polls_YYYY-MM-DD.jsonl.gz (O(1) memory, atomic
+#     renames, idempotent, tail-catch for lines appended mid-rotation
+#     by late matches); the live file holds today ONLY — structural,
+#     not luck. polls_daily.jsonl keeps one summary record per day
+#     (polls / fixtures / avg_gps, deduped). The Telegram ML backup
+#     re-sends the small day files (streamed from disk, 120s); the
+#     old truncate is GONE (it lost post-backup lines; now nothing is
+#     lost — today's lines archive+backup tomorrow). Runs after the
+#     auto-EOD report AND once at startup (catch-up when the bot was
+#     down or a signal-less day never fired the EOD block — rotation
+#     archives ALL past days it finds, multi-day catch-up built in).
+#     eod_report.py (v10.129) reads day files + live file with
+#     byte-identical membership; /polls streams its gzip to a disk
+#     tmp (raw.read() is now extinct in this codebase).
+#     (2) PRICE HONESTY. Measured Sep 21: 138/138 cards + 303/304
+#     corners mkt_* prices are prematch_fallback (ZERO live prices —
+#     no feed carries these markets live on this plan); the goals
+#     ledger shows the illusion on the SAME signals: 81% WR / +86u
+#     prematch paper vs 53% / -7.7u live-priced (~28pp fabricated).
+#     The EOD now prints a PRICE REGIME table (same signals split by
+#     odds_source) and the cards/corners sections print their
+#     live-priced share. Paper rows are upper bounds; live rows are
+#     the only money truth; /price receipts remain the only real
+#     cards/corners path.
 # v10.127 — SHADOW LEAGUES +3: SERBIA & SLOVAKIA & POLAND + EOD SUBPROCESS
 #     HARDENING (user request Sep 19:
 #     "yes serbian and slovakian as well, if it is having good
@@ -1150,7 +1180,7 @@ _ratio117_sent_date: str | None = None
 #         not |proj-line|.
 #     (4) EOD LEDGER POCKETS P&L split into REAL RECEIPTS (manual
 #         /price freezes) vs prematch paper (upper bound) per rule.
-BOT_VERSION = "v10.127"
+BOT_VERSION = "v10.129"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -1339,6 +1369,13 @@ genuine_burst_fixtures: set[int] = set()   # v10.56: 2+ GENUINE (non-goal) SOT j
 # predict goals within 5/10/15 minutes.
 # v10.19.3: Moved to /data volume so poll data survives redeployments
 POLL_DATA_FILE = os.path.join(_VOLUME_DIR, "pressure_polls.jsonl")
+# v10.129: POLLS ROTATION — completed (pre-today, Sofia) poll days are
+# archived nightly to data/polls/polls_YYYY-MM-DD.jsonl.gz and the live
+# file shrinks to today-only. The v10.44n Telegram-backup-then-truncate
+# could NEVER recover once one upload failed (123MB / 6 days by Sep 20);
+# rotation makes smallness structural, not luck-dependent.
+POLLS_ROTATE_DIR = os.path.join(_VOLUME_DIR, "polls")
+POLLS_DAILY_LEDGER = os.path.join(POLLS_ROTATE_DIR, "polls_daily.jsonl")
 
 # --- v10.11: Daily summary ---
 daily_summary_date: str = ""
@@ -7233,12 +7270,243 @@ def _load_poisson_calibration() -> None:
         log.warning(f"v10.49: Failed to load calibration file: {e}")
 
 
-def _backup_ml_data(client: httpx.Client) -> None:
+def _archived_days_count() -> int:
+    """v10.129: number of archived poll day files in data/polls/."""
+    try:
+        return sum(1 for f in os.listdir(POLLS_ROTATE_DIR)
+                   if f.startswith("polls_") and f.endswith(".jsonl.gz"))
+    except OSError:
+        return 0
+
+
+def _rotate_polls() -> list:
+    """v10.129: archive completed (pre-today, Sofia) poll days to
+    data/polls/polls_YYYY-MM-DD.jsonl.gz; shrink the live file to
+    today-only. THE GROWTH FIX.
+
+    Why: v10.44n's Telegram-backup-then-truncate never recovered from
+    ONE failed upload (60s timeout on a growing file, in-memory gzip =
+    the Sep-20 OOM class) — the live file reached 123MB / 6 days
+    (Sep 14-20) and every EOD since paid the full-file scan cost.
+    Rotation makes smallness structural: the live file can never hold
+    more than the current Sofia day, whatever Telegram does.
+
+    Mechanics (crash-safe, idempotent, O(1) memory):
+      - ONE binary streaming pass; per line the Sofia day comes from
+        the top-level ts (regex — the eod_report v10.127 trick,
+        verified exactly-one-match per line on the real 40k-line file;
+        a line whose ts cannot be parsed is treated as TODAY: never
+        archived, never dropped).
+      - day < today: append to data/polls/polls_<day>.jsonl.gz.tmp
+        (fresh: tmp + atomic rename; day file already exists from a
+        crash-retry: the tmp is byte-appended as an extra gzip member
+        — multi-member gz, every reader sees the union).
+      - day >= today: kept in the live file.
+      - The live file is atomically replaced ONLY after every day
+        file finalized (a finalize failure aborts the replace — the
+        lines stay in the live file and the next run retries).
+      - Tail-catch: lines appended DURING rotation (late matches past
+        midnight) are folded into the keep file before the replace —
+        rotation can never drop a record.
+      - polls_daily.jsonl: one summary record per archived day
+        (polls/fixtures/avg_gps, deduped), whole-file rewrite —
+        idempotent.
+    Returns the day-gz paths written this run (for the Telegram ML
+    backup); a no-op rotation returns [].
+    """
+    import re as _re
+    _ts_re = _re.compile(rb'"ts"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
+    today_key = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
+    if not os.path.exists(POLL_DATA_FILE) or os.path.getsize(POLL_DATA_FILE) == 0:
+        return []
+    try:
+        os.makedirs(POLLS_ROTATE_DIR, exist_ok=True)
+        # orphaned .tmp files from a crashed run are redundant — their
+        # source lines are still in the live file (replace never ran)
+        for _f in os.listdir(POLLS_ROTATE_DIR):
+            if _f.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(POLLS_ROTATE_DIR, _f))
+                except OSError:
+                    pass
+    except OSError as e:
+        log.warning(f"v10.129 rotation: {POLLS_ROTATE_DIR} not usable: {e}")
+        return []
+
+    keep_path = POLL_DATA_FILE + ".rotkeep"
+    day_tmp = {}   # day -> tmp path
+    day_gz = {}    # day -> open gzip handle
+    counts = {}    # day -> lines archived this run
+    kept = 0
+    end_off = 0
+    try:
+        with open(POLL_DATA_FILE, "rb") as f_in, open(keep_path, "wb") as f_keep:
+            for raw_line in f_in:
+                if not raw_line.strip():
+                    continue
+                day = today_key
+                m = _ts_re.search(raw_line)
+                if m:
+                    try:
+                        day = datetime.fromtimestamp(
+                            float(m.group(1)), tz=BULGARIA_TZ
+                        ).strftime("%Y-%m-%d")
+                    except (ValueError, OverflowError, OSError):
+                        day = today_key
+                if day >= today_key:
+                    f_keep.write(raw_line)
+                    kept += 1
+                else:
+                    gz = day_gz.get(day)
+                    if gz is None:
+                        tmp_path = os.path.join(
+                            POLLS_ROTATE_DIR, f"polls_{day}.jsonl.gz.tmp")
+                        gz = gzip.open(tmp_path, "ab")
+                        day_tmp[day] = tmp_path
+                        day_gz[day] = gz
+                    gz.write(raw_line)
+                    counts[day] = counts.get(day, 0) + 1
+            end_off = f_in.tell()
+        # tail-catch: lines appended while we streamed (late matches)
+        try:
+            if os.path.getsize(POLL_DATA_FILE) > end_off:
+                with open(POLL_DATA_FILE, "rb") as f_tail:
+                    f_tail.seek(end_off)
+                    rest = f_tail.read()
+                nl = rest.rfind(b"\n")
+                complete = rest[: nl + 1] if nl >= 0 else b""
+                if complete:
+                    with open(keep_path, "ab") as f_keep2:
+                        f_keep2.write(complete)
+                    kept += complete.count(b"\n")
+        except OSError:
+            pass
+    except Exception as e:
+        log.warning(f"v10.129 rotation: stream failed: {e}")
+        return []
+    finally:
+        for gz in day_gz.values():
+            try:
+                gz.close()
+            except Exception:
+                pass
+
+    # finalize day archives (atomic per file; live replace gated on ALL)
+    written = []
+    finalize_failed = 0
+    for day in sorted(day_tmp):
+        tmp_path = day_tmp[day]
+        final_path = os.path.join(POLLS_ROTATE_DIR, f"polls_{day}.jsonl.gz")
+        try:
+            if os.path.exists(final_path):
+                # crash-retry stragglers: append tmp as an extra gzip
+                # member (multi-member gz — readers see the union)
+                with open(final_path, "ab") as f_dst, open(tmp_path, "rb") as f_src:
+                    while True:
+                        chunk = f_src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f_dst.write(chunk)
+                os.remove(tmp_path)
+            else:
+                os.replace(tmp_path, final_path)
+            written.append(final_path)
+            log.info(
+                "v10.129 rotation: %s polls -> %s"
+                % (counts.get(day, 0), os.path.basename(final_path))
+            )
+        except OSError as e:
+            finalize_failed += 1
+            log.warning(f"v10.129 rotation: finalize failed for {day}: {e}")
+    if finalize_failed:
+        log.warning(
+            "v10.129 rotation: live file NOT replaced (%d finalize "
+            "failure(s)) — lines stay put, next EOD retries"
+            % finalize_failed
+        )
+        try:
+            os.remove(keep_path)
+        except OSError:
+            pass
+        return written
+
+    # polls_daily.jsonl — one summary record per archived day (deduped)
+    try:
+        ledger = {}
+        if os.path.exists(POLLS_DAILY_LEDGER):
+            with open(POLLS_DAILY_LEDGER, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("date"):
+                            ledger[rec["date"]] = rec
+                    except json.JSONDecodeError:
+                        continue
+        for day in day_tmp:
+            gz_path = os.path.join(POLLS_ROTATE_DIR, f"polls_{day}.jsonl.gz")
+            if not os.path.exists(gz_path):
+                continue
+            n = 0
+            fids = set()
+            gps_sum = 0.0
+            gps_n = 0
+            seen = set()
+            with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    k = (round(float(rec.get("ts") or 0), 3),
+                         rec.get("fixture_id"), rec.get("team_id"),
+                         rec.get("minute"))
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    n += 1
+                    if rec.get("fixture_id") is not None:
+                        fids.add(rec.get("fixture_id"))
+                    g = rec.get("gps")
+                    if g is not None:
+                        try:
+                            gps_sum += float(g)
+                            gps_n += 1
+                        except (TypeError, ValueError):
+                            pass
+            ledger[day] = {"date": day, "polls": n, "fixtures": len(fids),
+                           "avg_gps": round(gps_sum / gps_n, 1) if gps_n else None}
+        tmp_ledger = POLLS_DAILY_LEDGER + ".tmp"
+        with open(tmp_ledger, "w", encoding="utf-8") as f:
+            for d in sorted(ledger):
+                f.write(json.dumps(ledger[d], default=str) + "\n")
+        os.replace(tmp_ledger, POLLS_DAILY_LEDGER)
+    except Exception as e:
+        log.warning(f"v10.129 rotation: daily ledger update failed: {e}")
+
+    # atomic live-file replace — the LAST step, after everything else
+    try:
+        os.replace(keep_path, POLL_DATA_FILE)
+        log.info(
+            "v10.129 rotation: live polls file = today only (%d line(s)); "
+            "%d line(s) archived across %d day file(s)"
+            % (kept, sum(counts.values()), len(written))
+        )
+    except OSError as e:
+        log.warning(f"v10.129 rotation: live replace failed: {e}")
+    return written
+
+
+def _backup_ml_data(client: httpx.Client, rotated_polls: list | None = None) -> None:
     """v10.44l: Auto-backup ML data files to Telegram at end of day.
 
-    Sends signal_outcomes.jsonl and pressure_polls.jsonl as date-stamped
-    documents. After successful backup, truncates the polls file to prevent
-    unbounded growth (signals file is rewritten daily by existing logic).
+    Sends signal_outcomes.jsonl as a date-stamped document and, since
+    v10.129, the archived polls DAY files produced by _rotate_polls()
+    (the live file keeps today's lines — archived and backed up
+    tomorrow; no whole-file uploads, no truncation, no unbounded
+    growth when Telegram is slow).
 
     Tracks backup date in ML_BACKUP_SENT_FILE to avoid double-sends on restart.
     """
@@ -7280,60 +7548,63 @@ def _backup_ml_data(client: httpx.Client) -> None:
         else:
             log.warning(f"ML backup: signals file too large ({fsize / 1024 / 1024:.1f} MB)")
 
-    # --- Backup pressure_polls.jsonl ---
-    # v10.44n: Gzip compress if > 10 MB to stay under Telegram's 50 MB limit
-    if os.path.exists(POLL_DATA_FILE) and os.path.getsize(POLL_DATA_FILE) > 0:
-        fsize = os.path.getsize(POLL_DATA_FILE)
-        fname = f"ml_polls_{today_str}.jsonl"
-        _gzip_used = fsize > 10 * 1024 * 1024
-        try:
-            if _gzip_used:
-                # Compress in memory and send as .jsonl.gz
-                buf = io.BytesIO()
-                with open(POLL_DATA_FILE, "rb") as raw:
-                    with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
-                        gz.write(raw.read())
-                buf.seek(0)
-                gz_fname = f"ml_polls_{today_str}.jsonl.gz"
-                gz_size = buf.getbuffer().nbytes
-                client.post(
-                    f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                    data={"chat_id": TELEGRAM_CHAT_ID},
-                    files={"document": (gz_fname, buf, "application/gzip")},
-                    timeout=60.0,
-                )
-                _lines = 0
-                with open(POLL_DATA_FILE, "r") as f:
-                    for _ in f:
-                        _lines += 1
-                _sent_files.append(f"{gz_fname} ({_lines} polls, {fsize / 1024 / 1024:.1f} MB -> {gz_size / 1024 / 1024:.1f} MB gz)")
-            elif fsize <= _MAX_BYTES:
-                with open(POLL_DATA_FILE, "rb") as f:
+    # --- Backup polls (v10.129: send the rotation's day files) ---
+    # v10.44n sent the WHOLE live file in one in-memory gzip
+    # (raw.read() of up to 100+MB = the Sep-20 OOM class) and
+    # truncated only when the 60s upload won — one failure and growth
+    # became permanent (123MB / 6 days by Sep 20). v10.129 rotation
+    # archives completed days to disk BEFORE this point; the backup
+    # now streams those SMALL day files. Today's fresh lines stay in
+    # the live file and are backed up tomorrow (the old truncate
+    # actively LOST post-backup lines — nothing is lost now).
+    if rotated_polls:
+        for _gz_path in rotated_polls:
+            try:
+                _gz_size = os.path.getsize(_gz_path)
+                with open(_gz_path, "rb") as f:
                     client.post(
                         f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
                         data={"chat_id": TELEGRAM_CHAT_ID},
-                        files={"document": (fname, f, "application/jsonl")},
-                        timeout=60.0,
+                        files={"document": (os.path.basename(_gz_path), f, "application/gzip")},
+                        timeout=120.0,
                     )
-                _lines = 0
-                with open(POLL_DATA_FILE, "r") as f:
-                    for _ in f:
-                        _lines += 1
-                _sent_files.append(f"{fname} ({_lines} polls, {fsize / 1024:.1f} KB)")
-            else:
-                log.warning(f"ML backup: polls file too large even for gzip ({fsize / 1024 / 1024:.1f} MB)")
+                _sent_files.append(f"{os.path.basename(_gz_path)} ({_gz_size / 1048576:.1f} MB gz)")
+                _polls_backup_ok = True
+            except Exception as e:
+                log.warning(f"ML backup: failed to send {os.path.basename(_gz_path)}: {e}")
+    elif os.path.exists(POLL_DATA_FILE) and os.path.getsize(POLL_DATA_FILE) > 0:
+        # manual /backup mid-day (no rotation output yet): stream the
+        # live file — disk-tmp gzip, NEVER raw.read() in memory
+        try:
+            import shutil as _sh
+            fsize = os.path.getsize(POLL_DATA_FILE)
+            gz_fname = f"ml_polls_{today_str}.jsonl.gz"
+            tmp_gz = POLL_DATA_FILE + ".bkp.gz"
+            with open(POLL_DATA_FILE, "rb") as raw:
+                with gzip.GzipFile(tmp_gz, "wb") as gz:
+                    _sh.copyfileobj(raw, gz, 1024 * 1024)
+            _lines = 0
+            with open(POLL_DATA_FILE, "rb") as f:
+                for _ in f:
+                    _lines += 1
+            _gz_size = os.path.getsize(tmp_gz)
+            with open(tmp_gz, "rb") as f:
+                client.post(
+                    f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                    data={"chat_id": TELEGRAM_CHAT_ID},
+                    files={"document": (gz_fname, f, "application/gzip")},
+                    timeout=120.0,
+                )
+            _sent_files.append(f"{gz_fname} ({_lines} polls, {fsize / 1048576:.1f} MB -> {_gz_size / 1048576:.1f} MB gz)")
             _polls_backup_ok = True
         except Exception as e:
-            log.warning(f"ML backup: failed to send polls file: {e}")
-
-    # --- Truncate polls file only if its backup succeeded ---
-    if _polls_backup_ok and os.path.exists(POLL_DATA_FILE):
-        try:
-            with open(POLL_DATA_FILE, "w") as f:
-                pass  # Truncate to empty
-            log.info("ML backup: truncated polls file after backup")
-        except Exception as e:
-            log.warning(f"ML backup: failed to truncate polls file: {e}")
+            log.warning(f"ML backup: failed to send live polls file: {e}")
+        finally:
+            try:
+                if os.path.exists(POLL_DATA_FILE + ".bkp.gz"):
+                    os.remove(POLL_DATA_FILE + ".bkp.gz")
+            except OSError:
+                pass
 
     # --- Mark backup as sent & notify ---
     if _sent_files:
@@ -7343,7 +7614,7 @@ def _backup_ml_data(client: httpx.Client) -> None:
         except Exception:
             pass
         _msg = "📦 ML DATA BACKUP\n\n" + "\n".join(f"  ✅ {f}" for f in _sent_files)
-        _msg += "\n\nSaved to Telegram. Polls file truncated for next day."
+        _msg += "\n\nSaved to Telegram + archived locally (data/polls/). Live file = today only."
         send_telegram(client, _msg)
         log.info(f"v10.44l: ML data backup sent: {', '.join(_sent_files)}")
 
@@ -15438,22 +15709,34 @@ def check_telegram_commands(client: httpx.Client) -> None:
                             line_count += 1
                     try:
                         if file_size > 10 * 1024 * 1024:
-                            # Gzip compress for files > 10MB
-                            buf = io.BytesIO()
-                            with open(POLL_DATA_FILE, "rb") as raw:
-                                with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
-                                    gz.write(raw.read())
-                            buf.seek(0)
-                            gz_size = buf.getbuffer().nbytes
-                            gz_fname = "pressure_polls.jsonl.gz"
-                            client.post(
-                                f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
-                                data={"chat_id": TELEGRAM_CHAT_ID},
-                                files={"document": (gz_fname, buf, "application/gzip")},
-                                timeout=30.0,
-                            )
-                            send_telegram(client, f"sent {gz_fname} ({line_count} polls, {file_size / 1024 / 1024:.1f} MB -> {gz_size / 1024 / 1024:.1f} MB gzipped)")
-                            log.info(f"/polls: sent gzipped ({line_count} polls, {file_size / 1024 / 1024:.1f} MB -> {gz_size / 1024 / 1024:.1f} MB)")
+                            # v10.129: stream to a tmp gz ON DISK — the old
+                            # raw.read() in-memory gzip was the Sep-20 OOM
+                            # class. Rotation keeps the live file at ~one
+                            # busy day (max ~40MB); this path never holds
+                            # more than a 1MB chunk in RAM.
+                            import shutil as _sh
+                            _tmp_gz = POLL_DATA_FILE + ".send.gz"
+                            try:
+                                with open(POLL_DATA_FILE, "rb") as raw:
+                                    with gzip.GzipFile(_tmp_gz, "wb") as gz:
+                                        _sh.copyfileobj(raw, gz, 1024 * 1024)
+                                gz_size = os.path.getsize(_tmp_gz)
+                                gz_fname = "pressure_polls.jsonl.gz"
+                                with open(_tmp_gz, "rb") as fdoc:
+                                    client.post(
+                                        f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                                        data={"chat_id": TELEGRAM_CHAT_ID},
+                                        files={"document": (gz_fname, fdoc, "application/gzip")},
+                                        timeout=120.0,
+                                    )
+                                send_telegram(client, f"sent {gz_fname} ({line_count} polls, {file_size / 1024 / 1024:.1f} MB -> {gz_size / 1024 / 1024:.1f} MB gzipped) · history: data/polls/ ({_archived_days_count()} day archive(s))")
+                                log.info(f"/polls: sent gzipped ({line_count} polls, {file_size / 1024 / 1024:.1f} MB -> {gz_size / 1024 / 1024:.1f} MB)")
+                            finally:
+                                try:
+                                    if os.path.exists(_tmp_gz):
+                                        os.remove(_tmp_gz)
+                                except OSError:
+                                    pass
                         else:
                             with open(POLL_DATA_FILE, "rb") as f:
                                 client.post(
@@ -15462,7 +15745,7 @@ def check_telegram_commands(client: httpx.Client) -> None:
                                     files={"document": ("pressure_polls.jsonl", f, "application/jsonl")},
                                     timeout=30.0,
                                 )
-                            send_telegram(client, f"sent pressure_polls.jsonl ({line_count} polls, {file_size / 1024:.1f} KB)")
+                            send_telegram(client, f"sent pressure_polls.jsonl ({line_count} polls, {file_size / 1024:.1f} KB) · history: data/polls/ ({_archived_days_count()} day archive(s))")
                             log.info(f"/polls: sent JSONL ({line_count} polls, {file_size / 1024:.1f} KB)")
                     except Exception as e:
                         send_telegram(client, f"Failed to send file: {e}")
@@ -19773,6 +20056,19 @@ def main():
         "Signals logged + EOD-graded, never sent; promote at n>=15 & "
         "WR>=65% at live prices (flip out of SHADOW_LEAGUES)"
     )
+    # v10.129: STARTUP ROTATION CATCH-UP — if the bot was down (or a
+    # signal-less day never fired the EOD block) yesterday's polls are
+    # still in the live file; archive them NOW so the day starts
+    # structurally small. Streams once, no-op when already rotated.
+    try:
+        _rot_boot = _rotate_polls()
+        if _rot_boot:
+            log.info(
+                "v10.129: startup rotation archived %d day file(s)"
+                % len(_rot_boot)
+            )
+    except Exception as _re:
+        log.warning(f"v10.129 startup rotation failed: {_re}")
     # v10.127b: EOD subprocess hardening — see changelog.
     log.info(
         "v10.127: EOD HARDENING — eod_report.py window-loads only the "
@@ -20205,10 +20501,20 @@ def main():
                                     "%.1fs: %s (pressure_polls.jsonl = %.1f MB)"
                                     % (time.time() - _auto_eod_t0, e, _apolls_mb)
                                 )
+                        # v10.129: rotate polls FIRST (archive completed days
+                        # to data/polls/*.jsonl.gz, shrink the live file to
+                        # today) — the Telegram backup below then re-sends
+                        # those small day files instead of one giant
+                        # in-memory gzip that OOMs or times out.
                         # v10.44l: Auto-backup ML data to Telegram BEFORE rewrite/clear
                         # v10.44n: Now runs after retry, so fewer unresolved entries in backup
                         try:
-                            _backup_ml_data(client)
+                            _rotated_poll_files = _rotate_polls()
+                        except Exception as _re:
+                            _rotated_poll_files = []
+                            log.warning(f"v10.129 polls rotation failed: {_re}")
+                        try:
+                            _backup_ml_data(client, rotated_polls=_rotated_poll_files)
                         except Exception as _e:
                             log.warning(f"ML data backup failed: {_e}")
                         if _eod_pending:
