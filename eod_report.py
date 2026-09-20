@@ -26,7 +26,9 @@ Environment variables (same as bot):
 import argparse
 import json
 import os
+import re
 import sys
+import time
 import httpx
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -59,6 +61,77 @@ def load_jsonl(path: str) -> list[dict]:
                 except json.JSONDecodeError:
                     pass
     return records
+
+
+# v10.127 EOD HARDENING: one busy day = ~40k pressure_polls lines
+# (~80MB) whose FULL json.loads peaks ~500MB RSS — that starved
+# the 120s EOD subprocess on the small prod instance (the
+# 2026-09-20 '/eod' for Sep 19 timed out; the 18:43:57 Sep 19
+# service restart lands exactly 120s into the auto-EOD window).
+# The loader below full-parses ONLY lines whose 'ts' epoch falls
+# in the requested window; the exact per-record date filter
+# (get_poll_date_key, Europe/Sofia) still runs afterwards, so
+# membership NEVER changes — only memory/CPU do.
+_TS_RE = re.compile(r'"ts"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
+
+
+def _sofia_epoch(date_str: str) -> float:
+    """v10.127: YYYY-MM-DD 00:00 Europe/Sofia -> epoch seconds."""
+    y, m, d = map(int, date_str.split("-"))
+    return datetime(y, m, d, tzinfo=BULGARIA_TZ).timestamp()
+
+
+def load_jsonl_window(path: str, epoch_lo: float,
+                      epoch_hi: float) -> tuple[list[dict], int]:
+    """v10.127: stream a JSONL file, full-parse only in-window records.
+
+    The regex ts-extraction is a strict superset guard (verified on
+    the real 40,663-line Sep 18 polls file: exactly one match per
+    line, always the top-level ts); any line the regex cannot
+    resolve UNAMBIGUOUSLY (zero or multiple matches) is
+    conservatively full-parsed. Returns
+    (records_in_window, total_nonempty_lines).
+    """
+    records: list[dict] = []
+    total = 0
+    if not os.path.exists(path):
+        return records, 0
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            ts = None
+            ms = list(_TS_RE.finditer(line))
+            if len(ms) == 1:
+                # exactly one "ts": pattern — verified on the
+                # real 40,663-line Sep 18 polls file (0 multi,
+                # 0 zero). Zero OR multiple matches fall through
+                # to the conservative full parse below, so a
+                # nested/decoy ts can never silently drop or
+                # keep a wrong line.
+                try:
+                    ts = float(ms[0].group(1))
+                except ValueError:
+                    ts = None
+            if ts is None:
+                # conservative: full-parse to decide (0 occurrences
+                # on the real 40,663-line Sep 18 file, kept for safety)
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                _rts = rec.get("ts", 0) or 0
+                if epoch_lo <= _rts < epoch_hi:
+                    records.append(rec)
+                continue
+            if epoch_lo <= ts < epoch_hi:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    return records, total
 
 
 def get_date_key(entry: dict) -> str:
@@ -693,7 +766,7 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                          " book's live price to make this real")
 
     # --- v10.114: SHADOW LEAGUES — trial leagues (logged, never sent) ---
-    # Austria / Switzerland / Norway / Sweden + Serbia / Slovakia (v10.127)
+    # Austria / Switzerland / Norway / Sweden + Serbia / Slovakia / Poland (v10.127)
     # signals carry shadow_league=True
     # in the ledger; this section grades them nightly so promotion is a data
     # decision (n>=15 & WR>=65% at live prices), never a guess.
@@ -1762,9 +1835,45 @@ def main():
     else:
         target_date = datetime.now(BULGARIA_TZ).strftime("%Y-%m-%d")
 
+    # v10.127 EOD HARDENING: compute the polls epoch window BEFORE
+    # loading — pressure_polls.jsonl can be ~80MB/day and the full
+    # parse peaked ~500MB RSS (the 2026-09-20 120s timeout root
+    # cause). The window is a strict superset (2h margins) of the
+    # dates filter_by_date(_range) will select, so results are
+    # identical to the full load.
+    _t_load0 = time.time()
+    if args.all:
+        _polls_window = None  # --all genuinely needs every record
+    else:
+        _margin = 7200.0  # 2h safety around Sofia-day boundaries
+        if args.days:
+            _now_bg_w = datetime.now(BULGARIA_TZ)
+            _oldest_d = (_now_bg_w - timedelta(days=args.days)).strftime("%Y-%m-%d")
+            _newest_d = (_now_bg_w + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            _oldest_d = target_date
+            _newest_d = (datetime.strptime(target_date, "%Y-%m-%d")
+                         + timedelta(days=1)).strftime("%Y-%m-%d")
+        _polls_window = (_sofia_epoch(_oldest_d) - _margin,
+                         _sofia_epoch(_newest_d) + _margin)
+
     # Load data
     all_outcomes = load_jsonl(os.path.join(args.data_dir, "signal_outcomes.jsonl"))
-    all_polls = load_jsonl(os.path.join(args.data_dir, "pressure_polls.jsonl"))
+    if _polls_window is None:
+        all_polls = load_jsonl(os.path.join(args.data_dir, "pressure_polls.jsonl"))
+        _polls_total = len(all_polls)
+    else:
+        all_polls, _polls_total = load_jsonl_window(
+            os.path.join(args.data_dir, "pressure_polls.jsonl"),
+            _polls_window[0], _polls_window[1],
+        )
+    print(
+        "[eod v10.127] load: %d outcomes, %d/%d poll lines, "
+        "windowed=%s, %.1fs"
+        % (len(all_outcomes), len(all_polls), _polls_total,
+           _polls_window is not None, time.time() - _t_load0),
+        file=sys.stderr,
+    )
     all_blocked = load_jsonl(os.path.join(args.data_dir, "blocked_outcomes.jsonl"))  # v10.49
     all_shadow = load_jsonl(os.path.join(args.data_dir, "fastlane_shadow.jsonl"))  # v10.50
     all_ratio = load_jsonl(os.path.join(args.data_dir, "ratio_trial.jsonl"))  # v10.117
@@ -1799,7 +1908,7 @@ def main():
     now_bg = datetime.now(BULGARIA_TZ)
     report_lines.append(f"EOD REPORT: {date_label}")
     report_lines.append(f"Generated: {now_bg.strftime('%Y-%m-%d %H:%M')} Bulgaria")
-    report_lines.append(f"Data: {args.data_dir} ({len(all_outcomes)} total outcomes, {len(all_polls)} total polls, {len(all_blocked)} blocked candidates, {len(all_shadow)} fast-lane shadows, {len(all_ratio)} ratio trials)")
+    report_lines.append(f"Data: {args.data_dir} ({len(all_outcomes)} total outcomes, {_polls_total} total polls, {len(all_blocked)} blocked candidates, {len(all_shadow)} fast-lane shadows, {len(all_ratio)} ratio trials)")
     report_lines.append("=" * 60)
 
     # --- Per-day breakdown (only in --all mode) ---
@@ -1887,6 +1996,29 @@ def main():
         with open(args.out, "w") as f:
             f.write(report_text + "\n")
         print(f"\nReport written to: {args.out}", file=sys.stderr)
+
+    # v10.127: total elapsed + resident memory — visible in
+    # journalctl when the bot runs this as a subprocess (and on
+    # a terminal when run manually). NOTE: ru_maxrss SURVIVES
+    # fork+exec (the child inherits the parent's high-water
+    # mark), so current VmRSS from /proc is the honest
+    # child-memory number; ru_maxrss is only a fallback for
+    # non-Linux (KB -> MB there).
+    try:
+        with open("/proc/self/status") as _st:
+            _rss_mb = next(
+                float(l.split()[1]) / 1024.0
+                for l in _st if l.startswith("VmRSS:"))
+    except Exception:
+        try:
+            import resource
+            _rss_mb = (
+                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                / 1024.0)
+        except Exception:
+            _rss_mb = -1.0
+    print("[eod v10.127] done in %.1fs, rss=%.0f MB"
+          % (time.time() - _t_load0, _rss_mb), file=sys.stderr)
 
     # Write JSON report
     if args.json_out:
