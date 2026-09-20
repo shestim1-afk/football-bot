@@ -196,6 +196,69 @@ MINUTE_MAX = 61
 # changes. Set PRICE_FLOOR=0 to disable (live < 0 is never true).
 PRICE_FLOOR = float(os.environ.get("PRICE_FLOOR", "1.25"))
 
+# v10.130: LIVE-WINDOW VETO + STEAM STAMPS (Sep 21). The live-priced
+# goals ledger (Sep 15-20, n=55) finally has the shape to ENFORCE the
+# first-half rule instead of advising it: <=45' 78% WR (+2.39u; the
+# 41-45' band alone 5/6) vs >45' 48% WR (-10.05u; 61-75' 14/28 -5.52u,
+# 76'+ 2/6 -2.75u). The 46-49' band is EMPTY in the live ledger, so the
+# old <50 flag's slack bought nothing. The market side agrees: late
+# bets priced at/under the prematch line (steam<=0.97) went 0/9 while
+# drifted (>1.03) went 58% — and the crosstab says it is not just a
+# minute proxy (early+steamed 3/3, late+steamed 0/9). v10.130: (a) the
+# BET advice is hard-vetoed after LIVE_BET_MINUTE_MAX, (b) every odds
+# capture parks/joins a per-fixture prematch ref (zero extra credits
+# — prematch_fallback parses already pay for it) and live captures
+# stamp prematch_ref + steam_ratio into the ledger.
+LIVE_BET_MINUTE_MAX = 45  # v10.130: > this -> live-bet advice suppressed
+_PREMATCH_REF: dict = {}  # v10.130: {fid: {"line", "odds", "ts"}}
+
+
+def _live_veto_line_130(minute):
+    """v10.130: message line for the late-window live-bet veto."""
+    if minute is not None and minute > LIVE_BET_MINUTE_MAX:
+        return (
+            "\n\U0001f6ab LIVE-BET VETO (v10.130): >45' live bets run 48% "
+            "WR lifetime (\u221210.05u) \u2014 signal info only, NO bet"
+        )
+    return ""
+
+
+def _prematch_ref_stamp_130(source, result, fixture_id):
+    """v10.130: park prematch refs; join them onto later live captures.
+
+    Called at the single odds_source choke point in fetch_signal_odds.
+    prematch_fallback parses update the per-fixture ref (latest wins);
+    a later live capture on the same fixture attaches prematch_ref +
+    steam_ratio when the over line matches. Ledger-only — the
+    message text never changes.
+    """
+    try:
+        if not result:
+            return
+        if source == "prematch_fallback" and result.get("over_odds"):
+            _PREMATCH_REF[fixture_id] = {
+                "line": result.get("over_line"),
+                "odds": result.get("over_odds"),
+                "ts": time.time(),
+            }
+        elif source in ("live", "oddsapi_live") and result.get("over_odds"):
+            _ref = _PREMATCH_REF.get(fixture_id) or {}
+            _ref_odds = _ref.get("odds")
+            if not _ref_odds:
+                return
+            _line_ok = (
+                _ref.get("line") is None
+                or result.get("over_line") is None
+                or str(_ref.get("line")) == str(result.get("over_line"))
+            )
+            if _line_ok:
+                result["prematch_ref"] = float(_ref_odds)
+                result["steam_ratio"] = round(
+                    float(result["over_odds"]) / float(_ref_odds), 4
+                )
+    except Exception:
+        pass
+
 # v10.104: DRIFT-WAIT — the follow-up engine for price-gated signals.
 # The Sep 12+13 ledger: the value-zone entries (live >= 1.25 at signal
 # time) won 87.5% vs 75.8% implied, but ~40% of BET signals arrive
@@ -1037,6 +1100,21 @@ _ratio117_sent_date: str | None = None
 #     (3) zero_zero 90-POCKET sub-flag scoped to 21-35' only (verified
 #         95.7% 22/23; the wider 21-40' 0-0 slice is 87.5% 28/32).
 #     EOD analyze_pockets re-cut to grade exactly these rules.
+# v10.130 — LIVE-WINDOW VETO + STEAM LEDGER (Sep 21):
+#     (1) ENFORCED FIRST-HALF RULE. Live-priced goals ledger (n=55,
+#         Sep 15-20): <=45' 78% WR +2.39u; >45' 48% WR -10.05u (61-75'
+#         14/28 -5.52u, 76'+ 2/6 -2.75u; the 46-49' band is EMPTY).
+#         The v10.91 bet_flag minute rule was ledger advice; now the
+#         message BET advice itself is vetoed after LIVE_BET_MINUTE_MAX
+#         (signal still sends, EOD still grades; ledger gets
+#         live_veto="late_window").
+#     (2) STEAM LEDGER. prematch_fallback parses park a per-fixture
+#         over-price ref (_PREMATCH_REF); a later live capture on the
+#         same fixture stamps prematch_ref + steam_ratio (live/prematch)
+#         into the record. Measured: late+steam<=0.97 = 0/9 (buying the
+#         top), drifted >1.03 = 58%. Zero extra credits. EOD gains the
+#         LIVE WINDOW section (minute bands + steam buckets + veto
+#         savings). The stats-only fields feed brain v2.
 # v10.129 — POLLS ROTATION + HONEST-PRICE EOD (Sep 21):
 #     (1) GROWTH FIX. The live pressure_polls.jsonl reached 123MB /
 #     62k lines (Sep 14-20) because the v10.44n backup-and-truncate
@@ -1180,7 +1258,7 @@ _ratio117_sent_date: str | None = None
 #         not |proj-line|.
 #     (4) EOD LEDGER POCKETS P&L split into REAL RECEIPTS (manual
 #         /price freezes) vs prematch paper (upper bound) per rule.
-BOT_VERSION = "v10.129"
+BOT_VERSION = "v10.130"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -11193,6 +11271,9 @@ def fetch_signal_odds(client: httpx.Client, fixture_id: int,
     result["odds_source"] = source
     result["suspect"] = suspect
     result["attempts"] = attempts
+    # v10.130: prematch-ref park/join (steam stamps — see
+    # _prematch_ref_stamp_130). Zero credits, zero added latency.
+    _prematch_ref_stamp_130(source, result, fixture_id)
     # v10.93: the why-live-was-empty diagnostic + line-shop numbers ride
     # the capture dict into the outcome record (odds_live_diag,
     # odds_over_best, odds_live_books). Only set when live came back
@@ -18209,6 +18290,23 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 )
         msg += _price_gate_line(_price_gate, _price_live)
 
+        # v10.130: LIVE-WINDOW VETO — v10.91's minute flag was ledger
+        # advice; the live-priced ledger verdict is now enforced on the
+        # BET advice itself: <=45' 78% WR +2.39u / >45' 48% WR -10.05u
+        # (61-75' 14/28 -5.52u; 76'+ 2/6 -2.75u; late+steamed 0/9).
+        # The signal still sends — pressure info is real and EOD
+        # still grades it; only the betting frame after 45' is vetoed.
+        _live_veto130 = None
+        if minute is not None and minute > LIVE_BET_MINUTE_MAX:
+            _live_veto130 = "late_window"
+            if bet_flag == "BET":
+                bet_flag = "NO_BET"
+            msg += _live_veto_line_130(minute)
+            log.info(
+                f"  v10.130 LIVE-WINDOW VETO: F{fid} {tname} {minute}' "
+                "\u2014 live-bet advice suppressed (late window)"
+            )
+
         # v10.120: SHADOW-90 STAMP — the 21-40' SOT>=3/CRITICAL any-goal
         # pocket (Sep 12-18 ledger: 93.5%, n=46) measured on every signal,
         # NOT bet and NOT sent: pure ledger stamps the EOD grades with the
@@ -18777,6 +18875,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "price_gate_odds": _price_live,
             "price_gate_final": _price_gate_final,
             "price_floor": PRICE_FLOOR,
+            # v10.130: LIVE-WINDOW VETO trail + steam stamps —
+            # the veto reason for late signals, and the live-vs-prematch
+            # price ratio (stamped at capture when the fixture has a
+            # parked prematch ref; EOD fixture-joins pre-v10.130 history).
+            "live_veto": _live_veto130,
+            "prematch_ref_odds": (_odds_data or {}).get("prematch_ref"),
+            "steam_ratio": (_odds_data or {}).get("steam_ratio"),
             # v10.93: LIVE-ODDS TRUTH — the why-live-was-empty snapshot
             # (results + errors straight off the /odds/live response) and
             # the multi-book line-shop numbers. live_diag is set ONLY when
