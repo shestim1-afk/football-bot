@@ -2,7 +2,8 @@
 """
 EOD (End-of-Day) Automated Data Collection Script
 ==============================================
-Reads signal_outcomes.jsonl + pressure_polls.jsonl from the bot's /data volume,
+Reads signal_outcomes.jsonl + pressure_polls.jsonl (plus data/polls/ day
+archives since v10.129 rotation) from the bot's /data volume,
 generates a comprehensive daily report, and optionally sends it to Telegram.
 
 Usage:
@@ -24,6 +25,7 @@ Environment variables (same as bot):
 """
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -132,6 +134,108 @@ def load_jsonl_window(path: str, epoch_lo: float,
                 except json.JSONDecodeError:
                     pass
     return records, total
+
+
+# v10.129: POLLS MULTISOURCE LOAD — rotation-aware.
+# The bot (v10.129) archives completed days to data/polls/
+# polls_YYYY-MM-DD.jsonl.gz and keeps the live file at today-only.
+# This loader unions BOTH sources (full backward compatibility: with
+# no data/polls/ directory it behaves exactly like v10.127). Crash-
+# retry archives can contain duplicate gzip members — records are
+# deduped on (ts, fixture_id, team_id, minute).
+_POLLS_DAY_RE = re.compile(r"^polls_(\d{4}-\d{2}-\d{2})\.jsonl\.gz$")
+
+
+def _dedup_key(rec: dict) -> tuple:
+    return (round(float(rec.get("ts") or 0), 3),
+            rec.get("fixture_id"), rec.get("team_id"), rec.get("minute"))
+
+
+def load_polls_multisource(data_dir: str, window: tuple | None):
+    """v10.129: archived day files + live file, windowed or full.
+
+    Returns (records, total_nonempty_lines_all_sources,
+    archived_day_counts). window=None loads everything (--all);
+    else (epoch_lo, epoch_hi) — the same superset-with-margins
+    semantics as load_jsonl_window, so filter_by_date(_range)
+    membership is IDENTICAL to the pre-rotation full-file load.
+    """
+    lo, hi = (0.0, float("inf")) if window is None else window
+    seen = set()
+    records = []
+    archived = {}
+    polls_dir = os.path.join(data_dir, "polls")
+    if os.path.isdir(polls_dir):
+        for fn in sorted(os.listdir(polls_dir)):
+            m = _POLLS_DAY_RE.match(fn)
+            if not m:
+                continue
+            d = m.group(1)
+            try:
+                dlo = _sofia_epoch(d)
+                dhi = _sofia_epoch(d) + 86400.0
+            except Exception:
+                continue
+            if dhi <= lo or dlo >= hi:
+                continue
+            n = 0
+            path = os.path.join(polls_dir, fn)
+            try:
+                with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        n += 1
+                        ms = list(_TS_RE.finditer(line))
+                        ts = None
+                        if len(ms) == 1:
+                            try:
+                                ts = float(ms[0].group(1))
+                            except ValueError:
+                                ts = None
+                        if ts is None or (lo <= ts < hi):
+                            try:
+                                rec = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            k = _dedup_key(rec)
+                            if k not in seen:
+                                seen.add(k)
+                                records.append(rec)
+            except (OSError, EOFError, gzip.BadGzipFile):
+                continue
+            archived[d] = n
+    # v10.129: informational total — archived days OUTSIDE the window
+    # come from the tiny polls_daily.jsonl ledger the rotation writes
+    # (O(days), never a full-history scan), so the header stat keeps
+    # its pre-rotation meaning: every poll line on disk.
+    ledger_path = os.path.join(polls_dir, "polls_daily.jsonl")
+    if os.path.exists(ledger_path):
+        try:
+            with open(ledger_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    _ld = rec.get("date")
+                    if _ld and _ld not in archived and isinstance(rec.get("polls"), int):
+                        archived[_ld] = rec["polls"]
+        except OSError:
+            pass
+    live_path = os.path.join(data_dir, "pressure_polls.jsonl")
+    if window is None:
+        live = load_jsonl(live_path)
+        live_total = len(live)
+    else:
+        live, live_total = load_jsonl_window(live_path, lo, hi)
+    for rec in live:
+        k = _dedup_key(rec)
+        if k not in seen:
+            seen.add(k)
+            records.append(rec)
+    return records, live_total + sum(archived.values()), archived
 
 
 def get_date_key(entry: dict) -> str:
@@ -710,6 +814,26 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                    and (e.get("odds_over_odds") or 0) >= 1.35])
         _edge_row("ALL priced (baseline)", _cum_priced)
         lines.append("  promote a rule at n>=50 & edge held 2+ match-weeks")
+        # v10.129: PRICE REGIME — the stale-price illusion, quantified
+        # nightly on the SAME signals: prematch_fallback prices are
+        # paper/upper-bound (the line was set BEFORE kickoff while the
+        # 'bet' is recorded mid-match); live/manual rows are P&L-grade.
+        # Sep 12-20 measured: 81% WR / +86u paper vs 53% / -7.7u live —
+        # a ~28pp fabricated gap. NEVER quote a paper row as money.
+        lines.append("  price regime (same signals, split by odds_source):")
+        _paper_set = [e for e in _cum_priced
+                      if (e.get("odds_source") or "") == "prematch_fallback"]
+        _real_set = [e for e in _cum_priced
+                     if (e.get("odds_source") or "") in ("live", "oddsapi_live", "manual")]
+        if _paper_set:
+            _edge_row("prematch (paper UB)", _paper_set)
+        if _real_set:
+            _edge_row("live/manual (P&L)", _real_set)
+        if _paper_set and _real_set:
+            _pw = sum(1 for e in _paper_set if _over_true(e)) / len(_paper_set)
+            _rw = sum(1 for e in _real_set if _over_true(e)) / len(_real_set)
+            lines.append(f"  illusion gap: {(_pw - _rw) * 100:+.0f}pp "
+                         f"(paper WR - live WR; trust the live row)")
 
     # --- v10.119: CARDS & CORNERS EDGE — lean grading + receipt P&L ---
     # The lean is settled at FT vs the line (mkt_*_ft_result, stamped by
@@ -747,6 +871,22 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
         if _npr:
             lines.append(f"  paper P&L (prematch odds, UPPER BOUND): {_pnl:+.1f}u"
                          f" on {_npr} priced ({_pnl/_npr:+.0%})")
+            # v10.129: live-priced share — the honesty line. Sep 12-20
+            # measured 0 live prices for BOTH markets (every mkt_* price
+            # prematch fallback); the UPPER BOUND label is not a formality.
+            _live_n = 0
+            for e in _graded:
+                if (e.get("odds_source") or "") not in ("live", "oddsapi_live", "manual"):
+                    continue
+                _side_e = e.get(f"mkt_{_kind}_lean")
+                _odd_e = (e.get(f"mkt_{_kind}_over_odds") if _side_e == "OVER"
+                          else e.get(f"mkt_{_kind}_under_odds"))
+                if _odd_e and _odd_e > 1.0:
+                    _live_n += 1
+            if _live_n:
+                lines.append(f"  live-priced: {_live_n}/{_npr} (P&L-grade)")
+            else:
+                lines.append("  live-priced: 0 — /price receipts are the only real path")
         _rec_live = [e for e in _graded if e.get(f"{_kind}_shadow_odds")
                      and e.get(f"{_kind}_shadow_side")
                      and e.get(f"{_kind}_shadow_odds_src") in ("manual", "live")]
@@ -1859,19 +1999,16 @@ def main():
 
     # Load data
     all_outcomes = load_jsonl(os.path.join(args.data_dir, "signal_outcomes.jsonl"))
-    if _polls_window is None:
-        all_polls = load_jsonl(os.path.join(args.data_dir, "pressure_polls.jsonl"))
-        _polls_total = len(all_polls)
-    else:
-        all_polls, _polls_total = load_jsonl_window(
-            os.path.join(args.data_dir, "pressure_polls.jsonl"),
-            _polls_window[0], _polls_window[1],
-        )
+    # v10.129: rotation-aware polls load — archived day files (data/polls/)
+    # UNION the live file; identical membership either way.
+    all_polls, _polls_total, _archived_days = load_polls_multisource(
+        args.data_dir, _polls_window)
     print(
-        "[eod v10.127] load: %d outcomes, %d/%d poll lines, "
-        "windowed=%s, %.1fs"
+        "[eod v10.129] load: %d outcomes, %d poll records, %d total "
+        "lines (%d poll days on disk), windowed=%s, %.1fs"
         % (len(all_outcomes), len(all_polls), _polls_total,
-           _polls_window is not None, time.time() - _t_load0),
+           len(_archived_days), _polls_window is not None,
+           time.time() - _t_load0),
         file=sys.stderr,
     )
     all_blocked = load_jsonl(os.path.join(args.data_dir, "blocked_outcomes.jsonl"))  # v10.49
@@ -2017,7 +2154,7 @@ def main():
                 / 1024.0)
         except Exception:
             _rss_mb = -1.0
-    print("[eod v10.127] done in %.1fs, rss=%.0f MB"
+    print("[eod v10.129] done in %.1fs, rss=%.0f MB"
           % (time.time() - _t_load0, _rss_mb), file=sys.stderr)
 
     # Write JSON report
