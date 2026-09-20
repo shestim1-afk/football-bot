@@ -128,6 +128,13 @@ LEAGUE_IDS = {
     # 113:Allsvenskan = Elfsborg/Hammarby (Sweden).
     218: "Bundesliga (Austria)", 207: "Super League (Switzerland)",
     103: "Eliteserien (Norway)", 113: "Allsvenskan (Sweden)",
+    # v10.127 SHADOW LEAGUES +2 (user request Sep 19: 'serbian and
+    # slovakian as well'): IDs verified from the server's OWN live
+    # feed (Sep 19 UNTRACKED lines): 286 Super Liga = Radnik Surdulica
+    # vs FK Partizan; 332 Super Liga = Komarno vs Slovan Bratislava.
+    # BOTH raw names are plain 'Super Liga' — the ID overrides below
+    # disambiguate (same class as the 78/218 Bundesliga collision).
+    286: "Super Liga (Serbia)", 332: "Super Liga (Slovakia)",
 }
 
 # v10.114: shadow-league config. LEAGUE_NAME_OVERRIDES disambiguates API
@@ -140,10 +147,20 @@ LEAGUE_IDS = {
 LEAGUE_NAME_OVERRIDES = {
     218: "Bundesliga (Austria)", 207: "Super League (Switzerland)",
     103: "Eliteserien (Norway)", 113: "Allsvenskan (Sweden)",
+    # v10.127: Serbia 286 + Slovakia 332 BOTH send raw name
+    # "Super Liga" — without these ID overrides the two leagues
+    # would collide with each other in class grading, the ledger and
+    # SHADOW_LEAGUES membership (name-only matching cannot tell them
+    # apart, the same lesson as Bundesliga 78 vs 218).
+    286: "Super Liga (Serbia)", 332: "Super Liga (Slovakia)",
 }
 SHADOW_LEAGUES = {
     "Bundesliga (Austria)", "Super League (Switzerland)",
     "Eliteserien (Norway)", "Allsvenskan (Sweden)",
+    # v10.127: Serbia + Slovakia (user request) — same trial pattern:
+    # logged + EOD-graded, never sent; promote at n>=15 & WR>=65%
+    # live-priced (flip = remove the name from this set).
+    "Super Liga (Serbia)", "Super Liga (Slovakia)",
 }
 
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "P", "BT", "LIVE", "IN_PLAY"}
@@ -1010,6 +1027,25 @@ _ratio117_sent_date: str | None = None
 #     (3) zero_zero 90-POCKET sub-flag scoped to 21-35' only (verified
 #         95.7% 22/23; the wider 21-40' 0-0 slice is 87.5% 28/32).
 #     EOD analyze_pockets re-cut to grade exactly these rules.
+# v10.127 — SHADOW LEAGUES +2: SERBIA & SLOVAKIA (user request Sep 19:
+#     "yes serbian and slovakian as well, if it is having good
+#     winrate"): league 286 (Super Liga Serbia — feed proof Sep 19:
+#     Radnik Surdulica vs FK Partizan) and league 332 (Super Liga
+#     Slovakia — Komarno vs Slovan Bratislava) join the v10.114 trial
+#     set as SHADOW leagues: fixtures fully tracked (stats polled,
+#     GPS computed, signals evaluated) but every signal is logged +
+#     EOD-graded and NEVER sent to Telegram. Zero ledger history
+#     exists for either league today — the shadow period IS the
+#     winrate measurement: the nightly EOD 'SHADOW LEAGUES' section
+#     grades 'Super Liga (Serbia)' / 'Super Liga (Slovakia)' (ID
+#     overrides disambiguate the raw 'Super Liga' name collision —
+#     both countries send the SAME plain name, the 78/218 Bundesliga
+#     collision class); promotion = config flip (drop the name from
+#     SHADOW_LEAGUES) at n>=15 & WR>=65% at live prices.
+#     LEDGER DISCIPLINE: no tier/class changes (same standard GPS
+#     floors as the other four shadow leagues), no preseeded team IDs
+#     (the cache auto-fills from league fixtures); discovery, polling,
+#     signal gates, EOD grading untouched.
 # v10.126 — CARDS LINE RESTORED + INTEGER LINES (user request Sep 19:
 #     "keep the cards line but instead 8.5 write 9 same for corner ...
 #     can you list current corner as it is with card it has current
@@ -1084,7 +1120,7 @@ _ratio117_sent_date: str | None = None
 #         not |proj-line|.
 #     (4) EOD LEDGER POCKETS P&L split into REAL RECEIPTS (manual
 #         /price freezes) vs prematch paper (upper bound) per rule.
-BOT_VERSION = "v10.126"
+BOT_VERSION = "v10.127"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -1492,7 +1528,7 @@ PRESEEDED_TEAM_IDS = {
     556, 559, 558, 560,
     # Salzburg, Rapid Wien, Austria Wien, Sturm Graz
 
-    # --- SuperLiga Serbia (283) ---
+    # --- SuperLiga Serbia (286; v10.127 feed-verified) ---
     2634, 2635,
     # Red Star, Partizan
 
@@ -15111,10 +15147,11 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     "/goalsboard \u2014 over/under 2.5 per game (form + H2H)\n"
                     "  \u2192 auto-sent every morning before kickoffs\n\n"
                     "\U0001f9ea SHADOW LEAGUES (v10.114)\n"
-                    "Austria / Switzerland / Norway / Sweden are trial-\n"
-                    "tracked: signals logged + EOD-graded but NOT sent,\n"
-                    "until the nightly 'SHADOW LEAGUES' section proves\n"
-                    "them (n>=15 & WR>=65% at live prices)\n\n"
+                    "Austria / Switzerland / Norway / Sweden / Serbia /\n"
+                    "Slovakia are trial-tracked: signals logged + EOD-\n"
+                    "graded but NOT sent, until the nightly 'SHADOW\n"
+                    "LEAGUES' section proves them (n>=15 & WR>=65% at\n"
+                    "live prices)\n\n"
                     "\u26a1 SURGE WATCH & GOAL FLASHES\n"
                     "/surgewatch \u2014 PRE-GOAL pressure alerts on/off (default ON)\n"
                     "  \u2192 Warns when a quiet team's shots suddenly start\n"
@@ -19676,6 +19713,16 @@ def main():
         "RATIOTRIAL_LIVE_MODE=%s (shadow ledgers + EOD grading continue; "
         "journal shows 'virtual, NOT sent' / 'record only (capped/off)')"
         % (FASTLANE_LIVE_MODE, RATIOTRIAL_LIVE_MODE)
+    )
+    # v10.127: shadow leagues +2 — one boot line so Telegram silence
+    # for Serbia/Slovakia is verifiable from journalctl.
+    log.info(
+        "v10.127: SHADOW LEAGUES +2 — Serbia (286) + Slovakia (332) "
+        "trial-tracked (IDs verified from own live feed Sep 19: Radnik "
+        "Surdulica vs FK Partizan 286, Komarno vs Slovan Bratislava 332; "
+        "both raw names 'Super Liga', disambiguated by ID overrides). "
+        "Signals logged + EOD-graded, never sent; promote at n>=15 & "
+        "WR>=65% at live prices (flip out of SHADOW_LEAGUES)"
     )
     log.info(
         "v10.112 TOPSCORER PARSE FIX active: /players/topscorers nests the "
