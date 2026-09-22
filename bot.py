@@ -1139,6 +1139,27 @@ _ratio117_sent_date: str | None = None
 #         top), drifted >1.03 = 58%. Zero extra credits. EOD gains the
 #         LIVE WINDOW section (minute bands + steam buckets + veto
 #         savings). The stats-only fields feed brain v2.
+# v10.132 — MARKED POCKET + 10' RE-QUOTE CONFIRMATION (Sep 22):
+#     (1) POCKET MARK IN THE MESSAGE. The advice record (<=45' live,
+#         12/14 86% +6.61u) is the money surface; its BET lines are now
+#         visibly tagged "🎯 EARLY ≤45'" and the model edge prints
+#         numerically on every live BET line (edge ±N%) — the chat
+#         answers 'is this a pocket signal?' at a glance.
+#     (2) +10' RE-QUOTE (in-play CLV analog). Closing-line value is
+#         unmeasurable on next-goal markets (suspension on the goal);
+#         the honest equivalent re-captures the live price ~600s after
+#         each pocket BET: shortened = market confirmed the pressure,
+#         lengthened = faded. One fetch/BET, drift-watch caps; a goal
+#         before due cancels (bet won). Ledger: requote_10m_*; EOD:
+#         MARKET CONFIRMATION buckets. Evidence for the 95% push —
+#         stamps, never gates.
+#     (3) BET-LINE RENDER FIX. _mkt_live excluded feed-2 — every live
+#         price since v10.111 IS feed-2, so the BET line stopped
+#         rendering Sep 15 (76/76 feed-2 rows carry no edge_p). Both
+#         live classes accepted; feed-2 is parse-sanitized (v10.111).
+#     (4) MODEL-EDGE GATE stays a stamp (pocket-internal n too small;
+#         the cumulative <-5pp cohort is mostly late rows the veto
+#         already kills). Stale 'v10.63' schedule log tag -> BOT_VERSION.
 # v10.131 — STEAM LADDER + MODEL-EDGE EVIDENCE (Sep 22):
 #     (1) LADDER PARK/JOIN. First 24h of v10.130: ZERO steam stamps —
 #         49/77 live rows sit on a line the parked prematch ref does
@@ -1293,7 +1314,7 @@ _ratio117_sent_date: str | None = None
 #         not |proj-line|.
 #     (4) EOD LEDGER POCKETS P&L split into REAL RECEIPTS (manual
 #         /price freezes) vs prematch paper (upper bound) per rule.
-BOT_VERSION = "v10.131"
+BOT_VERSION = "v10.132"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -13718,6 +13739,152 @@ def _drift_watch_tick(client, fixtures_now: dict) -> None:
         log.warning(f"  DRIFT tick failed (watches preserved): {_te}")
 
 
+# ============================================================
+# v10.132: +10' RE-QUOTE — MARKET CONFIRMATION FOR POCKET BETS
+# The in-play CLV analog. The advice record (<=45' live: 12/14 86%
+# +6.61u) is real, but every stamp so far was taken AT the signal.
+# The open question for the win-rate push: does the market CONFIRM
+# the signal after the fact? A re-quote ~10 min after the advice
+# measures it — price shortened = the market moved with us (the
+# entry beat the market), lengthened = the market faded the pressure.
+# Drift-watch discipline: one fetch per registered BET, hard daily
+# cap, quota floor, cancel on goal-before-due (the bet won — nothing
+# to measure) / FT / minute ceiling / expiry. NEVER raises into the
+# poll loop, never gates, never sends anything. Stamps only.
+# ============================================================
+REQUOTE_DELAY_SECS = int(os.environ.get("REQUOTE_DELAY_SECS", "600"))
+REQUOTE_MAX_ACTIVE = int(os.environ.get("REQUOTE_MAX_ACTIVE", "8"))
+REQUOTE_DAILY_CAP = int(os.environ.get("REQUOTE_DAILY_CAP", "12"))
+REQUOTE_QUOTA_FLOOR = int(os.environ.get("REQUOTE_QUOTA_FLOOR", "60"))
+REQUOTE_MAX_MINUTE = int(os.environ.get("REQUOTE_MAX_MINUTE", "85"))
+
+_requote_132: dict[int, dict] = {}
+_requote_day_132: dict = {"date": None, "registers": 0, "checks": 0}
+
+
+def _requote_day_rollover_132() -> None:
+    _d = time.strftime("%Y-%m-%d")
+    if _requote_day_132["date"] != _d:
+        _requote_day_132.update(date=_d, registers=0, checks=0)
+
+
+def _requote_register_132(fid, tid, tname, league, minute, price,
+                          goals_now) -> None:
+    """v10.132: a pocket BET fired — schedule its +10' re-quote.
+    Defensive: any failure just skips the measurement."""
+    try:
+        _requote_day_rollover_132()
+        if len(_requote_132) >= REQUOTE_MAX_ACTIVE:
+            log.info(f"  v10.132 RE-QUOTE: F{fid} skipped (queue full)")
+            return
+        if _requote_day_132["registers"] >= REQUOTE_DAILY_CAP:
+            return
+        _requote_132[fid] = {
+            "fid": fid, "tid": tid, "tname": tname, "league": league,
+            "minute": minute, "price": float(price),
+            "goals_at_signal": int(goals_now or 0),
+            "ts": time.time(),
+        }
+        _requote_day_132["registers"] += 1
+        log.info(
+            f"  v10.132 RE-QUOTE armed: F{fid} {tname} {minute}' "
+            f"live {price:.2f} — re-price in {REQUOTE_DELAY_SECS}s"
+        )
+    except Exception as _re:
+        log.debug(f"  v10.132 re-quote register failed F{fid}: {_re}")
+
+
+def _requote_stamp_132(e: dict, price: float, ratio, minute_now) -> None:
+    """Stamp requote_10m_* onto the open ledger row for that fixture+team
+    (in-memory + the standard merge-rewrite). Latest open row wins."""
+    try:
+        for row in reversed(signal_outcomes):
+            if (
+                row.get("fixture_id") == e["fid"]
+                and row.get("team_id") == e["tid"]
+                and not row.get("resolved")
+            ):
+                row["requote_10m_odds"] = round(float(price), 2)
+                row["requote_10m_ratio"] = ratio
+                row["requote_10m_minute"] = minute_now
+                row["requote_10m_wait_s"] = int(time.time() - e["ts"])
+                rewrite_outcomes_file()
+                log.info(
+                    f"  v10.132 RE-QUOTE stamp: F{e['fid']} {e['tname']} "
+                    f"{e['price']:.2f} -> {price:.2f} (ratio {ratio})"
+                )
+                return
+        log.info(
+            f"  v10.132 RE-QUOTE: F{e['fid']} no open ledger row — stamp skipped"
+        )
+    except Exception as _se:
+        log.debug(f"  v10.132 re-quote stamp failed: {_se}")
+
+
+def _requote_tick_132(client, fixtures_now: dict) -> None:
+    """v10.132: the +10' sweep — same fresh fixture map as the drift
+    tick. One live fetch per registered pocket BET at due time; goal /
+    FT / ceiling / expiry / caps all cancel silently. NEVER raises."""
+    if not _requote_132:
+        return
+    try:
+        now = time.time()
+        _requote_day_rollover_132()
+        for fid in list(_requote_132.keys()):
+            e = _requote_132.get(fid)
+            if e is None:
+                continue
+            if now - e["ts"] > REQUOTE_DELAY_SECS + 900:
+                _requote_132.pop(fid, None)
+                continue
+            fx = fixtures_now.get(fid) if fixtures_now else None
+            if fx is None:
+                continue  # not in this cycle; the age cap reaps it
+            tot, elapsed, short = _fixture_live_state(fx)
+            if short in ("FT", "AET", "PEN"):
+                _requote_132.pop(fid, None)
+                continue
+            if tot is not None and tot != e["goals_at_signal"]:
+                _requote_132.pop(fid, None)
+                log.info(
+                    f"  v10.132 RE-QUOTE skip: F{fid} goal landed before "
+                    "+10' — bet won, nothing to measure"
+                )
+                continue
+            if now < e["ts"] + REQUOTE_DELAY_SECS:
+                continue
+            if elapsed is not None and elapsed >= REQUOTE_MAX_MINUTE:
+                _requote_132.pop(fid, None)
+                continue
+            if _requote_day_132["checks"] >= REQUOTE_DAILY_CAP:
+                continue
+            if quota_remaining is not None and quota_remaining <= REQUOTE_QUOTA_FLOOR:
+                continue
+            price = None
+            try:
+                od = fetch_signal_odds(
+                    client, fid, tot if tot is not None else 0,
+                    game_minute=elapsed, for_message=True
+                )
+                _requote_day_132["checks"] += 1
+                if (
+                    od is not None
+                    and od.get("odds_source") in ("live", "oddsapi_live")
+                    and not od.get("suspect")
+                    and od.get("over_odds") is not None
+                ):
+                    price = float(od["over_odds"])
+            except Exception as _de:
+                log.debug(f"  v10.132 RE-QUOTE fetch failed F{fid}: {_de}")
+            _requote_132.pop(fid, None)
+            if price is None:
+                continue
+            ratio = round(price / e["price"], 3) if e["price"] else None
+            _requote_stamp_132(e, price, ratio, elapsed)
+    except Exception as _te:
+        log.warning(f"  v10.132 re-quote tick failed: {_te}")
+
+
 def _apply_price_gate(
     bet_flag: str, odds_msg: dict | None, model_p: float | None = None,
 ) -> tuple[str, str, float | None]:
@@ -13814,8 +13981,9 @@ def _build_odds_value_block(
         capped at 0.98 x the any-goal line (team events are a subset of
         any-goal events — never display an impossible crossing).
 
-    EV verdict ONLY against P&L-grade live prices (source='live' AND not
-    suspect) — pre-match refs are display-only reference, exactly the
+    EV verdict ONLY against P&L-grade live prices (source in
+    ('live', 'oddsapi_live') AND not suspect) — pre-match refs are
+    display-only reference, exactly the
     v10.77 discipline (pre-match prices applied to in-play lines are the
     Sep-4/Sep-6 garbage class).
 
@@ -13863,7 +14031,12 @@ def _build_odds_value_block(
         _mkt_live = bool(
             odds_data
             and odds_data.get("over_odds")
-            and odds_data.get("odds_source") == "live"
+            # v10.132 FIX: feed-2 ('oddsapi_live') was EXCLUDED here —
+            # every live price since v10.111 is feed-2, so the BET line
+            # + edge stamps silently stopped rendering Sep 15 (76/76
+            # feed-2 ledger rows carry no edge_p / ev_pct). Feed-2 is
+            # sanitized at parse (v10.111) and P&L-grade: render + stamp.
+            and odds_data.get("odds_source") in ("live", "oddsapi_live")
             and not odds_data.get("suspect")
         )
         # v10.125: LIVE-ONLY price line (user Sep 19: 'i dont want to
@@ -13879,10 +14052,11 @@ def _build_odds_value_block(
                 f"({odds_data.get('bookmaker') or '?'} \u00b7 LIVE)"
             )
             ev_pct = (float(odds_data["over_odds"]) * p_any_v2 - 1.0) * 100.0  # v10.120: v2 EV
-            if ev_pct >= 3.0:
-                _book_bit += f" \u00b7 VALUE +{ev_pct:.0f}%"
-            elif ev_pct <= -3.0:
-                _book_bit += " \u00b7 no edge"
+            if ev_pct is not None:
+                # v10.132: the edge is ALWAYS numeric — one honest
+                # number (model P x odds - 1, % of stake) instead of
+                # the old VALUE/no-edge qualitative tags
+                _book_bit += f" \u00b7 edge {ev_pct:+.0f}%"
             if (
                 odds_data.get("over_best")
                 and odds_data.get("live_books")
@@ -13892,8 +14066,14 @@ def _build_odds_value_block(
                     f" \u00b7 best {float(odds_data['over_best']):.2f} "
                     f"@{odds_data.get('over_best_book') or '?'}"
                 )
+            _early132 = ""
+            if minute is not None and minute <= LIVE_BET_MINUTE_MAX:
+                # v10.132: the POCKET MARK — every bettable (early
+                # window) BET line is tagged, so the advice class is
+                # identifiable in the chat at a glance
+                _early132 = "\U0001f3af EARLY \u226445' \u00b7 "
             lines = [
-                f"\n\U0001f4b0 BET Over {any_line:.1f} \u2014 {_book_bit}"
+                f"\n\U0001f4b0 {_early132}BET Over {any_line:.1f} \u2014 {_book_bit}"
             ]
 
         # v10.120: edge bookkeeping — model P (v2) minus implied P when a
@@ -18356,6 +18536,32 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 "\u2014 live-bet advice suppressed (late window)"
             )
 
+        # v10.132: +10' RE-QUOTE REGISTRATION — a pocket BET row (<=45',
+        # live-priced, every gate passed) gets ONE market-confirmation
+        # fetch ~10 min later (the in-play CLV analog). A goal before
+        # the due time cancels it at the tick (the bet won).
+        try:
+            _rq_price132 = None
+            if _odds_msg is not None \
+                    and (_odds_msg.get("odds_source") or "") in ("live", "oddsapi_live") \
+                    and not _odds_msg.get("suspect"):
+                try:
+                    _rq_price132 = float(_odds_msg.get("over_odds"))
+                except (TypeError, ValueError):
+                    _rq_price132 = None
+            if (
+                bet_flag == "BET"
+                and minute is not None
+                and minute <= LIVE_BET_MINUTE_MAX
+                and _rq_price132 is not None
+            ):
+                _requote_register_132(
+                    fid, tid, tname, league, minute, _rq_price132,
+                    int(_current_goals or 0),
+                )
+        except Exception as _rqe132:
+            log.debug(f"  v10.132 re-quote register skipped: {_rqe132}")
+
         # v10.120: SHADOW-90 STAMP — the 21-40' SOT>=3/CRITICAL any-goal
         # pocket (Sep 12-18 ledger: 93.5%, n=46) measured on every signal,
         # NOT bet and NOT sent: pure ledger stamps the EOD grades with the
@@ -18937,6 +19143,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             # analysis). Live rows carry the live book's ladder (kept
             # for completeness); the EOD join reads prematch rows only.
             "goals_ladder": (_odds_data or {}).get("goals_ladder") or None,
+            # v10.132: +10' RE-QUOTE stamps — the market's verdict on the
+            # pocket BET ~10 min after the advice (None = not re-quoted:
+            # goal landed first / FT / cap / not live-priced at signal).
+            "requote_10m_odds": None,
+            "requote_10m_ratio": None,
+            "requote_10m_minute": None,
+            "requote_10m_wait_s": None,
             # v10.93: LIVE-ODDS TRUTH — the why-live-was-empty snapshot
             # (results + errors straight off the /odds/live response) and
             # the multi-book line-shop numbers. live_diag is set ONLY when
@@ -19478,6 +19691,7 @@ def check_monitored_stats(
         # fresh fixture map (zero extra fixture calls; only the capped
         # odds re-prices cost credits).
         _drift_watch_tick(client, refreshed_fixtures)
+        _requote_tick_132(client, refreshed_fixtures)  # v10.132: +10' confirmation
         return any_success
 
     # ================================================================
@@ -19531,6 +19745,7 @@ def check_monitored_stats(
 
     # v10.104: drift-watch tick (fallback path) — same engine, same caps.
     _drift_watch_tick(client, refreshed_fixtures)
+    _requote_tick_132(client, refreshed_fixtures)  # v10.132 (fallback path)
     return any_success
 
 
@@ -20880,7 +21095,7 @@ def main():
                 if not _eod_lookup_ok:
                     _eod_lookup_ok = True
                     log.info(
-                        "v10.63: schedule shows no tracked matches today — EOD gate armed"
+                        f"{BOT_VERSION}: schedule shows no tracked matches today — EOD gate armed"
                     )
                 # v9.7.1: Smart sleep — calculate how long until next meaningful wake
                 now_bg = datetime.now(BULGARIA_TZ)
