@@ -845,7 +845,7 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
         # would-be late-bet P&L (savings) + early-pocket P&L.
         if _real_set:
             lines.append("")
-            lines.append("=== LIVE WINDOW (v10.131 — enforced ledger) ===")
+            lines.append("=== LIVE WINDOW (v10.132 — enforced ledger) ===")
             _edge_row("live <=45' (allowed)",
                       [e for e in _real_set if (e.get("game_minute") or 0) <= 45])
             _edge_row("live 46-60' (vetoed)",
@@ -977,6 +977,29 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                     f" bet(s) suppressed, would-be P&L {_dp130:+.2f}u")
             else:
                 lines.append("  veto savings (day scope): no late live-priced bets")
+            # v10.132: +10' MARKET CONFIRMATION — the re-quote stamps on
+            # the P&L-grade rows (the in-play CLV analog: taken price vs
+            # the +10' re-captured price; shortened = the market moved
+            # WITH the signal). Buckets accumulate the evidence for the
+            # win-rate push; stamps start tonight, promotion discipline
+            # unchanged (n>=50 & 2+ match-weeks).
+            _rq132 = []
+            for _e in _real_set:
+                try:
+                    _r = float(_e.get("requote_10m_ratio"))
+                except (TypeError, ValueError):
+                    continue
+                _rq132.append((_e, _r))
+            if _rq132:
+                lines.append("  +10' market confirmation (re-quote):")
+                _edge_row("rq <0.95 (confirmed)",
+                          [e for e, r in _rq132 if r < 0.95])
+                _edge_row("rq 0.95-1.05 (flat)",
+                          [e for e, r in _rq132 if 0.95 <= r <= 1.05])
+                _edge_row("rq >1.05 (faded)",
+                          [e for e, r in _rq132 if r > 1.05])
+            else:
+                lines.append("  +10' re-quote: no stamps yet (starts v10.132)")
 
     # --- v10.119: CARDS & CORNERS EDGE — lean grading + receipt P&L ---
     # The lean is settled at FT vs the line (mkt_*_ft_result, stamped by
@@ -2147,7 +2170,7 @@ def main():
     all_polls, _polls_total, _archived_days = load_polls_multisource(
         args.data_dir, _polls_window)
     print(
-        "[eod v10.130] load: %d outcomes, %d poll records, %d total "
+        "[eod v10.132] load: %d outcomes, %d poll records, %d total "
         "lines (%d poll days on disk), windowed=%s, %.1fs"
         % (len(all_outcomes), len(all_polls), _polls_total,
            len(_archived_days), _polls_window is not None,
@@ -2297,7 +2320,7 @@ def main():
                 / 1024.0)
         except Exception:
             _rss_mb = -1.0
-    print("[eod v10.130] done in %.1fs, rss=%.0f MB"
+    print("[eod v10.132] done in %.1fs, rss=%.0f MB"
           % (time.time() - _t_load0, _rss_mb), file=sys.stderr)
 
     # Write JSON report
