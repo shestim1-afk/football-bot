@@ -210,7 +210,16 @@ PRICE_FLOOR = float(os.environ.get("PRICE_FLOOR", "1.25"))
 # — prematch_fallback parses already pay for it) and live captures
 # stamp prematch_ref + steam_ratio into the ledger.
 LIVE_BET_MINUTE_MAX = 45  # v10.130: > this -> live-bet advice suppressed
-_PREMATCH_REF: dict = {}  # v10.130: {fid: {"line", "odds", "ts"}}
+# v10.131: STEAM LADDER (Sep 22). First 24h of v10.130 stamped ZERO
+# steam: the join needs live line == parked prematch MAIN line, but
+# 49/77 live rows sit on a drifted line (live next-goal line moves with
+# the score; the parked main line doesn't). Fix: park the book's FULL
+# goals O/U ladder on every prematch parse (same fetch, zero credits)
+# and join the live line against the ladder entry first. EOD gains
+# model-edge bands on live rows (escape-matrix: <-5pp ran 44% -7.58u —
+# nearly all the lifetime loss; never gated until n>=50) and an
+# early-pocket day-scope P&L line (the allowed half of the veto ledger).
+_PREMATCH_REF: dict = {}  # v10.130/131: {fid: {"line", "odds", "ladder", "ts"}}
 
 
 def _live_veto_line_130(minute):
@@ -224,38 +233,53 @@ def _live_veto_line_130(minute):
 
 
 def _prematch_ref_stamp_130(source, result, fixture_id):
-    """v10.130: park prematch refs; join them onto later live captures.
+    """v10.130/131: park prematch refs; join them onto later live captures.
 
     Called at the single odds_source choke point in fetch_signal_odds.
     prematch_fallback parses update the per-fixture ref (latest wins);
     a later live capture on the same fixture attaches prematch_ref +
-    steam_ratio when the over line matches. Ledger-only — the
-    message text never changes.
+    steam_ratio when the over line matches. v10.131: the park carries
+    the book's FULL goals O/U ladder and the live join resolves the
+    live line against the LADDER entry first — a live O3.5 capture now
+    joins the parked prematch O3.5 even when the parked main line was
+    O2.5 (v10.130's exact-line join left 49/77 live rows unjoinable and
+    stamped zero steam in 24h). Ledger-only — the message text never
+    changes.
     """
     try:
         if not result:
             return
-        if source == "prematch_fallback" and result.get("over_odds"):
+        if source == "prematch_fallback" and (
+            result.get("over_odds") or result.get("goals_ladder")
+        ):
+            _ref = _PREMATCH_REF.get(fixture_id) or {}
+            _lad = _ref.get("ladder") or {}
+            for _ln, _od in (result.get("goals_ladder") or {}).items():
+                try:
+                    _lad[str(_ln)] = float(_od)
+                except (TypeError, ValueError):
+                    pass
             _PREMATCH_REF[fixture_id] = {
                 "line": result.get("over_line"),
                 "odds": result.get("over_odds"),
+                "ladder": _lad,
                 "ts": time.time(),
             }
         elif source in ("live", "oddsapi_live") and result.get("over_odds"):
             _ref = _PREMATCH_REF.get(fixture_id) or {}
-            _ref_odds = _ref.get("odds")
+            _live_ln = str(result.get("over_line"))
+            _ref_odds = (_ref.get("ladder") or {}).get(_live_ln)
+            if not _ref_odds and _ref.get("odds") and (
+                _ref.get("line") is None
+                or _live_ln == str(_ref.get("line"))
+            ):
+                _ref_odds = _ref.get("odds")
             if not _ref_odds:
                 return
-            _line_ok = (
-                _ref.get("line") is None
-                or result.get("over_line") is None
-                or str(_ref.get("line")) == str(result.get("over_line"))
+            result["prematch_ref"] = float(_ref_odds)
+            result["steam_ratio"] = round(
+                float(result["over_odds"]) / float(_ref_odds), 4
             )
-            if _line_ok:
-                result["prematch_ref"] = float(_ref_odds)
-                result["steam_ratio"] = round(
-                    float(result["over_odds"]) / float(_ref_odds), 4
-                )
     except Exception:
         pass
 
@@ -1115,6 +1139,17 @@ _ratio117_sent_date: str | None = None
 #         top), drifted >1.03 = 58%. Zero extra credits. EOD gains the
 #         LIVE WINDOW section (minute bands + steam buckets + veto
 #         savings). The stats-only fields feed brain v2.
+# v10.131 — STEAM LADDER + MODEL-EDGE EVIDENCE (Sep 22):
+#     (1) LADDER PARK/JOIN. First 24h of v10.130: ZERO steam stamps —
+#         49/77 live rows sit on a line the parked prematch ref does
+#         not carry (the live next-goal line drifts with the score).
+#         prematch parses now park the book's FULL goals O/U ladder
+#         (same fetch, zero credits) and live joins resolve the ladder
+#         entry for the live line FIRST, legacy exact-main-line second.
+#     (2) EOD MODEL-EDGE BANDS on the P&L-grade rows (escape-matrix:
+#         pred_over_25_cal - implied < -5pp ran 44% -7.58u; +5..15pp
+#         3/3) + early-pocket day-scope P&L line. Stamps, never gates;
+#         promotion at n>=50 & 2+ match-weeks, as everywhere else.
 # v10.129 — POLLS ROTATION + HONEST-PRICE EOD (Sep 21):
 #     (1) GROWTH FIX. The live pressure_polls.jsonl reached 123MB /
 #     62k lines (Sep 14-20) because the v10.44n backup-and-truncate
@@ -1258,7 +1293,7 @@ _ratio117_sent_date: str | None = None
 #         not |proj-line|.
 #     (4) EOD LEDGER POCKETS P&L split into REAL RECEIPTS (manual
 #         /price freezes) vs prematch paper (upper bound) per rule.
-BOT_VERSION = "v10.130"
+BOT_VERSION = "v10.131"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -10598,6 +10633,10 @@ def _parse_signal_odds(data: dict, total_goals: int,
         # v10.80: full O/U ladders for the card/corner markets
         "cards_lines": [],
         "corners_lines": [],
+        # v10.131: the book's FULL goals O/U ladder {"2.5": 1.85, ...}
+        # — parked per fixture on prematch parses so live captures can
+        # join a prematch ref at ANY line, not just the parked main.
+        "goals_ladder": {},
     }
 
     # Target: Over (current total + 0.5) goals
@@ -10633,6 +10672,16 @@ def _parse_signal_odds(data: dict, total_goals: int,
                             result["over_line"] = target_line
                             result["over_odds"] = round(odd, 2)
                             result["over_implied"] = round(1.0 / odd, 3)
+                    # v10.131: ladder — every Over line on this book
+                    # ("Under X.5" values never parse as float, so the
+                    # startswith is pure defense). Same fetch, same
+                    # values list, zero extra calls.
+                    if val_str.lower().startswith("over"):
+                        _od131 = safe_float(str(v.get("odd", "")))
+                        if _od131 and _od131 > 1.01:
+                            result["goals_ladder"][str(round(line, 1))] = round(
+                                _od131, 2
+                            )
                 except (ValueError, IndexError):
                     pass
 
@@ -18882,6 +18931,12 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "live_veto": _live_veto130,
             "prematch_ref_odds": (_odds_data or {}).get("prematch_ref"),
             "steam_ratio": (_odds_data or {}).get("steam_ratio"),
+            # v10.131: the captured book's goals O/U ladder — lets the
+            # EOD fixture-join prematch refs for live rows whose line
+            # drifted off the prematch main line (49/77 in the Sep 22
+            # analysis). Live rows carry the live book's ladder (kept
+            # for completeness); the EOD join reads prematch rows only.
+            "goals_ladder": (_odds_data or {}).get("goals_ladder") or None,
             # v10.93: LIVE-ODDS TRUTH — the why-live-was-empty snapshot
             # (results + errors straight off the /odds/live response) and
             # the multi-book line-shop numbers. live_diag is set ONLY when
