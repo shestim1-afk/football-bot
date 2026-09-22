@@ -834,16 +834,18 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
             _rw = sum(1 for e in _real_set if _over_true(e)) / len(_real_set)
             lines.append(f"  illusion gap: {(_pw - _rw) * 100:+.0f}pp "
                          f"(paper WR - live WR; trust the live row)")
-        # v10.130: LIVE WINDOW — the enforced ledger. v10.130
+        # v10.130/131: LIVE WINDOW — the enforced ledger. v10.130
         # hard-vetoes the BET advice after minute 45 (message +
         # bet_flag); this table shows the window split on the
         # P&L-grade rows: cumulative minute bands, steam buckets
         # (steam_ratio stamped at capture from v10.130; older rows use
-        # the prematch fixture-join fallback), and the day's would-be
-        # late-bet P&L (the savings line).
+        # the prematch fixture-join fallback — v10.131 widens it with
+        # the parked goals-ladder), model-edge bands (v10.131: the
+        # escape-matrix killer stat, finally tracked), and the day's
+        # would-be late-bet P&L (savings) + early-pocket P&L.
         if _real_set:
             lines.append("")
-            lines.append("=== LIVE WINDOW (v10.130 — enforced ledger) ===")
+            lines.append("=== LIVE WINDOW (v10.131 — enforced ledger) ===")
             _edge_row("live <=45' (allowed)",
                       [e for e in _real_set if (e.get("game_minute") or 0) <= 45])
             _edge_row("live 46-60' (vetoed)",
@@ -855,6 +857,7 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
             _edge_row("live 76+' (vetoed)",
                       [e for e in _real_set if (e.get("game_minute") or 0) >= 76])
             _pre_ref130 = {}
+            _pre_lad131 = {}   # v10.131: fid -> {line_str: prematch odds}
             for _e in _cum_priced:
                 if (_e.get("odds_source") or "") == "prematch_fallback":
                     _fx = _e.get("fixture_id")
@@ -862,6 +865,14 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                     _od = _e.get("odds_over_odds")
                     if _fx is not None and _od:
                         _pre_ref130[(_fx, _ln)] = _od
+                    _lad = _e.get("goals_ladder") or {}
+                    if _fx is not None and isinstance(_lad, dict):
+                        _dst131 = _pre_lad131.setdefault(_fx, {})
+                        for _k, _v in _lad.items():
+                            try:
+                                _dst131[str(_k)] = float(_v)
+                            except (TypeError, ValueError):
+                                pass
 
             def _steam_of130(e):
                 _v = e.get("steam_ratio")
@@ -872,6 +883,13 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                         return None
                 _pm = _pre_ref130.get((e.get("fixture_id"),
                                        str(e.get("odds_over_line"))))
+                # v10.131: ladder fallback — the live line may sit off
+                # the prematch main line (49/77 rows); a prematch
+                # ladder entry for the SAME numeric line is still an
+                # honest prematch ref for it.
+                if not _pm:
+                    _pm = (_pre_lad131.get(e.get("fixture_id")) or {}).get(
+                        str(e.get("odds_over_line")))
                 if not _pm:
                     return None
                 try:
@@ -887,6 +905,38 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
             _unk130 = sum(1 for e in _real_set if _steam_of130(e) is None)
             if _unk130:
                 lines.append(f"  steam unknown: {_unk130} row(s) (no prematch ref)")
+            # v10.131: MODEL-EDGE BANDS — the escape-matrix killer stat
+            # (pred_over_25_cal - implied: < -5pp ran 44% -7.58u = nearly
+            # all the lifetime loss; +5..15pp ran 3/3). Tracked nightly on
+            # the P&L-grade rows; promotion to a gate only at n>=50 per
+            # bucket AND the gap holding 2+ match-weeks.
+            def _medge_of131(e):
+                try:
+                    _pv = e.get("pred_over_25_cal")
+                    _iv = e.get("odds_over_implied")
+                    if _pv is None or _iv is None:
+                        return None
+                    return float(_pv) - float(_iv)
+                except (TypeError, ValueError):
+                    return None
+
+            _me131 = [(e, _medge_of131(e)) for e in _real_set]
+            _me131 = [(e, m) for e, m in _me131 if m is not None]
+            if _me131:
+                lines.append("  model-edge bands (pred_over_25_cal - implied):")
+                for _lbl, _lo, _hi in (
+                    ("edge < -5pp", None, -0.05),
+                    ("edge -5..0pp", -0.05, 0.0),
+                    ("edge 0..+5pp", 0.0, 0.05),
+                    ("edge >= +5pp", 0.05, None),
+                ):
+                    _es131 = [e for e, m in _me131
+                              if (_lo is None or m >= _lo)
+                              and (_hi is None or m < _hi)]
+                    if _es131:
+                        _edge_row(_lbl, _es131)
+                lines.append("  promote a model-edge gate at n>=50/bucket &"
+                             " 2+ match-weeks (escape-matrix: <-5pp 44% -7.58u)")
             _day_late130 = [
                 e for e in (signals or [])
                 if (e.get("odds_source") or "") in ("live", "oddsapi_live", "manual")
@@ -895,6 +945,28 @@ def analyze_signals(signals: list[dict], all_signals: list[dict] | None = None) 
                 and e.get("odds_over_odds")
                 and e.get("outcome_full") in ("HIT", "MISS")
             ]
+            # v10.131: early pocket day scope — the allowed half of the
+            # veto ledger (advice record: 12/14 86% +6.61u lifetime).
+            _day_early131 = [
+                e for e in (signals or [])
+                if (e.get("odds_source") or "") in ("live", "oddsapi_live", "manual")
+                and not e.get("odds_suspect")
+                and (e.get("game_minute") or 0) <= 45
+                and e.get("odds_over_odds")
+                and e.get("outcome_full") in ("HIT", "MISS")
+            ]
+            if _day_early131:
+                _ep131 = sum(
+                    (e.get("odds_over_odds") or 2.0) - 1.0
+                    if _over_true(e) else -1.0
+                    for e in _day_early131)
+                _ew131 = sum(1 for e in _day_early131 if _over_true(e))
+                lines.append(
+                    f"  early pocket (day scope): {len(_day_early131)} live"
+                    f" bet(s) allowed, {_ew131}/{len(_day_early131)} won,"
+                    f" P&L {_ep131:+.2f}u")
+            else:
+                lines.append("  early pocket (day scope): no live-priced bets")
             if _day_late130:
                 _dp130 = sum(
                     (e.get("odds_over_odds") or 2.0) - 1.0
