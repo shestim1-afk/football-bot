@@ -103,6 +103,7 @@ LEAGUE_IDS = {
     39: "Premier League", 140: "La Liga", 78: "Bundesliga", 79: "2. Bundesliga",
     135: "Serie A", 61: "Ligue 1", 2: "Champions League", 3: "Europa League",
     848: "Conference League", 357: "First League (Bulgaria)", 172: "First League (Bulgaria)",
+    5: "UEFA Nations League",
     656: "Super Cup (Bulgaria)",  # v10.81: Levski-CSKA derby Sep 9 was UNTRACKED (league 656)
     94: "Primeira Liga",
     88: "Eredivisie", 203: "Super Lig",
