@@ -1318,7 +1318,23 @@ _ratio117_sent_date: str | None = None
 # v10.134 (Sep 25): PATTERN MINE wired into live messages —
 # mined badges + vetoes ride the signal after the pocket badges
 # and land in the ledger as mine_stamps (display+ledger only).
-BOT_VERSION = "v10.134"
+# v10.135 (Sep 26): CLEAR STAMPS — the mine/veto lines rewritten for
+# readability (number first, plain words, <=2 MINE + <=3 VETO shown, one
+# legend line; every fired rule id still lands in the ledger) + NEW VETO
+# V-CHASE61 (losing team 61'+ = 36.4% goal WR, the comeback-test finding).
+# Display + ledger only — no thresholds, gates or stakes touched.
+# v10.136 (Sep 26): QUIET STAMPS + NO-BET GATE (user call):
+#     (1) Message CLEAN again — NO mine/veto stamp text at all; pocket
+#         badges stay exactly as v10.122 ("like before"). Every fired id
+#         still lands in the ledger as mine_stamps (uncapped).
+#     (2) A GOALS veto now means NO BET: a live BET is demoted to NO_BET
+#         (same mechanism as the v10.130 live-window veto) and ONE short
+#         line rides the message ("NO BET — reason (%)"). New ledger
+#         field veto_gate records which veto demoted the row (gradable).
+#     (3) Market vetoes (cards/corners UNDER family) grade a DIFFERENT
+#         market than the goals bet — they never demote it; ledger only.
+#     Rule conditions and ids are byte-identical to v10.134/135.
+BOT_VERSION = "v10.136"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -11664,23 +11680,35 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
         return ""
 
 
-def _pattern_mine_stamps_134(minute, mkt_extras, team_goals, opp_goals,
+def _pattern_mine_stamps_136(minute, mkt_extras, team_goals, opp_goals,
                               sot, shots_inside_box, opp_shots_inside_box,
                               corners, fouls, league, league_class,
                               window_tag, fid, tid):
-    """v10.134: PATTERN MINE stamps for the signal message (see the
-    v10.134 header). Returns (text, rule_ids) — text is "" when
-    nothing fired. Numbers mirror the published mine table (app
-    Ledger Audit section 11): Sep 12-21 ledger grades, push-aware
-    corners/cards. Fully defensive — any missing input just skips
-    that stamp, never the signal."""
+    """v10.136: QUIET STAMPS + NO-BET GATE (user call, Sep 26: "if it is
+    veto just put no bet \u2014 keep all info inside the ledger").
+    Same rules as v10.134/135 \u2014 identical trigger conditions, identical
+    rule ids \u2014 but the message carries NO stamp text any more (pocket
+    badges stay exactly as v10.122). Returns (ids, goals_veto_id, line):
+      * ids \u2014 EVERY fired rule id (badges, vetoes, risk) for the ledger
+        mine_stamps field; grading stays uncapped.
+      * goals_veto_id \u2014 the strongest fired GOALS veto (lowest WR); only
+        these may demote BET -> NO_BET at the call site. Market vetoes
+        (the cards/corners UNDER family) grade a DIFFERENT market than
+        the goals bet, so they never demote it \u2014 ledger only.
+      * line \u2014 one short "NO BET \u2014 reason (%)" message line when a
+        goals veto fired ("" otherwise); the caller demotes only a live
+        BET, so an already-vetoed late window stays quiet (v10.130 line
+        already says NO bet there).
+    Fully defensive \u2014 any missing input skips that stamp, never the signal.
+    """
     try:
         _m = int(minute or 0)
         _ex = mkt_extras or {}
         _tg = int(team_goals or 0)
         _og = int(opp_goals or 0)
         _tot = _tg + _og
-        _badges, _vetoes, _ids = [], [], []
+        _ids = []
+        _gv = None          # (wr, rid, label) \u2014 strongest goals veto
 
         _cl_up = str(_ex.get("mkt_corners_lean") or "").upper()
         _kl_up = str(_ex.get("mkt_cards_lean") or "").upper()
@@ -11694,124 +11722,76 @@ def _pattern_mine_stamps_134(minute, mkt_extras, team_goals, opp_goals,
         except Exception:
             _fsc = None
 
-        # --- corners family ------------------------------------
-        # C1 distance gate: OVER lean & now >= floor(line)-1
-        # (need <= 2) = 47/47 at ALL minutes; complement = risk zone.
+        def _badge(rid):
+            _ids.append(rid)
+
+        def _mveto(rid):
+            # market veto \u2014 ledger only, never demotes the goals bet
+            _ids.append(rid)
+
+        def _gveto(wr, label, rid):
+            # goals veto \u2014 the NO BET family; strongest (lowest WR) wins
+            nonlocal _gv
+            _ids.append(rid)
+            if _gv is None or wr < _gv[0]:
+                _gv = (wr, rid, label)
+
+        # --- corners family (conditions identical to v10.134) ----
         if "OVER" in _cl_up and _cn is not None and _cline is not None:
             try:
-                _thr = int(math.floor(float(_cline))) + 1   # FT OVER threshold
+                _thr = int(math.floor(float(_cline))) + 1
                 _need = _thr - int(_cn)
             except (TypeError, ValueError):
                 _need = None
             if _need is not None:
                 if _need <= 2:
-                    _badges.append(
-                        f"\n\U000026cf MINE \u00b7 CORNERS DISTANCE GATE \u2014 need {_need}\u22642"
-                        f" \u00b7 47/47 = 100% \u00b7 LB 92.4% \u00b7 paper"
-                    )
-                    _ids.append("C1-DIST-GATE")
+                    _badge("C1-DIST-GATE")
                 else:
-                    _vetoes.append(
-                        f"\n\U000026a0 MINE-RISK \u00b7 corners need {_need}\u22653 \u2014 risk zone"
-                        f" (73.4% \u00b7 n=158): OVER misses cluster here at every minute"
-                    )
-                    _ids.append("C-OVER-NEED3")
+                    _mveto("C-OVER-NEED3")
         if "UNDER" in _cl_up:
             if _m >= 61 and _tot >= 2:
-                # C5: open game, corner-light -> UNDER holds
-                _badges.append(
-                    "\n\U000026cf MINE \u00b7 UNDER & 2+ goals on board 61'+"
-                    " \u2014 95.0% (19/20) \u00b7 paper"
-                )
-                _ids.append("C5-UNDER-TOT2")
+                _badge("C5-UNDER-TOT2")
             elif _m >= 51:
                 try:
                     _cv = _rt117_delta10(_ratio117_corners_hist, (fid, tid), _m, corners)
                 except Exception:
                     _cv = None
                 if _cv is not None and _cv <= 2:
-                    # C3: corner flow stalled -> UNDER holds
-                    _badges.append(
-                        "\n\U000026cf MINE \u00b7 UNDER FLOW-STALL 51'+ (vel\u22642)"
-                        " \u2014 93.1% (27/29) \u00b7 paper"
-                    )
-                    _ids.append("C3-UNDER-STALL")
+                    _badge("C3-UNDER-STALL")
             if str(league_class or "").strip().upper()[:1] == "A":
-                _vetoes.append(
-                    "\n\U000026d4 MINE-VETO \u00b7 corners UNDER in class-A league"
-                    " \u2014 53.1% (26/49): class-A is corner-heavy"
-                )
-                _ids.append("V-C-UNDER-CLASSA")
+                _mveto("V-C-UNDER-CLASSA")
 
         # --- cards family ---------------------------------------
         if "UNDER" in _kl_up:
             if _fsc is not None and _fsc <= 1:
-                _vetoes.append(
-                    "\n\U000026d4 MINE-VETO \u00b7 cards UNDER & fresh card (fsc\u22641)"
-                    " \u2014 31.8% (7/22): teams calm after a booking"
-                )
-                _ids.append("V-K-UNDER-FRESH")
+                _mveto("V-K-UNDER-FRESH")
             if _kline is not None and _kn is not None:
                 try:
                     _allow = float(_kline) - int(_kn)
                 except (TypeError, ValueError):
                     _allow = None
                 if _allow is not None and _allow <= 2:
-                    _vetoes.append(
-                        f"\n\U000026d4 MINE-VETO \u00b7 cards UNDER within {_allow:g} of line"
-                        " \u2014 45.7% (16/35), worsening late"
-                    )
-                    _ids.append("V-K-UNDER-NEAR")
+                    _mveto("V-K-UNDER-NEAR")
                 try:
                     if abs(float(_kline) - 2.5) < 1e-9:
-                        _vetoes.append(
-                            "\n\U000026d4 MINE-VETO \u00b7 cards UNDER & line 2.5"
-                            " \u2014 25.0% (2/8): low lines are the worst UNDER context"
-                        )
-                        _ids.append("V-K-UNDER-LINE25")
+                        _mveto("V-K-UNDER-LINE25")
                 except (TypeError, ValueError):
                     pass
         elif "OVER" in _kl_up and not (51 <= _m <= 70):
-            # the 51-70' pocket already badges; outside it the
-            # minute gate is unnecessary: 91.4% at all minutes.
-            _badges.append(
-                "\n\U000026cf MINE \u00b7 CARDS OVER, any minute (outside the 51-70' pocket)"
-                " \u2014 91.4% (32/35) \u00b7 paper"
-            )
-            _ids.append("K-OVER-ANYMIN")
+            _badge("K-OVER-ANYMIN")
 
-        # --- goal badges ----------------------------------------
+        # --- goal badges (ledger only now \u2014 no message text) ----
         if 10 <= _m <= 33 and _tot <= 1:
             if "OVER" in _cl_up:
-                _badges.append(
-                    "\n\U000026cf MINE \u00b7 FUSION 10-33' & \u22641 goal & corners-lean OVER"
-                    " \u2014 42/42 = 100% \u00b7 LB 91.6% \u00b7 paper"
-                )
-                _ids.append("G3-FUSION")
+                _badge("G3-FUSION")
             else:
-                _badges.append(
-                    "\n\U000026cf MINE \u00b7 10-33' & \u22641 goal on board"
-                    " \u2014 97.1% (67/69) \u00b7 LB 90.0% \u00b7 paper"
-                )
-                _ids.append("G1-EARLY-TOT1")
+                _badge("G1-EARLY-TOT1")
         elif 10 <= _m <= 33 and "OVER" in _cl_up and _tot >= 2:
-            _badges.append(
-                "\n\U000026cf MINE \u00b7 10-33' & corners-lean OVER"
-                " \u2014 98.2% (54/55) \u00b7 paper"
-            )
-            _ids.append("G2-EARLY-COVER")
+            _badge("G2-EARLY-COVER")
         elif 34 <= _m <= 40 and _tot <= 1:
-            _badges.append(
-                "\n\U000026cf MINE \u00b7 10-40' & \u22641 goal (volume window)"
-                " \u2014 92.9% (104/112) \u00b7 paper"
-            )
-            _ids.append("G7-VOLUME")
+            _badge("G7-VOLUME")
         if 21 <= _m <= 35 and _tot == 0 and int(sot or 0) >= 3:
-            _badges.append(
-                "\n\U000026cf MINE \u00b7 0-0 & SOT\u22653 21-35' (pocket tightener)"
-                " \u2014 14/14 \u00b7 thin \u00b7 paper"
-            )
-            _ids.append("G5-SOT3-TIGHT")
+            _badge("G5-SOT3-TIGHT")
         try:
             _cdebt = (int(sot) - _tg) if sot is not None else None
         except (TypeError, ValueError):
@@ -11820,75 +11800,47 @@ def _pattern_mine_stamps_134(minute, mkt_extras, team_goals, opp_goals,
         if (_cdebt is not None and 1 <= _cdebt <= 2
                 and _fsc is not None and 2 <= _fsc <= 3
                 and _ib_dom >= 0):
-            _badges.append(
-                "\n\U000026cf MINE \u00b7 BALANCED MID-PRESSURE"
-                " (debt 1-2 \u00b7 fsc 2-3 \u00b7 ib_dom\u22650)"
-                " \u2014 49/49 = 100% \u00b7 LB 92.7% \u00b7 sub-ledger \u00b7 paper"
-            )
-            _ids.append("G4-MIDPRESS")
+            _badge("G4-MIDPRESS")
 
-        # --- goal vetoes ----------------------------------------
+        # --- goal vetoes (the NO BET family) --------------------
         if _m >= 61 and _kl_up and "NEUTRAL" not in _kl_up:
-            _vetoes.append(
-                "\n\U000026d4 MINE-VETO \u00b7 cards-lean 61'+ \u2014 goal only 37.5% (6/16):"
-                " late cards signals kill goals"
-            )
-            _ids.append("V-CARDS61")
+            _gveto(37.5, "late cards signal", "V-CARDS61")
         if "LATE_OVERRIDE" in str(window_tag or "") and _tg == _og:
-            _vetoes.append(
-                "\n\U000026d4 MINE-VETO \u00b7 LATE_OVERRIDE & drawing \u2014 41.7%:"
-                " vetoing removes 14 misses at the cost of 10 hits"
-            )
-            _ids.append("V-LATE-DRAW")
+            _gveto(41.7, "late & level score", "V-LATE-DRAW")
+        if _m >= 61 and _tg < _og:
+            # v10.135 (comeback test, Sep 12-21 ledger): a CHASING team
+            # past 61' converts 36.4% (8/22) \u2014 17pts below the signal base
+            # rate; in class B/C leagues 26.7%. The mirror of the comeback
+            # pocket: don't bet the late chase.
+            _gveto(36.4, "chasing team 61'+", "V-CHASE61")
         if _m >= 76:
-            _vetoes.append(
-                "\n\U000026d4 MINE-VETO \u00b7 minute 76'+ \u2014 50.0% (12/24):"
-                " the hard late cliff"
-            )
-            _ids.append("V-M76")
+            _gveto(50.0, "minute 76'+", "V-M76")
         if _fn is not None:
             try:
                 if int(_fn) >= 18:
-                    _vetoes.append(
-                        f"\n\U000026d4 MINE-VETO \u00b7 foul-heavy game ({int(_fn)} fouls)"
-                        " \u2014 57.6% (34/59): stop-start games don't produce goals"
-                    )
-                    _ids.append("V-FOULS18")
+                    _gveto(57.6, f"{int(_fn)} fouls, stop-start game", "V-FOULS18")
             except (TypeError, ValueError):
                 pass
         if "Allsvenskan" in str(league or ""):
-            _vetoes.append(
-                "\n\U000026d4 MINE-VETO \u00b7 Allsvenskan \u2014 50.0% (8/16):"
-                " confirms the audit's disaster finding"
-            )
-            _ids.append("V-ALLSVENSKAN")
+            _gveto(50.0, "Allsvenskan game", "V-ALLSVENSKAN")
         try:
             _cdp = team_cooldown_polls.get((fid, tid), 0)
         except Exception:
             _cdp = 0
         if _cdp >= SIGNAL_COOLDOWN_POLLS and _m >= 61:
-            _vetoes.append(
-                "\n\U000026d4 MINE-VETO \u00b7 cooldown-requalified & 61'+ \u2014 56.7%:"
-                " decay re-entry + late minute = double leak"
-            )
-            _ids.append("V-COOLDOWN61")
+            _gveto(56.7, "repeat signal late", "V-COOLDOWN61")
         if _m >= 61 and "NEUTRAL" in _cl_up:
-            _vetoes.append(
-                "\n\U000026d4 MINE-VETO \u00b7 corners-lean NEUTRAL 61'+ \u2014 56.6%:"
-                " low-activity + late compound"
-            )
-            _ids.append("V-CNEU61")
+            _gveto(56.6, "quiet corners late", "V-CNEU61")
         if (_tg - _og) in (1, 2) and _m >= 60:
-            _vetoes.append(
-                "\n\U000026d4 MINE-VETO \u00b7 lead-protect 60'+ \u2014 58.8%:"
-                " the leading team parks the bus"
-            )
-            _ids.append("V-LEADPROT60")
+            _gveto(58.8, "leader parks the bus", "V-LEADPROT60")
 
-        _txt = "".join(_badges) + "".join(_vetoes)
-        return _txt, _ids
+        # --- return: ids for the ledger, the demoting veto, one line --
+        _line = ""
+        if _gv is not None:
+            _line = f"\n\U0001f6ab NO BET \u2014 {_gv[2]} ({int(round(_gv[0]))}%)"
+        return _ids, (_gv[1] if _gv else None), _line
     except Exception:
-        return "", []
+        return [], None, ""
 
 
 def _pocket_eligible_123(kind: str, minute, lean) -> bool:
@@ -19013,7 +18965,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # credits) and the SAME batch statistics (both teams, already
         # parsed above). Counts live-update via editMessageText.
         _mkt_block, _mkt_extras = "", {}
-        _mine_ids_134 = []  # v10.134: PATTERN MINE ids (ledger field)
+        _mine_ids_136 = []  # v10.134/136: PATTERN MINE ids (ledger field)
+        _veto_gate_136 = None  # v10.136: goals veto that demoted the BET
         _shadow105 = {"corners": None, "cards": None}  # v10.105
         _msg_prefix_80 = msg
         _c80_line = _c80_ov = _c80_un = None
@@ -19088,23 +19041,37 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     _msg_prefix_80 = msg
             except Exception as _pe122:
                 log.debug(f"  v10.122 pocket badge skipped: {_pe122}")
-            # v10.134: PATTERN MINE stamps ride after the pocket badges
-            # (same prefix mechanism — they survive live-edit rebuilds).
-            # Badges = mined >=90% contexts, vetoes = mined miss filters;
-            # ids land in the ledger as mine_stamps for EOD grading.
+            # v10.136: QUIET STAMPS — no stamp text rides the message any
+            # more (the pocket badges above stay exactly as v10.122); every
+            # fired id still lands in the ledger as mine_stamps for EOD
+            # grading. A GOALS veto now means NO BET: a live BET is demoted
+            # (same mechanism as the v10.130 live-window veto) and ONE short
+            # line rides the message; veto_gate records the demotion in the
+            # ledger so the gate itself is gradable (hits lost vs misses
+            # avoided). Market vetoes (cards/corners UNDER) never demote the
+            # goals bet — they grade a different market.
+            # Note: the v10.132 re-quote register ran BEFORE this point, so
+            # a veto-demoted row may still fetch one +10' market confirmation
+            # (observational, quota-guarded) — harmless, noted for honesty.
             try:
-                _mine_txt_134, _mine_ids_134 = _pattern_mine_stamps_134(
+                _mine_ids_136, _gv_id_136, _gv_line_136 = _pattern_mine_stamps_136(
                     minute, _mkt_extras,
                     goals_now, opp_goals,
                     sot, shots_inside_box, _opp_shots_inside_box,
                     corners, fouls,
                     league, _lg_class, window_tag, fid, tid,
                 )
-                if _mine_txt_134:
-                    msg += _mine_txt_134
+                if _gv_id_136 and bet_flag == "BET":
+                    bet_flag = "NO_BET"
+                    _veto_gate_136 = _gv_id_136
+                    msg += _gv_line_136
                     _msg_prefix_80 = msg
-            except Exception as _me134:
-                log.debug(f"  v10.134 mine stamps skipped: {_me134}")
+                    log.info(
+                        f"  v10.136 MINE VETO: F{fid} {tname} {minute}' "
+                        f"— BET demoted to NO_BET ({_gv_id_136})"
+                    )
+            except Exception as _me136:
+                log.debug(f"  v10.136 mine stamps skipped: {_me136}")
             if _mkt_block:
                 msg += _mkt_block
         except Exception as _me80:
@@ -19370,7 +19337,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "conversion_debt": _rt117["conversion_debt"],
             # v10.134: PATTERN MINE stamp ids fired at signal time —
             # the EOD / next mining pass grades them live (data loop).
-            "mine_stamps": list(_mine_ids_134 or []),
+            # v10.136: veto_gate = the goals veto that demoted THIS row's
+            # BET advice (None = no demotion) — the gate itself is
+            # gradable: hits lost vs misses avoided.
+            "mine_stamps": list(_mine_ids_136 or []),
+            "veto_gate": _veto_gate_136,
             "save_storm_10": _rt117["save_storm_10"],
             "lead_protect_60": _rt117["lead_protect_60"],
             "goals_at_signal": goals_now,
