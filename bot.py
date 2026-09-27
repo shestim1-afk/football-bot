@@ -224,11 +224,12 @@ _PREMATCH_REF: dict = {}  # v10.130/131: {fid: {"line", "odds", "ladder", "ts"}}
 
 
 def _live_veto_line_130(minute):
-    """v10.130: message line for the late-window live-bet veto."""
+    """v10.130: message line for the late-window live-bet veto.
+    v10.139: plain + compact (emoji gone, number first)."""
     if minute is not None and minute > LIVE_BET_MINUTE_MAX:
         return (
-            "\n\U0001f6ab LIVE-BET VETO (v10.130): >45' live bets run 48% "
-            "WR lifetime (\u221210.05u) \u2014 signal info only, NO bet"
+            "\nNO BET \u2014 after 45' live bets run 48% WR "
+            "(\u221210.05u lifetime)"
         )
     return ""
 
@@ -260,10 +261,15 @@ def _prematch_ref_stamp_130(source, result, fixture_id):
                     _lad[str(_ln)] = float(_od)
                 except (TypeError, ValueError):
                     pass
+            # v10.139: park the board's PLAYER SCORER ODDS too \u2014 the
+            # next-scorer block reuses them at zero credits on repeat
+            # signals (a feed-2 totals capture has no player markets).
+            _sc139 = result.get("scorer_odds") or {}
             _PREMATCH_REF[fixture_id] = {
                 "line": result.get("over_line"),
                 "odds": result.get("over_odds"),
                 "ladder": _lad,
+                "scorer_odds": (_sc139 if _sc139 else _ref.get("scorer_odds")),
                 "ts": time.time(),
             }
         elif source in ("live", "oddsapi_live") and result.get("over_odds"):
@@ -1357,7 +1363,24 @@ _ratio117_sent_date: str | None = None
 #     NO BET line + BET demotion (veto_gate), market vetoes + the 73%
 #     risk stamp ledger-only. Rule conditions + ids byte-identical
 #     to v10.134/135/136/137.
-BOT_VERSION = "v10.138"
+# v10.139 (Sep 26, late evening — user call): SIMPLE SIGNALS +
+#     NEXT-SCORER BLOCK. (1) BOTH TEAMS' top SOT players who have NOT
+#     scored yet ride the message, each with their anytime-scorer odds
+#     + implied % ("cite the odds", "only those without that has not
+#     scored yet a goal") — "Next scorer (no goal yet): Serbia —
+#     Živković 12% @ 8.00 (2 SOT) · Joveljić 9% @ 11.00 (1 SOT)".
+#     The odds parse off the SAME capture (Bet365 'Anytime Goal Scorer'
+#     board, ~80% coverage in ledger captures); when feed-2 supplied
+#     the totals price, the prematch-ref park or ONE quota-guarded
+#     /odds fetch joins the board (+1 credit max) — 'pre-match odds'
+#     tagged in the header for honesty. (2) MESSAGES SIMPLIFIED,
+#     emoji -> likelihood %: decorative emoticons gone; every line
+#     leads with its number (goal chance %, player implied %, FT %,
+#     market lean %, edge %). New ledger fields: top_sot_opp_players +
+#     scorer_odds_cited + scorer_odds_pre. Display-only — zero gates,
+#     stakes, triggers or grading touched; pocket rules + veto demotion
+#     byte-identical to v10.134-138.
+BOT_VERSION = "v10.139"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -8100,7 +8123,7 @@ def _build_red_card_block(
             # report — a "Red Cards: None" line was pure display noise.
             if stats_fallback_str in ("None", "", "N/A"):
                 return "", None, None, None
-            return f"\n\U0001f7e5 Red Cards: {stats_fallback_str}", None, None, None
+            return f"\nRed Cards: {stats_fallback_str}", None, None, None
         if not rc_events:
             # events coverage confirms: zero reds — nothing to say
             return "", 0, 0, []
@@ -8127,18 +8150,18 @@ def _build_red_card_block(
                 _latest_min = _m
                 _latest_name = _tnm
                 _latest_player = rc.get("player", "?")
-        block = "\n\U0001f7e5 Red Cards: " + " | ".join(_parts)
+        block = "\nRed Cards: " + " | ".join(_parts)
         # NEW RED CARD freshness (<= RED_CARD_FRESH_MINUTES game minutes old)
         if _latest_min > 0 and 0 <= (minute - _latest_min) <= RED_CARD_FRESH_MINUTES:
             block += (
-                f"\n\U0001f6a8 NEW RED CARD ({minute - _latest_min}' ago) — "
+                f"\nNEW RED CARD ({minute - _latest_min}' ago) — "
                 f"{_latest_player} off, {_latest_name} down to 10"
             )
         # Man-power context: 10v11 / 11v10 shifts goal probability strongly
         if _opp_reds > _team_reds and _earliest_opp_min is not None:
-            block += f"\n\U0001f4aa Man-up: opponent down to 10 (since {_earliest_opp_min}')"
+            block += f"\nMan-up: opponent down to 10 (since {_earliest_opp_min}')"
         elif _team_reds > _opp_reds:
-            block += "\n\u26a0\ufe0f Man-down: pressing with 10 men"
+            block += "\nMan-down: pressing with 10 men"
         return block, _team_reds, _opp_reds, rc_events
     except Exception:
         return "", None, None, None
@@ -8930,6 +8953,237 @@ def _build_top_sot_segment(
         return ""
 
 
+# ============================================================
+# v10.139: NEXT-SCORER BLOCK — both teams, odds cited (user Sep 26)
+# ============================================================
+
+def _norm_player_name_139(name: str) -> str:
+    """v10.139: normalize a player name for the odds-board join.
+
+    The events feed writes 'A. Živković' (initial + surname); the odds
+    board writes 'Andrija Živković' or 'Živković A.'. NFKD-strip the
+    diacritics, lowercase, punctuation to spaces, collapse \u2014 so the
+    SURNAME becomes the stable join key.
+    """
+    try:
+        import unicodedata
+        s = unicodedata.normalize("NFKD", str(name or ""))
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        s = s.lower()
+        for ch in ".'\u2019\u2018`-":
+            s = s.replace(ch, " ")
+        return " ".join(s.split())
+    except Exception:
+        return ""
+
+
+def _lookup_scorer_odds_139(name: str, scorer_odds: dict):
+    """v10.139: the anytime-scorer odds for one Top-SOT player.
+
+    Exact normalized match first; then the SURNAME, order-agnostic
+    ('A. Zivkovic' and 'Zivkovic A.' both key on 'zivkovic'; unique on
+    the board, or the first initial disambiguates brothers). Returns
+    None when the board doesn't list the player (a sub, a name
+    mismatch) \u2014 the message then shows the player without odds.
+    Pure lookup, fully defensive.
+    """
+    try:
+        if not scorer_odds or not name:
+            return None
+        _n = _norm_player_name_139(name)
+        if not _n:
+            return None
+        _board = {}
+        for k, v in scorer_odds.items():
+            _nk = _norm_player_name_139(k)
+            if _nk:
+                _board[_nk] = v
+        if _n in _board:
+            return float(_board[_n])
+        _tok = _n.split()
+        if not _tok:
+            return None
+
+        def _surname_first_139(toks):
+            """(surname, first-name/initial) \u2014 order-agnostic key."""
+            if len(toks) >= 2 and len(toks[-1]) == 1:
+                return toks[0], toks[-1]
+            if len(toks) >= 2 and len(toks[0]) == 1:
+                return toks[-1], toks[0]
+            if len(toks) == 1:
+                return toks[0], ""
+            return toks[-1], toks[0]
+
+        _surname, _first = _surname_first_139(_tok)
+        _hits = []
+        for _k, _v in _board.items():
+            _ks, _kf = _surname_first_139(_k.split())
+            if _ks == _surname:
+                _hits.append((_kf, float(_v)))
+        if not _hits:
+            return None
+        if len(_hits) == 1:
+            return _hits[0][1]
+        for _kf, _v in _hits:
+            if _kf and _first and _kf[0] == _first[0]:
+                return _v
+        return None
+    except Exception:
+        return None
+
+
+def _build_next_scorer_block_139(
+    tname: str, opp_name: str,
+    players_sig, players_opp,
+    scorer_odds: dict, pre_tag: bool = False,
+    info_sig: dict | None = None, info_opp: dict | None = None,
+    max_players: int = 2,
+):
+    """v10.139: the NEXT-SCORER block \u2014 BOTH teams' top SOT players who
+    have NOT scored yet, with their anytime-scorer odds + implied %
+    (user Sep 26: 'top sot player shots for both teams, as well cite
+    the odds, but only those that has not scored yet'). The fetch
+    already returns non-scorers only (v10.57/58 rule, kept); this
+    renders them:
+
+        Next scorer (no goal yet \u00b7 pre-match odds):
+        Serbia \u2014 Živković 12% @ 8.00 (2 SOT) \u00b7 Joveljić 9% @ 11.00 (1 SOT)
+        Netherlands \u2014 Gakpo 21% @ 4.75 (2 SOT)
+
+    The % is the odds' own implied likelihood (1/odds) \u2014 'how likely
+    is gonna happen', per the same user call. pre_tag adds the
+    'pre-match odds' honesty tag when the cited board is pre-match
+    (the live feed-2 has totals only; a live player board renders
+    untagged). A team with no eligible players gets one short reason
+    line (feed lag / all scored); both empty -> no block at all.
+    Returns (block_str, cited) \u2014 cited is the ledger list of the
+    players + the odds the message joined. Pure render, defensive.
+    """
+    try:
+        def _why(info):
+            _o = (info or {}).get("outcome")
+            if _o == "all_scored":
+                return "every listed shooter already scored"
+            if _o == "no_shooters":
+                return "no player data yet"
+            return None
+
+        def _line(team, players, info):
+            if not players:
+                _w = _why(info)
+                return "\n" + team + " \u2014 " + _w if _w else ""
+            _bits = []
+            for _n, _s, _t in list(players)[:max_players]:
+                _base = f"({_s} SOT)" if _s > 0 else f"({_t} shots)"
+                _o = _lookup_scorer_odds_139(_n, scorer_odds)
+                if _o is not None and _o > 1.0:
+                    _bits.append(
+                        f"{_n} {int(round(100.0 / _o))}% @ {_o:.2f} {_base}"
+                    )
+                else:
+                    _bits.append(f"{_n} {_base}")
+            return "\n" + team + " \u2014 " + " \u00b7 ".join(_bits)
+
+        _l_sig = _line(tname, players_sig, info_sig)
+        _l_opp = _line(opp_name, players_opp, info_opp)
+        if not _l_sig and not _l_opp:
+            return "", []
+        _hdr = "Next scorer (no goal yet"
+        if pre_tag and scorer_odds:
+            _hdr += " \u00b7 pre-match odds"
+        _hdr += "):"
+        _cited = []
+        for _team, _players in ((tname, players_sig), (opp_name, players_opp)):
+            for _n, _s, _t in list(_players or [])[:max_players]:
+                _o = _lookup_scorer_odds_139(_n, scorer_odds)
+                _row = {"name": _n, "team": _team, "sot": _s, "shots": _t}
+                if _o is not None and _o > 1.0:
+                    _row["odds"] = round(float(_o), 2)
+                _cited.append(_row)
+        return "\n" + _hdr + _l_sig + _l_opp, _cited
+    except Exception:
+        return "", []
+
+
+def _parse_scorer_board_139(data) -> dict:
+    """v10.139: parse ONLY the anytime-scorer markets off an odds
+    response (the ensure-path helper \u2014 no dependence on the goals
+    O/U target line, so a board without the priced Over still yields
+    its player prices). Same market whitelist + merge rule as the
+    main parse. Returns {} when the board carries nothing.
+    """
+    try:
+        response = data.get("response", []) if isinstance(data, dict) else []
+        if not response:
+            return {}
+        bookmakers = response[0].get("bookmakers", []) or []
+        if not bookmakers:
+            return {}
+        chosen = None
+        for bm in bookmakers:
+            if bm.get("name") == PREFERRED_BOOKMAKER:
+                chosen = bm
+                break
+        if not chosen:
+            chosen = bookmakers[0]
+        out = {}
+        for bet in chosen.get("bets", []) or []:
+            if str(bet.get("name", "")).strip() not in (
+                "Anytime Goal Scorer", "Home Anytime Goal Scorer",
+                "Away Anytime Goal Scorer",
+            ):
+                continue
+            for v in bet.get("values", []) or []:
+                _pn = str(v.get("value", "")).strip()
+                _po = safe_float(str(v.get("odd", "")))
+                if _pn and _po and _po > 1.01:
+                    _prev = out.get(_pn)
+                    if _prev is None or _po > _prev:
+                        out[_pn] = round(_po, 2)
+        return out
+    except Exception:
+        return {}
+
+
+def _ensure_scorer_odds_139(client, fixture_id: int, odds_msg):
+    """v10.139: make sure the signal can cite player-scorer odds.
+
+    The live totals price usually comes from feed-2 (the-odds-api),
+    which has NO player markets; the api-sports boards do (Bet365
+    'Anytime Goal Scorer', ~80% of ledger captures). When the odds
+    capture already carries scorer odds (prematch fallback parse, or a
+    live board when coverage returns), return them. Otherwise: the
+    per-fixture PREMATCH_REF park first (zero credits), then ONE
+    quota-guarded /odds fetch (1 credit \u2014 mostly the ~15% of signals
+    whose price came from feed-2). Returns (scorer_odds, pre_tag):
+    pre_tag True marks pre-match prices (the block header says so).
+    """
+    try:
+        if odds_msg and odds_msg.get("scorer_odds"):
+            _live = (odds_msg.get("odds_source") or "") in (
+                "live", "oddsapi_live")
+            return odds_msg["scorer_odds"], (not _live)
+        _ref = _PREMATCH_REF.get(fixture_id) or {}
+        if _ref.get("scorer_odds"):
+            return _ref["scorer_odds"], True
+        if quota_remaining is not None and quota_remaining <= 5:
+            return {}, False
+        data = api_get(client, "/odds", {"fixture": fixture_id})
+        _sc139 = _parse_scorer_board_139(data)
+        if _sc139:
+            # park it \u2014 repeat signals on this fixture join for free
+            try:
+                _PREMATCH_REF.setdefault(fixture_id, {})[
+                    "scorer_odds"
+                ] = _sc139
+            except Exception:
+                pass
+            return _sc139, True
+    except Exception as e:
+        log.debug(f"  v10.139 scorer-odds fetch failed: {e}")
+    return {}, False
+
+
 def fetch_top_sot_players(
     client: httpx.Client, fixture_id: int, team_id: int, max_players: int = 3,
     team_sot_now: int | None = None, pre_signal: bool = False,
@@ -9391,17 +9645,17 @@ def process_top_sot_retries(client: httpx.Client) -> None:
                 minute = safe_int(str(f["fixture"].get("status", {}).get("elapsed", 0) or 0))
                 tname = home if f["teams"]["home"].get("id") == tid else away
                 _parts = [
-                    f"{_n} ({_s})" if _s > 0 else f"{_n} ({_t} shots)"
+                    f"{_n} ({_s} SOT)" if _s > 0 else f"{_n} ({_t} shots)"
                     for _n, _s, _t in players
                 ]
-                _any_sot = any(_s > 0 for _, _s, _ in players)
-                _head = "\U0001f3af Top SOT" if _any_sot else "\U0001f3af Top shooters (no SOT yet)"
+                # v10.139: plain follow-up, same wording as the block
                 try:
                     send_telegram(
                         client,
-                        f"{_head} — {tname}: {', '.join(_parts)}\n"
-                        f"({home} {sh} - {sa} {away}, {minute}')\n"
-                        f"\u23f1 feed-lag recovery (line unavailable at signal time)",
+                        f"Next scorer (no goal yet):\n{tname} — "
+                        f"{', '.join(_parts)}\n"
+                        f"({home} {sh} - {sa} {away}, {minute}') · "
+                        f"feed-lag recovery (line unavailable at signal time)",
                     )
                     log.info(
                         f"  v10.63 TOP-SOT RECOVERED: F{fid} T{tid} — line sent "
@@ -10701,6 +10955,9 @@ def _parse_signal_odds(data: dict, total_goals: int,
         # — parked per fixture on prematch parses so live captures can
         # join a prematch ref at ANY line, not just the parked main.
         "goals_ladder": {},
+        # v10.139: the board's anytime-scorer prices {player: odds},
+        # parsed from the SAME response at zero extra credits.
+        "scorer_odds": {},
     }
 
     # Target: Over (current total + 0.5) goals
@@ -10795,6 +11052,26 @@ def _parse_signal_odds(data: dict, total_goals: int,
                         result["match_away_odds"] = round(odd, 2)
                     elif "Draw" in label:
                         result["match_draw_odds"] = round(odd, 2)
+
+        # v10.139: PLAYER SCORER ODDS \u2014 the chosen book's Anytime Goal
+        # Scorer market(s) (Bet365 boards carry it on ~80% of the ledger
+        # captures), parsed from the SAME response at ZERO extra credits:
+        # {player_name: decimal odds}. Display-only (the next-scorer
+        # block cites them); never a gate, never P&L-graded. Exact
+        # market-name whitelist \u2014 "First/Last Goal Scorer", "Player
+        # Singles" and "Player to Score or Assist" are DIFFERENT bets
+        # and must not leak in (the v10.114 wrong-market class).
+        if bet_name.strip() in (
+            "Anytime Goal Scorer", "Home Anytime Goal Scorer",
+            "Away Anytime Goal Scorer",
+        ):
+            for v in values:
+                _pn139 = str(v.get("value", "")).strip()
+                _po139 = safe_float(str(v.get("odd", "")))
+                if _pn139 and _po139 and _po139 > 1.01:
+                    _prev139 = result["scorer_odds"].get(_pn139)
+                    if _prev139 is None or _po139 > _prev139:
+                        result["scorer_odds"][_pn139] = round(_po139, 2)
 
     # v10.114: 1X2 sanity guard — a real 3-way book sums to ~0.90-1.25
     # implied (books keep margin on complete markets; even lopsided live
@@ -11658,7 +11935,7 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                 _wr, _h, _n = _CORNER_OVER_71_V122
                 _rwr, _rh, _rn = _CORNER_OVER_61_V122
                 out.append(
-                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
+                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
                     f" \u00b7 71'+ ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                     f" \u00b7 61'+ rule {int(round(_rwr * 100))}% ({_rh}/{_rn})"
                 )
@@ -11666,7 +11943,7 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                 _wr, _h, _n = _CORNER_OVER_61_V122
                 _cwr, _ch, _ccn = _CORNER_OVER_51_CUM_V122
                 out.append(
-                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
+                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
                     f" \u00b7 61'+ ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                     f" \u00b7 51'+ cum {int(round(_cwr * 100))}% ({_ch}/{_ccn})"
                 )
@@ -11674,13 +11951,13 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
             if 51 <= _m <= 60:
                 _wr, _h, _n = _CORNER_UNDER_5160_V122
                 out.append(
-                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
+                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
                     f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
             elif _m >= 71:
                 _wr, _h, _n = _CORNER_UNDER_71_V122
                 out.append(
-                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
+                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
                     f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
         _kl_up = (_ex.get("mkt_cards_lean") or "").upper()
@@ -11688,14 +11965,14 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
             _wr, _h, _n = _CARDS_UNDER_60_V122
             _awr, _ah, _an = _CARDS_ANY_60_V122
             out.append(
-                f"\n\U0001f3af CARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'UNDER')}"
+                f"\nCARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'UNDER')}"
                 f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 f" \u00b7 any lean 60'+ {int(round(_awr * 100))}% ({_ah}/{_an})"
             )
         elif "OVER" in _kl_up and 51 <= _m <= 70:
             _wr, _h, _n = _CARDS_OVER_5170_V122
             out.append(
-                f"\n\U0001f3af CARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'OVER')}"
+                f"\nCARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'OVER')}"
                 f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
             )
         return "".join(out)
@@ -11882,13 +12159,13 @@ def _pattern_mine_stamps_138(minute, mkt_extras, team_goals, opp_goals,
         if _badges:
             _badges.sort(key=lambda t: (-t[0], t[1]))
             _badge_txt = "".join(
-                "\n\U0001f3af " + t[2] + " 90% POCKET \u2014 " + t[3]
+                "\n" + t[2] + " 90% POCKET \u2014 " + t[3]
                 + " \u00b7 " + str(int(round(t[0]))) + "% (" + str(t[4])
                 + "/" + str(t[5]) + ")" + t[6] + " \u00b7 paper"
                 for t in _badges[:3])
         _line = ""
         if _gv is not None:
-            _line = f"\n\U0001f6ab NO BET \u2014 {_gv[2]} ({int(round(_gv[0]))}%)"
+            _line = f"\nNO BET \u2014 {_gv[2]} ({int(round(_gv[0]))}%)"
         return _ids, _badge_txt, (_gv[1] if _gv else None), _line
     except Exception:
         return [], "", None, ""
@@ -13511,23 +13788,27 @@ def _build_market_block(
 
     def _compact(emoji: str, label: str, now: int | None,
                  line: float | None, p_over: float | None) -> str:
-        """v10.126: PLAIN market line — '🚩 Corners: 1 · line 9 → UNDER'
-        and '🟨 Cards: 3 · line 5 → UNDER' (user request Sep 19: keep
-        the cards line; instead 8.5 write 9). The live count, the
-        integer-threshold line and the lean DIRECTION. Same inputs,
-        same ledger extras (mkt_*_line keeps the REAL book line),
-        same single render path (byte-stable live edits preserved).
+        """v10.126: PLAIN market line. v10.139: emoji out, likelihood %
+        in — 'Corners 1 · line 9 → UNDER (62%)'. The live count, the
+        integer-threshold line, the lean DIRECTION and the leaned
+        side's probability (user Sep 26: 'the emoticons put instead
+        likely and % depending on how likely is gonna happen'). Same
+        inputs, same ledger extras (mkt_*_line keeps the REAL book
+        line), same single render path (byte-stable live edits
+        preserved). The emoji arg stays for call-site stability.
         """
         if now is None:
             return ""
         if line is None:
-            return f"{emoji} {label}: {now}"
-        _base = f"{emoji} {label}: {now} \u00b7 line {_mkt_line_txt(line)}"
+            return f"{label} {now}"
+        _base = f"{label} {now} \u00b7 line {_mkt_line_txt(line)}"
         if p_over is None:
             return _base
         lean = _mkt_lean(p_over)
-        if lean in ("OVER", "UNDER"):
-            return f"{_base} \u2192 {lean}"
+        if lean == "OVER":
+            return f"{_base} \u2192 OVER ({p_over:.0%})"
+        if lean == "UNDER":
+            return f"{_base} \u2192 UNDER ({1.0 - p_over:.0%})"
         return _base
 
     try:
@@ -14194,25 +14475,23 @@ def _apply_price_gate(
 
 def _price_gate_line(gate: str, live: float | None) -> str:
     """v10.103: the one-line chat verdict that rides the signal message
-    right under the odds block — the buy/skip decision in one glance."""
+    right under the odds block — the buy/skip decision in one glance.
+    v10.139: plain + compact (emoji gone, numbers first)."""
     try:
         if gate == "DRAINED":
             return (
-                f"\n\U0001f6ab PRICE DRAINED: live {live:.2f} < "
-                f"{PRICE_FLOOR:.2f} floor \u2014 market already prices this "
-                f"goal (Sep 12-13 ledger: -30 pts edge buying here). Watch, don't buy."
+                f"\nPrice drained: {live:.2f} < {PRICE_FLOOR:.2f} floor "
+                "\u2014 market priced in, watch only"
             )
         if gate == "OK":
             return (
-                f"\n\u2705 PRICE ZONE: live {live:.2f} \u2265 "
-                f"{PRICE_FLOOR:.2f} floor \u2014 price hasn't caught up to "
-                f"the pressure (Sep 12-13 ledger: +8-13 pts edge)."
+                f"\nPrice {live:.2f} \u2265 {PRICE_FLOOR:.2f} floor "
+                "\u2014 value zone"
             )
         if gate == "NO_EDGE":
             return (
-                f"\n\U0001f539 NO EDGE: live {live:.2f} already carries the "
-                f"model's goal chance (edge < {EDGE_MIN_P:.0%}) \u2014 paper "
-                f"only. DRY-RUN gate (v10.120)."
+                f"\nNo edge: {live:.2f} already prices the goal chance "
+                f"(edge < {EDGE_MIN_P:.0%}) \u2014 paper only"
             )
     except Exception:
         pass
@@ -14308,9 +14587,12 @@ def _build_odds_value_block(
         # UNCHANGED — everything below still computes as v10.95/120.
         lines = []
         if _mkt_live and odds_data and odds_data.get("over_odds"):
+            # v10.139: PLAIN BET line \u2014 number first, no emoji, no
+            # 'book'/'LIVE' prose (the in-play price is implied):
+            # 'BET Over 3.5 @ 1.95 (nordicbet) \u00b7 edge +44%'
             _book_bit = (
-                f"book {float(odds_data['over_odds']):.2f} "
-                f"({odds_data.get('bookmaker') or '?'} \u00b7 LIVE)"
+                f"{float(odds_data['over_odds']):.2f} "
+                f"({odds_data.get('bookmaker') or '?'})"
             )
             ev_pct = (float(odds_data["over_odds"]) * p_any_v2 - 1.0) * 100.0  # v10.120: v2 EV
             if ev_pct is not None:
@@ -14325,16 +14607,16 @@ def _build_odds_value_block(
             ):
                 _book_bit += (
                     f" \u00b7 best {float(odds_data['over_best']):.2f} "
-                    f"@{odds_data.get('over_best_book') or '?'}"
+                    f"@ {odds_data.get('over_best_book') or '?'}"
                 )
             _early132 = ""
             if minute is not None and minute <= LIVE_BET_MINUTE_MAX:
                 # v10.132: the POCKET MARK — every bettable (early
                 # window) BET line is tagged, so the advice class is
                 # identifiable in the chat at a glance
-                _early132 = "\U0001f3af EARLY \u226445' \u00b7 "
+                _early132 = "EARLY \u226445' \u00b7 "
             lines = [
-                f"\n\U0001f4b0 {_early132}BET Over {any_line:.1f} \u2014 {_book_bit}"
+                f"\n{_early132}BET Over {any_line:.1f} @ {_book_bit}"
             ]
 
         # v10.120: edge bookkeeping — model P (v2) minus implied P when a
@@ -17677,10 +17959,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 f"{_net_opp_reds} net man, standard tier bars apply, tagged"
             )
             losing_tag = (
-                f"\n\u26a0\ufe0f LOSING {team_goals}-{opp_goals} — "
-                f"OPPONENT DOWN {_net_opp_reds} MAN "
-                f"(11v{max(11 - _net_opp_reds, 7)}): "
-                f"man-advantage chase, v10.89 relaxed bars"
+                f"\nLOSING {team_goals}-{opp_goals} \u2014 "
+                f"11v{max(11 - _net_opp_reds, 7)} man-advantage chase"
             )
         elif is_losing:
             if tier == "EARLY WARNING":
@@ -17732,8 +18012,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     continue
                 # Passed the higher bar -- tag but allow
                 losing_tag = (
-                    f"\n\u26a0\ufe0f LOSING {team_goals}-{opp_goals} — "
-                    f"high bar passed (GPS={gps:.0f} IB={ib_ratio:.0%} SOT={sot})"
+                    f"\nLOSING {team_goals}-{opp_goals} \u2014 "
+                    f"high bar (GPS {gps:.0f} \u00b7 IB {ib_ratio:.0%} \u00b7 SOT {sot})"
                 )
 
         # v10.44: SCORE-STATE DAMPENER — winning teams generate phantom pressure.
@@ -17839,9 +18119,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     # late warning of the 49' goal because the tag never
                     # said which goal it was about).
                     stale_tag = (
-                        f"\n\u26a0\ufe0f POST-GOAL — scored ~{last_goal_minute}' "
-                        f"({_min_since_goal}m ago); this watches the NEXT goal: "
-                        f"SOT {sot_at_last_goal}->{sot} fresh ({_pressure_reason})"
+                        f"\nPOST-GOAL \u2014 scored ~{last_goal_minute}' "
+                        f"({_min_since_goal}m ago) \u00b7 SOT {sot_at_last_goal}"
+                        f"\u2192{sot} fresh"
                     )
                     log.info(
                         f"  POST-GOAL PASS: {tname} {tier} at {minute}' — "
@@ -17932,8 +18212,8 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                         else "genuine SOT rise since last poll"
                     )
                     stale_tag = (
-                        f"\n\u26a0\ufe0f POST-GOAL — scored ~{last_goal_minute}' "
-                        f"({_min_since_goal}m ago); this watches the NEXT goal: {_fresh_why}"
+                        f"\nPOST-GOAL \u2014 scored ~{last_goal_minute}' "
+                        f"({_min_since_goal}m ago) \u00b7 fresh: {_fresh_why}"
                     )
                     log.info(
                         f"  POST-GOAL PASS: {tname} {tier} at {minute}' — "
@@ -18527,9 +18807,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             _bc_prev = _hist_now[-2].get("big_chances")
             if _bc_prev is not None and (big_chances - int(_bc_prev)) >= 1:
                 _bc_fresh = (
-                    f"\n\u26a0\ufe0f NEW BIG CHANCE just now "
-                    f"(+{big_chances - int(_bc_prev)} since last check) "
-                    f"— strongest single goal-warning sign"
+                    f"\nNEW BIG CHANCE just now (+{big_chances - int(_bc_prev)})"
                 )
 
         # v10.73: RED-CARD VOICE — events-based (player + minute + kind)
@@ -18571,15 +18849,34 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             _terr_bits.append(f"OPP RED CARD (+{_red_edge:.0f})")
         _terr_line = ""
         if _terr_bits:
-            _terr_line = (
-                "\U0001f9ed Territory: " + " \u00b7 ".join(_terr_bits)
-                + f" \u2192 GPS-adj {_gps_adj:.0f} (raw {gps:.0f})\n"
+            # v10.139: plain + compact \u2014 the GPS number + pass-share
+            # only (red-edge context lives in the red-card block; the
+            # dropped arithmetic detail stays in the ledger fields).
+            _terr_share_bit = (
+                f" \u00b7 pass {_terr_share * 100:.0f}%" if _terr_share is not None else ""
             )
+            _terr_line = (
+                f"\nGPS {_gps_adj:.0f} (raw {gps:.0f}){_terr_share_bit}"
+            )
+        # v10.139: SIMPLE BODY (user Sep 26: 'simplify the messages')
+        # \u2014 both teams NAMED, plain separators, no prose. The dropped
+        # display bits (xG detail line, big-chance count, opponent xG)
+        # still land in the ledger unchanged (xg, big_chances, recency).
+        _xg_bit139 = f" \u00b7 xG {xg_str}" if xg_value is not None else ""
+        _opp_name_139b = away["name"] if is_home_team else home["name"]
+        _opp_box_139 = ""
+        try:
+            if _opp_total_shots > 0:
+                _opp_box_139 = (
+                    " \u00b7 box "
+                    f"{int(round(100.0 * _opp_shots_inside_box / _opp_total_shots))}%"
+                )
+        except Exception:
+            _opp_box_139 = ""
         msg = (
             f"{home['name']} {sh}-{sa} {away['name']} \u00b7 {league} \u00b7 {minute}'\n\n"
-            f"{tname}: SOT {sot} | shots {total_shots} (box {ib_pct})"
-            f"{_xg_bit}{_bc_bit}\n"
-            f"Opp: SOT {opponent_sot}{_oxg_bit}{_bc_fresh}\n"
+            f"{tname}: SOT {sot} \u00b7 shots {total_shots} \u00b7 box {ib_pct}{_xg_bit139}\n"
+            f"{_opp_name_139b}: SOT {opponent_sot}{_opp_box_139}{_bc_fresh}\n"
             f"{_terr_line}"
             f"{_rc_block}"
             f"{losing_tag}"
@@ -18604,9 +18901,14 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             listed_sot=_last_top_sot_info.get("listed_sot", 0),
             stats_sot=sot,
         )
-        msg += _build_top_sot_segment(
-            tname, top_sot_players, fixture["league"]["id"], fid=fid, tid=tid
-        )
+        # v10.139: the Top-SOT segment became the NEXT-SCORER block
+        # (both teams + cited odds, built after the odds fetch and
+        # spliced into THIS position). Capture the signal team's
+        # empty-reason BEFORE the opponent fetch below overwrites
+        # _last_top_sot_info.
+        _ts_info_sig_139 = dict(_last_top_sot_info)
+        _scorer_sentinel_139 = "@@NEXT-SCORER-139@@"
+        msg += _scorer_sentinel_139
 
         # v10.87: GOAL-RACE GUARD (PSV-Shakhtar 45' post-mortem, Sep 10 —
         # "signal at 45, goal at 45, no time to bet"). The stats batch this
@@ -18636,6 +18938,29 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 gps, sot, ib_ratio, sh, sa, is_home_team, ml_score=ml_score,
             )
             continue
+
+        # v10.139: the OPPONENT'S Top-SOT players (user Sep 26: 'top sot
+        # player shots for both teams'). The pre-signal events fetch above
+        # already parsed BOTH teams into the per-fixture cache, so this is
+        # cache-served in the common case (zero extra credits); a goal /
+        # growth invalidation re-fetches at most +1 credit. Same fetch,
+        # same non-scorer-only rule (v10.57/58) \u2014 max_players=2 keeps
+        # the block compact; the ledger records them separately.
+        top_sot_opp_players = []
+        _ts_info_opp_139 = {}
+        try:
+            _opp_tid_139 = (away_tid if tid == home_tid else home_tid)
+            _opp_sot_139 = safe_int(opponent_sot)
+            top_sot_opp_players = fetch_top_sot_players(
+                client, fid, _opp_tid_139, max_players=2,
+                team_sot_now=_opp_sot_139, pre_signal=True,
+                league_id=fixture["league"]["id"],
+            )
+            _ts_info_opp_139 = dict(_last_top_sot_info)
+        except Exception as _oe139:
+            top_sot_opp_players = []
+            _ts_info_opp_139 = {}
+            log.debug(f"  v10.139 opponent top-sot fetch skipped: {_oe139}")
 
         # v10.95: recency display dropped (the fields still land in the
         # outcome record via the _build_recency_fields call below the
@@ -18745,6 +19070,32 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 msg += _odds_block
         except Exception as _oe:
             log.debug(f"  v10.78 odds block failed (signal sent without it): {_oe}")
+
+        # v10.139: NEXT-SCORER BLOCK \u2014 both teams' non-scorer Top-SOT
+        # players with their anytime-scorer odds (user Sep 26). Spliced
+        # into the sentinel position right after the team-stats lines;
+        # the sentinel itself never survives to Telegram (safety strip
+        # at the send below).
+        _scorer_odds_139, _scorer_pre_139 = {}, False
+        try:
+            _scorer_odds_139, _scorer_pre_139 = _ensure_scorer_odds_139(
+                client, fid, _odds_msg
+            )
+        except Exception as _soe139:
+            _scorer_odds_139, _scorer_pre_139 = {}, False
+        _scorer_block_139, _scorer_cited_139 = "", []
+        try:
+            _opp_name_139 = away["name"] if is_home_team else home["name"]
+            _scorer_block_139, _scorer_cited_139 = _build_next_scorer_block_139(
+                tname, _opp_name_139,
+                top_sot_players, top_sot_opp_players,
+                _scorer_odds_139, pre_tag=_scorer_pre_139,
+                info_sig=_ts_info_sig_139, info_opp=_ts_info_opp_139,
+            )
+        except Exception as _se139:
+            _scorer_block_139, _scorer_cited_139 = "", []
+            log.debug(f"  v10.139 next-scorer block skipped: {_se139}")
+        msg = msg.replace(_scorer_sentinel_139, _scorer_block_139)
 
         # v10.103: PRICE GATE — the entry-price verdict on the SAME fast
         # capture (zero extra credits, zero added latency): a drained live
@@ -18888,11 +19239,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                             f"{_fl121.replace('zero_zero', '0-0').replace('_', '-')}:"
                             f" {int(round(_fwr * 100))}% ({_fh}/{_fn})"
                         )
+                # v10.139: one plain line \u2014 emoji out, numbers first
                 msg += (
-                    "\n\U0001f3af 90-POCKET — 21-40' + SOT>=3/CRIT: "
+                    "\n90% POCKET \u2014 21-40' SOT\u22653/CRIT: "
                     + " \u00b7 ".join(_bits121)
-                    + "\n    bet frame: Over total (next goal) @ live >= "
-                    f"{SHADOW90_PRICE_MIN:.2f} \u2014 EOD grades it, bot never bets"
+                    + f" \u00b7 frame Over @ \u2265{SHADOW90_PRICE_MIN:.2f} \u00b7 paper"
                 )
         except Exception as _p90e121:
             log.debug(f"  v10.121 90-pocket badge skipped: {_p90e121}")
@@ -18939,9 +19290,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             # v10.95: one compact flags line — the WHY behind the number
             _flag_bits_95 = []
             if _lg_class == "A":
-                _flag_bits_95.append("\U0001f3c6 class-A league")
+                _flag_bits_95.append("class-A league")
             if _dog_state_msg:
-                _flag_bits_95.append(f"\U0001f415 dog ({_dog_state_msg})")
+                _flag_bits_95.append(f"dog {_dog_state_msg}")
             if _deficit_now <= -2:
                 _flag_bits_95.append("coasting +2")
             if _flag_bits_95:
@@ -18974,7 +19325,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     f"{_opp_name_ft96} {int(round(_ft['p_opp'] * 100))}%",
                 ]
                 _ft96_line = (
-                    "\n\U0001f3c1 FT: " + " \u00b7 ".join(_ft96_bits)
+                    "\nFT: " + " \u00b7 ".join(_ft96_bits)
                 )
                 # red-card context rides the SAME line (the engine already
                 # priced it — the tag just says so at a glance). Men count
@@ -18993,7 +19344,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # at the very top of the alert so they are recognizable at a
         # glance. Display only — never a gate, never changes thresholds.
         _green_hdr = (
-            "\U0001F7E2 BET WINDOW 20-56'\n" if 20 <= int(minute or 0) <= 56 else ""
+            "BET WINDOW 20-56'\n" if 20 <= int(minute or 0) <= 56 else ""
         )
         # v10.95: HIT-% HEADLINE — the ledger ladder number, PREPENDED so
         # it is the first thing read (user request: the percentage
@@ -19004,12 +19355,12 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 minute, _deficit_now, _lg_class, _dog_flag_msg,
             )
             msg = (
-                f"{_green_hdr}{tier_emoji(tier)} {_grade_word} — {_hit_pct}% goal chance "
-                f"{_grade_stars} ({sig_label})\n\n" + msg
+                f"{_green_hdr}{_grade_word} \u2014 {_hit_pct}% goal chance "
+                f"({sig_label})\n\n" + msg
             )
         except Exception as _he95:
             log.debug(f"  v10.95 headline skipped: {_he95}")
-            msg = f"{_green_hdr}{tier_emoji(tier)} {tier} ({sig_label})\n\n" + msg
+            msg = f"{_green_hdr}{tier} ({sig_label})\n\n" + msg
 
         # v10.80: CARDS & CORNERS market block — the OVER/UNDER prediction
         # line with odds, built from the SAME odds fetch (zero extra
@@ -19151,6 +19502,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             log.info(f"  v10.114 SHADOW signal: F{fid} {tname} {minute}' "
                      f"({league}) — logged + graded, NOT sent")
         else:
+            # v10.139: safety strip \u2014 the sentinel can only survive
+            # when the odds-block try above threw; never reach Telegram.
+            msg = msg.replace(_scorer_sentinel_139, "")
             _send_ok = send_telegram(client, msg)
         if isinstance(_send_ok, int) and _mkt_block:
             _prefix_80 = _msg_prefix_80
@@ -19558,6 +19912,17 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "top_sot_players": [
                 {"name": n, "sot": c, "shots": t} for n, c, t in top_sot_players
             ] if top_sot_players else [],
+            # v10.139: the opponent's non-scorer Top-SOT players + the
+            # scorer odds the message cited (anytime-scorer board join).
+            # Grading material for the next ledger pass: does the top
+            # non-scorer by SOT actually score next, and was the
+            # implied % honest?
+            "top_sot_opp_players": [
+                {"name": n, "sot": c, "shots": t}
+                for n, c, t in (top_sot_opp_players or [])
+            ] if top_sot_opp_players else [],
+            "scorer_odds_cited": _scorer_cited_139 or [],
+            "scorer_odds_pre": bool(_scorer_pre_139) if _scorer_odds_139 else None,
             # v10.44p: Latency measurement (0 extra credits — reuses top SOT events fetch)
             # detection_game_lag = signal_minute - latest_shot_event_minute
             # Measures how far behind statistics the signal was vs real-time events.
