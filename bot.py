@@ -1380,7 +1380,22 @@ _ratio117_sent_date: str | None = None
 #     scorer_odds_cited + scorer_odds_pre. Display-only — zero gates,
 #     stakes, triggers or grading touched; pocket rules + veto demotion
 #     byte-identical to v10.134-138.
-BOT_VERSION = "v10.139"
+# v10.140 (Sep 27 — first live v10.139 signal post-mortem, Norway 1-1
+#     Portugal 52'): (1) SCORE-AHEAD GUARD: the events feed lagged the
+#     scoreline, so the 51' scorer (Haaland) still headlined the
+#     Next-scorer block. When the scoreline knows more goals than the
+#     events feed, ONE budget-guarded /fixtures/players join repairs
+#     the scorer flags; a team whose goals still cannot be accounted
+#     for is withheld with an honest reason line. (2) No-line market
+#     counts carry P(>=1 more before FT): "Cards 3 · 1+ more (89%)"
+#     (user: '% likelihood of each line happening'). (3) Mined pocket
+#     badges in plain words: "🎯 GOALS 90% POCKET — next-goal bet hit
+#     100% (49/49) · paper" (user: 'instead of balanced mid pressure
+#     ... "next-goal bet hit 100% (49/49"'). (4) 🟢 BET WINDOW + 🎯
+#     pocket-badge emojis back (user: 'keep the emojis on the bet
+#     window appear, also on the socket badges'). (5) "(1 shot)"
+#     singular. Display-only; rules/ids/gates byte-identical.
+BOT_VERSION = "v10.140"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -9055,7 +9070,9 @@ def _build_next_scorer_block_139(
     'pre-match odds' honesty tag when the cited board is pre-match
     (the live feed-2 has totals only; a live player board renders
     untagged). A team with no eligible players gets one short reason
-    line (feed lag / all scored); both empty -> no block at all.
+    line (feed lag / all scored / v10.140 goal_pending — the events
+    feed is behind the scoreline so the just-scored goal's scorer is
+    unknown, that team's players withheld); both empty -> no block.
     Returns (block_str, cited) \u2014 cited is the ledger list of the
     players + the odds the message joined. Pure render, defensive.
     """
@@ -9066,6 +9083,11 @@ def _build_next_scorer_block_139(
                 return "every listed shooter already scored"
             if _o == "no_shooters":
                 return "no player data yet"
+            if _o == "goal_pending":
+                # v10.140: score-ahead guard — the events feed is behind
+                # the scoreline, so the just-scored goal has no scorer
+                # name in the feed yet; that team's players are withheld.
+                return "goal just scored \u2014 scorer not in feed yet"
             return None
 
         def _line(team, players, info):
@@ -9074,7 +9096,11 @@ def _build_next_scorer_block_139(
                 return "\n" + team + " \u2014 " + _w if _w else ""
             _bits = []
             for _n, _s, _t in list(players)[:max_players]:
-                _base = f"({_s} SOT)" if _s > 0 else f"({_t} shots)"
+                # v10.140: singular "(1 shot)" (was "(1 shots)")
+                _base = (
+                    f"({_s} SOT)" if _s > 0
+                    else (f"({_t} shot)" if _t == 1 else f"({_t} shots)")
+                )
                 _o = _lookup_scorer_odds_139(_n, scorer_odds)
                 if _o is not None and _o > 1.0:
                     _bits.append(
@@ -11935,7 +11961,7 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                 _wr, _h, _n = _CORNER_OVER_71_V122
                 _rwr, _rh, _rn = _CORNER_OVER_61_V122
                 out.append(
-                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
                     f" \u00b7 71'+ ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                     f" \u00b7 61'+ rule {int(round(_rwr * 100))}% ({_rh}/{_rn})"
                 )
@@ -11943,7 +11969,7 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                 _wr, _h, _n = _CORNER_OVER_61_V122
                 _cwr, _ch, _ccn = _CORNER_OVER_51_CUM_V122
                 out.append(
-                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'OVER')}"
                     f" \u00b7 61'+ ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                     f" \u00b7 51'+ cum {int(round(_cwr * 100))}% ({_ch}/{_ccn})"
                 )
@@ -11951,13 +11977,13 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
             if 51 <= _m <= 60:
                 _wr, _h, _n = _CORNER_UNDER_5160_V122
                 out.append(
-                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
                     f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
             elif _m >= 71:
                 _wr, _h, _n = _CORNER_UNDER_71_V122
                 out.append(
-                    f"\nCORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
+                    f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
                     f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
         _kl_up = (_ex.get("mkt_cards_lean") or "").upper()
@@ -11965,19 +11991,29 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
             _wr, _h, _n = _CARDS_UNDER_60_V122
             _awr, _ah, _an = _CARDS_ANY_60_V122
             out.append(
-                f"\nCARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'UNDER')}"
+                f"\n\U0001f3af CARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'UNDER')}"
                 f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 f" \u00b7 any lean 60'+ {int(round(_awr * 100))}% ({_ah}/{_an})"
             )
         elif "OVER" in _kl_up and 51 <= _m <= 70:
             _wr, _h, _n = _CARDS_OVER_5170_V122
             out.append(
-                f"\nCARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'OVER')}"
+                f"\n\U0001f3af CARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'OVER')}"
                 f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
             )
         return "".join(out)
     except Exception:
         return ""
+
+
+# v10.140: plain-words outcome verb per pocket family (user Sep 27:
+# 'instead of balance mid pressure ... "next-goal bet hit 100%
+# (49/49"'). The trigger contexts stay ledger-side (mine_stamps ids).
+_POCKET_VERB_140 = {
+    "GOALS": "next-goal bet hit",
+    "CORNERS": "corners bet hit",
+    "CARDS": "cards bet hit",
+}
 
 
 def _pattern_mine_stamps_138(minute, mkt_extras, team_goals, opp_goals,
@@ -11995,11 +12031,13 @@ def _pattern_mine_stamps_138(minute, mkt_extras, team_goals, opp_goals,
     (ids, badge_txt, goals_veto_id, no_bet_line):
       * ids \u2014 EVERY fired rule id (badges, vetoes, risk) for the ledger
         mine_stamps field; grading stays uncapped.
-      * badge_txt \u2014 the compact POCKET badge lines for the MESSAGE:
-        "\U0001f3af GOALS 90% POCKET \u2014 <context> \u00b7 <wr>% (<h>/<n>)
-        \u00b7 paper" (family GOALS / CORNERS / CARDS, strongest 3 by
-        win-rate) \u2014 rides right after the classic pocket badges;
-        "" when no badge fires.
+      * badge_txt \u2014 the compact POCKET badge lines for the MESSAGE
+        (v10.140 plain words + tag): "\U0001f3af GOALS 90% POCKET
+        \u2014 next-goal bet hit <wr>% (<h>/<n>) \u00b7 paper" (family
+        GOALS / CORNERS / CARDS, strongest 3 by win-rate) \u2014 rides
+        right after the classic pocket badges; "" when no badge fires.
+        The abstract context labels are GONE from the message (user
+        Sep 27); the rule ids still carry them in the ledger.
       * goals_veto_id \u2014 the strongest fired GOALS veto (lowest WR); only
         these may demote BET -> NO_BET at the call site. Market vetoes
         (the cards/corners UNDER family) grade a DIFFERENT market than
@@ -12158,9 +12196,14 @@ def _pattern_mine_stamps_138(minute, mkt_extras, team_goals, opp_goals,
         _badge_txt = ""
         if _badges:
             _badges.sort(key=lambda t: (-t[0], t[1]))
+            # v10.140: plain outcome phrasing + the \U0001f3af pocket
+            # tag back (user Sep 27: 'instead of balance mid pressure
+            # ... "next-goal bet hit 100% (49/49"' + 'keep the emojis
+            # ... on the socket badges'). Trigger contexts ledger-side.
             _badge_txt = "".join(
-                "\n" + t[2] + " 90% POCKET \u2014 " + t[3]
-                + " \u00b7 " + str(int(round(t[0]))) + "% (" + str(t[4])
+                "\n\U0001f3af " + t[2] + " 90% POCKET \u2014 "
+                + _POCKET_VERB_140.get(t[2], "bet hit") + " "
+                + str(int(round(t[0]))) + "% (" + str(t[4])
                 + "/" + str(t[5]) + ")" + t[6] + " \u00b7 paper"
                 for t in _badges[:3])
         _line = ""
@@ -13761,6 +13804,10 @@ def _build_market_block(
     request Sep 19. Ledger extras unchanged.
     v10.126: CARDS line restored (same plain format) and lines
     display integer thresholds (8.5 -> 9) — user Sep 19.
+    v10.140: counts with NO book line carry P(>=1 more before FT)
+    from the same lambda ('Cards 3 · 1+ more (89%)') — user Sep 27:
+    '% likelihood of each line happening'. Additive ledger fields
+    mkt_cards_p_more / mkt_corners_p_more; everything else identical.
 
     TEXT-ONLY change vs v10.80: the extras dict (mkt_* ledger fields),
     the record schema and the FT grading (mkt_*_ft_result) are
@@ -13784,22 +13831,28 @@ def _build_market_block(
         "mkt_cards_mod": None,   # v10.97: the applied context modifier (referee x team rates)
         "mkt_corners_proj": None, "mkt_corners_p_over": None,
         "mkt_corners_fair_over": None, "mkt_corners_lean": "NEUTRAL",
+        # v10.140: no-line likelihood % (P >= 1 more before FT)
+        "mkt_cards_p_more": None, "mkt_corners_p_more": None,
     }
 
     def _compact(emoji: str, label: str, now: int | None,
-                 line: float | None, p_over: float | None) -> str:
+                 line: float | None, p_over: float | None,
+                 p_more: float | None = None) -> str:
         """v10.126: PLAIN market line. v10.139: emoji out, likelihood %
-        in — 'Corners 1 · line 9 → UNDER (62%)'. The live count, the
-        integer-threshold line, the lean DIRECTION and the leaned
-        side's probability (user Sep 26: 'the emoticons put instead
-        likely and % depending on how likely is gonna happen'). Same
-        inputs, same ledger extras (mkt_*_line keeps the REAL book
-        line), same single render path (byte-stable live edits
-        preserved). The emoji arg stays for call-site stability.
+        in — 'Corners 1 · line 9 → UNDER (62%)'. v10.140: a count with
+        NO book line still carries its likelihood — 'Cards 3 · 1+ more
+        (89%)' = P(at least one more before FT) from the SAME
+        projection lambda (user Sep 27: '% likelihood of each line
+        happening'). Same inputs, same ledger extras (mkt_*_line keeps
+        the REAL book line; the NEW mkt_*_p_more fields are additive),
+        same single render path (byte-stable live edits preserved).
+        The emoji arg stays for call-site stability.
         """
         if now is None:
             return ""
         if line is None:
+            if p_more is not None and p_more > 1e-9:
+                return f"{label} {now} \u00b7 1+ more ({p_more:.0%})"
             return f"{label} {now}"
         _base = f"{label} {now} \u00b7 line {_mkt_line_txt(line)}"
         if p_over is None:
@@ -13851,7 +13904,18 @@ def _build_market_block(
         # v10.126: CARDS LINE RESTORED (user Sep 19: 'keep the cards
         # line ... with card it has current card') — same plain format
         # as corners: current count + integer line + direction.
-        parts.append(_compact("\U0001f7e8", "Cards", cards_now, cards_line, p_c))
+        # v10.140: no book line -> the count still carries P(>=1 more
+        # before FT) from the SAME projection lambda (user Sep 27: '%
+        # likelihood of each line happening').
+        _p_more_c = None
+        if cards_line is None and lam_c is not None and cards_now is not None:
+            _rem_c = max(float(lam_c) - float(cards_now), 0.0)
+            _p_more_c = _poisson_p_at_least(_rem_c, 1) if _rem_c > 1e-9 else None
+        extras["mkt_cards_p_more"] = (
+            round(_p_more_c, 3) if _p_more_c is not None else None
+        )
+        parts.append(_compact("\U0001f7e8", "Cards", cards_now, cards_line, p_c,
+                              p_more=_p_more_c))
 
         # --- CORNERS ---
         lam_n = _mkt_project_total(corners_now, game_minute, MKT_BASE_PACE_CORNERS,
@@ -13864,7 +13928,15 @@ def _build_market_block(
         if p_n is not None and p_n > 1e-9:
             extras["mkt_corners_fair_over"] = round(1.0 / p_n, 2)
         extras["mkt_corners_lean"] = _mkt_lean(p_n)
-        parts.append(_compact("\U0001f6a9", "Corners", corners_now, corners_line, p_n))
+        _p_more_n = None
+        if corners_line is None and lam_n is not None and corners_now is not None:
+            _rem_n = max(float(lam_n) - float(corners_now), 0.0)
+            _p_more_n = _poisson_p_at_least(_rem_n, 1) if _rem_n > 1e-9 else None
+        extras["mkt_corners_p_more"] = (
+            round(_p_more_n, 3) if _p_more_n is not None else None
+        )
+        parts.append(_compact("\U0001f6a9", "Corners", corners_now, corners_line, p_n,
+                              p_more=_p_more_n))
 
         if not parts:
             return "", extras
@@ -19071,6 +19143,81 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         except Exception as _oe:
             log.debug(f"  v10.78 odds block failed (signal sent without it): {_oe}")
 
+        # v10.140: SCORE-AHEAD GUARD (Norway-Portugal 52' post-mortem,
+        # Sep 27 — Haaland scored 51' yet headlined the Next-scorer
+        # block). The goal-race guard (v10.87) mutes the send when the
+        # events feed knows MORE goals than the scoreline; the REVERSE
+        # race (score ahead, feed behind — the Fenerbahce 49' class)
+        # never tripped anything: the events feed lagged the scoreline
+        # by a minute+, so the fresh player fetch still listed the
+        # just-scorer as a non-scorer. Repair path: ONE budget-guarded
+        # /fixtures/players join (the stats pipeline that already knows
+        # the score) refreshes the scorer flags; both teams re-serve
+        # from cache (zero credits). Whatever still cannot account for
+        # a team's goals is WITHHELD with an honest reason line — the
+        # top-SOT player is the MOST likely scorer, exactly the wrong
+        # 'scores next' hint. Display-only: no gate, no stake change.
+        try:
+            _feed_goals_140 = _fixture_valid_goals.get(fid, 0)
+            if _current_goals > _feed_goals_140:
+                _opp_tid_140 = (away_tid if tid == home_tid else home_tid)
+                _sig_goals_140 = (sh or 0) if tid == home_tid else (sa or 0)
+                _opp_goals_140 = (sa or 0) if tid == home_tid else (sh or 0)
+                log.info(
+                    f"  v10.140 SCORE-AHEAD: F{fid} {tname} {minute}' — scoreline "
+                    f"knows {_current_goals} goal(s), events feed {_feed_goals_140}; "
+                    f"repairing the Next-scorer flags"
+                )
+                try:
+                    fetch_top_sot_players_from_players_api(
+                        client, fid, tid, max_players=3, team_sot_now=sot,
+                        league_id=(fixture.get("league") or {}).get("id"),
+                        league_name=league,
+                    )
+                except Exception as _pjoin140:
+                    log.debug(f"  v10.140 players-join failed: {_pjoin140}")
+                # re-serve both teams (cache path, zero credits)
+                top_sot_players = fetch_top_sot_players(
+                    client, fid, tid, max_players=3, team_sot_now=sot,
+                    pre_signal=True, league_id=fixture["league"]["id"],
+                )
+                _ts_info_sig_139 = dict(_last_top_sot_info)
+                try:
+                    top_sot_opp_players = fetch_top_sot_players(
+                        client, fid, _opp_tid_140, max_players=2,
+                        team_sot_now=safe_int(opponent_sot), pre_signal=True,
+                        league_id=fixture["league"]["id"],
+                    )
+                    _ts_info_opp_139 = dict(_last_top_sot_info)
+                except Exception as _ore140:
+                    top_sot_opp_players = []
+                    _ts_info_opp_139 = {}
+                # withhold any team whose goals the flags cannot account for
+                _nsc_sig_140 = sum(
+                    1 for e in ((_player_sot_cache.get(fid) or {}).get(tid) or [])
+                    if e[3]
+                )
+                _nsc_opp_140 = sum(
+                    1 for e in ((_player_sot_cache.get(fid) or {}).get(_opp_tid_140) or [])
+                    if e[3]
+                )
+                if _nsc_sig_140 < _sig_goals_140:
+                    top_sot_players = []
+                    _ts_info_sig_139 = dict(_ts_info_sig_139)
+                    _ts_info_sig_139["outcome"] = "goal_pending"
+                if _nsc_opp_140 < _opp_goals_140:
+                    top_sot_opp_players = []
+                    _ts_info_opp_139 = dict(_ts_info_opp_139 or {})
+                    _ts_info_opp_139["outcome"] = "goal_pending"
+                if (_nsc_sig_140 < _sig_goals_140) or (_nsc_opp_140 < _opp_goals_140):
+                    log.info(
+                        "  v10.140 SCORE-AHEAD: scorer flags still behind the "
+                        "scoreline — team withheld from the Next-scorer block "
+                        "(honest reason line rides the message)"
+                    )
+        except Exception as _sag140:
+            log.debug(f"  v10.140 score-ahead guard skipped: {_sag140}")
+
         # v10.139: NEXT-SCORER BLOCK \u2014 both teams' non-scorer Top-SOT
         # players with their anytime-scorer odds (user Sep 26). Spliced
         # into the sentinel position right after the team-stats lines;
@@ -19239,9 +19386,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                             f"{_fl121.replace('zero_zero', '0-0').replace('_', '-')}:"
                             f" {int(round(_fwr * 100))}% ({_fh}/{_fn})"
                         )
-                # v10.139: one plain line \u2014 emoji out, numbers first
+                # v10.139: one plain line. v10.140: the \U0001f3af tag
+                # is back (user Sep 27: 'keep the emojis ... on the
+                # pocket badges'); numbers stay first.
                 msg += (
-                    "\n90% POCKET \u2014 21-40' SOT\u22653/CRIT: "
+                    "\n\U0001f3af 90% POCKET \u2014 21-40' SOT\u22653/CRIT: "
                     + " \u00b7 ".join(_bits121)
                     + f" \u00b7 frame Over @ \u2265{SHADOW90_PRICE_MIN:.2f} \u00b7 paper"
                 )
@@ -19343,8 +19492,11 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # Sep 8-12, 59% long-run at even money) get a green flag line
         # at the very top of the alert so they are recognizable at a
         # glance. Display only — never a gate, never changes thresholds.
+        # v10.140: the green-circle emoji is back on the BET WINDOW
+        # header (user Sep 27: 'keep the emojis on the bet window
+        # appear') — recognizable at a glance, exactly as v10.138.
         _green_hdr = (
-            "BET WINDOW 20-56'\n" if 20 <= int(minute or 0) <= 56 else ""
+            "\U0001F7E2 BET WINDOW 20-56'\n" if 20 <= int(minute or 0) <= 56 else ""
         )
         # v10.95: HIT-% HEADLINE — the ledger ladder number, PREPENDED so
         # it is the first thing read (user request: the percentage
