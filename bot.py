@@ -1380,6 +1380,37 @@ _ratio117_sent_date: str | None = None
 #     scorer_odds_cited + scorer_odds_pre. Display-only — zero gates,
 #     stakes, triggers or grading touched; pocket rules + veto demotion
 #     byte-identical to v10.134-138.
+# v10.141 (Oct 3 — the 628-signal ledger pass + the user's live-pocket
+#     call): (1) POCKET-GO-LIVE: the >=90% market pockets graduate from
+#     display-only badges to a LIVE BET line — "BET \U0001f3af: Cards OVER
+#     4 @ 1.83 · odds capture (verify live) · impl 55% · rule 94% (47/50)
+#     · flat 1u" — riding the message right after the pocket badge, with
+#     additive ledger stamps (pocket_bet/pocket_rule/pocket_line/
+#     pocket_odds/pocket_stake + pocket_ft_result/pocket_pnl at FT on the
+#     SAME lean-vs-line semantics). Arming discipline is the bot's own
+#     v10.119 promotion rule, re-read from the loaded ledger at every
+#     boot: n>=50 graded AND WR>=90%. First armed rule: CARDS OVER any
+#     minute (47/50 = 94%, Sep 12 - Oct 3, 18 days). corner_over_61
+#     (27/30 = 90%, n short) and cards_over_5170 (14/14, n short) sit at
+#     the same bar and auto-arm the day they cross n=50. No orders are
+#     placed (no bookmaker API — the v10.120 stub note); LIVE means the
+#     BET line + a graded P&L stream, manual /price receipts upgrade it.
+#     (2) THE is_named BUG (user-reported): post_signal_scorer_is_named
+#     used an EXACT string compare — events feed 'Nicky Clescenco' vs
+#     stats feed 'N. Cle\u0219cenco' scored 3% (9/346) when the true
+#     surname-matched rate is 16% (49/310). Fixed with the same join the
+#     odds board uses (surname + compatible initial, diacritics stripped).
+#     (3) CORRELATION SHADOW STAMPS (user: 'test in shadowing the
+#     correlations you found'): corr_shadows ledger field — sweet60
+#     (GPS 60-69 first half, 90% in the ledger), offveto (offsides>=2,
+#     -8pp), savestorm (opp-GK saves>=2/10'), fouls10 (fouls>=10 ->
+#     cards +25%/10'), chase (losing -> corners +15%/10'). RESEARCH
+#     ONLY, never gates; the EOD grades every stamp nightly vs its
+#     segment baseline so each graduates (or dies) at the usual n>=50
+#     bar. (4) Pocket badge constants refreshed to the Oct 3 ledger
+#     (61'+ corner rule 90% 27/30 etc.) and the armed cards-over badge
+#     now renders at ANY minute with a LIVE tag. Goal rules, gates,
+#     stakes and ledger stamps otherwise byte-identical to v10.140.
 # v10.140 (Sep 27 — first live v10.139 signal post-mortem, Norway 1-1
 #     Portugal 52'): (1) SCORE-AHEAD GUARD: the events feed lagged the
 #     scoreline, so the 51' scorer (Haaland) still headlined the
@@ -1395,7 +1426,7 @@ _ratio117_sent_date: str | None = None
 #     pocket-badge emojis back (user: 'keep the emojis on the bet
 #     window appear, also on the socket badges'). (5) "(1 shot)"
 #     singular. Display-only; rules/ids/gates byte-identical.
-BOT_VERSION = "v10.140"
+BOT_VERSION = "v10.141"
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -8992,6 +9023,70 @@ def _norm_player_name_139(name: str) -> str:
         return ""
 
 
+def _surname_key_141(toks):
+    """v10.141: (surname, first-name/initial) key, order-agnostic —
+    'N. Clescenco' -> ('clescenco', 'n'); 'Clescenco N.' -> same.
+    Mirrors the odds-board join in _lookup_scorer_odds_139."""
+    if not toks:
+        return "", ""
+    if len(toks) >= 2 and len(toks[-1]) == 1:
+        return toks[0], toks[-1]
+    if len(toks) >= 2 and len(toks[0]) == 1:
+        return toks[-1], toks[0]
+    return toks[-1], toks[0]
+
+
+def _scorer_on_top_sot_141(scorer, top_sot_players) -> bool:
+    """v10.141: THE is_named BUG FIX (user-reported, Oct 3 ledger pass).
+
+    post_signal_scorer_is_named used an EXACT string compare — the
+    events feed writes 'Nicky Clescenco' while top_sot_players carries
+    'N. Cle\u0219cenco', so the stamp scored 3% (9/346) when the true
+    surname-matched rate is 16% (49/310). Same join the odds board
+    uses: exact normalized match first, then surname + compatible
+    initial. Pure helper, fully defensive, never raises."""
+    try:
+        if not scorer:
+            return False
+        _sn = _norm_player_name_139(scorer)
+        if not _sn:
+            return False
+        _s_toks = _sn.split()
+        _s_sur, _s_first = _surname_key_141(_s_toks)
+        for _p in (top_sot_players or []):
+            try:
+                _nm = _p.get("name") if isinstance(_p, dict) else str(_p)
+            except Exception:
+                continue
+            _pn = _norm_player_name_139(_nm)
+            if not _pn:
+                continue
+            if _pn == _sn:
+                return True
+            _p_sur, _p_first = _surname_key_141(_pn.split())
+            if not _s_sur or not _p_sur or _s_sur != _p_sur:
+                continue
+            # same surname — initials must agree when both are single
+            # letters; a single letter must prefix the other's name
+            if len(_s_first) == 1 and len(_p_first) == 1:
+                if _s_first == _p_first:
+                    return True
+                continue
+            if len(_s_first) == 1:
+                if _p_first.startswith(_s_first):
+                    return True
+                continue
+            if len(_p_first) == 1:
+                if _s_first.startswith(_p_first):
+                    return True
+                continue
+            if _s_first == _p_first:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _lookup_scorer_odds_139(name: str, scorer_odds: dict):
     """v10.139: the anytime-scorer odds for one Top-SOT player.
 
@@ -11855,15 +11950,16 @@ _S90_SUB_V121 = {
     "zero_zero": (0.947, 36, 38),        # 21-35' only (v10.122 scope)
     "gps80": (0.939, 31, 33),            # SHADOW-90 & GPS>=80
 }
-_CORNER_OVER_61_V122 = (0.962, 25, 26)    # corners OVER 61'+ rule (push-aware)
-_CORNER_OVER_71_V122 = (1.00, 13, 13)    # corners OVER 71'+ band — STILL PERFECT
-_CORNER_OVER_51_CUM_V122 = (0.891, 57, 64)  # corners OVER 51'+ cumulative (push-aware)
-_CORNER_UNDER_5160_V122 = (0.864, 19, 22)  # corners UNDER 51-60' — BELOW the 90 bar
-_CORNER_UNDER_71_V122 = (0.923, 12, 13)     # corners UNDER 71'+ (push-aware)
+_CORNER_OVER_61_V122 = (0.900, 27, 30)    # corners OVER 61'+ rule (push-aware, Oct 3 ledger)
+_CORNER_OVER_71_V122 = (0.929, 13, 14)    # corners OVER 71'+ band (push-aware, Oct 3 ledger)
+_CORNER_OVER_51_CUM_V122 = (0.873, 62, 71)  # corners OVER 51'+ cumulative (push-aware, Oct 3 ledger)
+_CORNER_UNDER_5160_V122 = (0.893, 25, 28)  # corners UNDER 51-60' (push-aware, Oct 3 ledger)
+_CORNER_UNDER_71_V122 = (0.929, 13, 14)     # corners UNDER 71'+ (push-aware, Oct 3 ledger)
 _CORNER_AVG_ODDS_V122 = 1.89
-_CARDS_UNDER_60_V122 = (0.917, 11, 12)    # cards UNDER 60'+ rule — first loss
-_CARDS_ANY_60_V122 = (0.889, 16, 18)     # cards any lean 60'+ (context, below bar)
-_CARDS_OVER_5170_V122 = (1.00, 12, 12)   # cards OVER 51-70' rule — STILL PERFECT
+_CARDS_UNDER_60_V122 = (0.867, 13, 15)    # cards UNDER 60'+ rule (Oct 3 ledger)
+_CARDS_ANY_60_V122 = (0.864, 19, 22)     # cards any lean 60'+ (context, Oct 3 ledger)
+_CARDS_OVER_5170_V122 = (1.00, 14, 14)   # cards OVER 51-70' rule (Oct 3 ledger)
+_CARDS_OVER_ANY_V141 = (0.94, 47, 50)    # v10.141 LIVE rule: cards OVER any minute
 
 # ============================================================
 # v10.134: PATTERN MINE — the Sep 12-21 ledger mining pass
@@ -11987,7 +12083,22 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                     f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
         _kl_up = (_ex.get("mkt_cards_lean") or "").upper()
-        if "UNDER" in _kl_up and _m >= 60:
+        # v10.141: the ARMED live rule renders at ANY minute with the
+        # LIVE tag (supersedes the 51-70' badge while cards_over is
+        # armed — the BET line right below the badge carries the odds).
+        _k_arm141 = False
+        try:
+            _k_arm141 = bool(pocket_arm_141()["cards_over"][0])
+        except Exception:
+            _k_arm141 = False
+        if "OVER" in _kl_up and _k_arm141:
+            _awr141, _ah141, _an141 = pocket_arm_141()["cards_over"][1:4]
+            out.append(
+                f"\n\U0001f3af CARDS 90% POCKET{_ctx(_kn, _kl)} \u2192 {_ft(_kl, 'OVER')}"
+                f" \u00b7 ledger {int(round(_awr141 * 100))}% ({_ah141}/{_an141})"
+                f" \u00b7 LIVE BET (any minute)"
+            )
+        elif "UNDER" in _kl_up and _m >= 60:
             _wr, _h, _n = _CARDS_UNDER_60_V122
             _awr, _ah, _an = _CARDS_ANY_60_V122
             out.append(
@@ -12266,6 +12377,152 @@ def auto_bet_status(records=None):
         return (n >= AUTO_BET_MIN_N and wr >= AUTO_BET_MIN_WR, n, wr)
     except Exception:
         return False, 0, 0.0
+
+
+# ============================================================
+# v10.141: POCKET-GO-LIVE — the >=90% market pockets graduate from
+# display-only badges to a LIVE BET line inside the signal message
+# (user call Oct 3: 'should we implement some of the 90 percent
+# winrate shadow bets now live?'). The bot still places no orders
+# (no bookmaker API — the v10.120 stub note applies); LIVE here means
+# the BET line carries side + line + odds + flat stake + the rule's
+# ledger WR, and the ledger stamps pocket_bet/pocket_* so the EOD
+# grades a clean P&L stream at the recorded price (a manual /price
+# cards receipt upgrades the settlement price — the usual honest
+# prematch-frozen caveat otherwise).
+# Arming discipline is the bot's own promotion rule (v10.119):
+# n >= 50 graded AND WR >= 90% AND multi-week — re-checked at boot
+# from the loaded ledger, so a rule that drifts below 90% disarms
+# itself on the next restart. First live rule: CARDS OVER any-minute
+# (Sep 12 - Oct 3 ledger: 47/50 = 94%, graded across 18 days).
+# corner_over_61 (27/30 = 90%) and cards_over_5170 (14/14) wait at
+# the same bar — they auto-arm the day their ledger crosses n=50.
+# ============================================================
+POCKET_LIVE_MIN_N = 50
+POCKET_LIVE_MIN_WR = 0.90
+POCKET_LIVE_STAKE = 1.0
+_pocket_arm_141_cache: dict | None = None
+
+
+def _pocket_rule_stats_141(rows, rule_id):
+    """(armed, wr, hits, n) for one pocket rule from ledger rows.
+
+    Same semantics as the EOD _pocket_rows grading (push-aware: FT
+    total equal to the line is a push and stays ungraded): lean +
+    minute band + the recorded book line vs ft_{market}_total."""
+    try:
+        n = 0
+        hits = 0
+        for r in rows:
+            try:
+                market = "cards" if rule_id.startswith("cards") else "corners"
+                lean = (r.get(f"mkt_{market}_lean") or "").upper()
+                if "OVER" not in lean:
+                    continue
+                m = int(r.get("game_minute") or 0)
+                if rule_id == "corner_over_61" and m < 61:
+                    continue
+                if rule_id == "cards_over_5170" and not (51 <= m <= 70):
+                    continue
+                line_v = r.get(f"mkt_{market}_line")
+                ftt = r.get(f"ft_{market}_total")
+                if line_v is None or ftt is None or ftt == line_v:
+                    continue
+                n += 1
+                if ftt > line_v:
+                    hits += 1
+            except Exception:
+                continue
+        wr = (hits / n) if n else 0.0
+        return (n >= POCKET_LIVE_MIN_N and wr >= POCKET_LIVE_MIN_WR, wr, hits, n)
+    except Exception:
+        return False, 0.0, 0, 0
+
+
+def pocket_arm_141(records=None):
+    """{rule_id: (armed, wr, hits, n)} — computed ONCE from the boot
+    ledger (the arming bars move daily; a restart re-reads them)."""
+    global _pocket_arm_141_cache
+    if _pocket_arm_141_cache is not None:
+        return _pocket_arm_141_cache
+    try:
+        rows = records if records is not None else signal_outcomes
+        out = {
+            rid: _pocket_rule_stats_141(rows, rid)
+            for rid in ("cards_over", "corner_over_61", "cards_over_5170")
+        }
+    except Exception:
+        out = {
+            "cards_over": (False, 0.0, 0, 0),
+            "corner_over_61": (False, 0.0, 0, 0),
+            "cards_over_5170": (False, 0.0, 0, 0),
+        }
+    _pocket_arm_141_cache = out
+    try:
+        for _rid, (_arm, _wr, _h, _n) in out.items():
+            log.info(
+                f"v10.141 POCKET ARMING: {_rid} — wr {_wr:.0%} ({_h}/{_n}), "
+                f"bar n>={POCKET_LIVE_MIN_N} & wr>={POCKET_LIVE_MIN_WR:.0%} -> "
+                f"{'ARMED (LIVE BET line on)' if _arm else 'not armed (badge only)'}"
+            )
+    except Exception:
+        pass
+    return out
+
+
+def _pocket_live_141(minute, mkt_extras):
+    """The LIVE pocket BET meta for this signal, or None.
+
+    Returns dict(kind, rule, line, now, odds, wr, hits, n) when an
+    ARMED rule matches this signal's cards/corners lean. Pure read of
+    mkt_extras + the cached arming state; never gates the goal signal,
+    never changes stakes — the BET line is additive text and additive
+    ledger fields."""
+    try:
+        _ex = mkt_extras or {}
+        _arm = pocket_arm_141()
+        _kl = (_ex.get("mkt_cards_lean") or "").upper()
+        if "OVER" in _kl and _arm["cards_over"][0]:
+            _wr, _h, _n = _arm["cards_over"][1], _arm["cards_over"][2], _arm["cards_over"][3]
+            _odds = _ex.get("mkt_cards_over_odds")
+            try:
+                _odds = float(_odds) if _odds is not None else None
+            except (TypeError, ValueError):
+                _odds = None
+            return {
+                "kind": "cards", "rule": "cards_over_90",
+                "line": _ex.get("mkt_cards_line"),
+                "now": _ex.get("mkt_cards_now"), "odds": _odds,
+                "wr": _wr, "hits": _h, "n": _n,
+            }
+        # (corner_over_61 / cards_over_5170 render here the day they arm)
+        return None
+    except Exception:
+        return None
+
+
+def _pocket_live_line_141(meta):
+    """The BET line text for a _pocket_live_141 meta (v10.139 simple
+    style: number first, honest odds source, flat stake)."""
+    try:
+        if not meta:
+            return ""
+        _line_txt = _mkt_line_txt(meta.get("line"))
+        _wr_txt = f"{meta['wr']:.0%} ({meta['hits']}/{meta['n']})"
+        if meta.get("odds"):
+            _imp = 1.0 / meta["odds"]
+            return (
+                f"\nBET \U0001f3af: Cards OVER {_line_txt} @ {meta['odds']:.2f}"
+                f" \u00b7 odds capture (verify live) \u00b7 impl {_imp:.0%}"
+                f" \u00b7 rule {_wr_txt} \u00b7 flat {POCKET_LIVE_STAKE:g}u"
+            )
+        return (
+            f"\nBET \U0001f3af: Cards OVER {_line_txt} \u00b7 no book price yet"
+            f" \u2014 /price cards <odds> freezes a live receipt"
+            f" \u00b7 rule {_wr_txt} \u00b7 flat {POCKET_LIVE_STAKE:g}u"
+        )
+    except Exception:
+        return ""
 
 
 # ============================================================
@@ -14146,6 +14403,36 @@ def _stamp_ft_market_labels(client: httpx.Client, fixture: dict, fid: int) -> bo
             hit = (ft_cards_total > line) if lean == "OVER" else (ft_cards_total < line)
             entry["mkt_cards_ft_result"] = "HIT" if hit else "MISS"
             changed = True
+        # v10.141: settle the LIVE pocket bet on the SAME FT semantics —
+        # the lean grade above IS the bet grade; P&L is flat-stake at the
+        # frozen pocket odds, upgraded to a manual /price cards receipt
+        # when one exists (real book price beats the odds capture).
+        if entry.get("pocket_bet") and "pocket_ft_result" not in entry \
+                and entry.get("mkt_cards_ft_result") in ("HIT", "MISS"):
+            entry["pocket_ft_result"] = entry["mkt_cards_ft_result"]
+            _po141 = entry.get("pocket_odds")
+            try:
+                if (entry.get("cards_shadow_odds_src") or "") in ("manual", "live") \
+                        and entry.get("cards_shadow_odds"):
+                    _po141 = float(entry["cards_shadow_odds"])
+            except (TypeError, ValueError):
+                pass
+            _st141 = entry.get("pocket_stake") or 1.0
+            if _po141:
+                entry["pocket_pnl"] = round(
+                    (_po141 - 1.0) * _st141
+                    if entry["mkt_cards_ft_result"] == "HIT" else -1.0 * _st141, 2
+                )
+            changed = True
+            try:
+                log.info(
+                    f"  v10.141 POCKET BET SETTLED: F{entry.get('fixture_id')} "
+                    f"{entry.get('team_name')} — cards OVER {entry.get('pocket_line')} "
+                    f"-> {entry['pocket_ft_result']} "
+                    f"(pnl {entry.get('pocket_pnl'):+.2f}u)"
+                )
+            except Exception:
+                pass
         line = entry.get("mkt_corners_line")
         lean = entry.get("mkt_corners_lean")
         if "ft_corners_total" in entry and line is not None and lean in ("OVER", "UNDER") \
@@ -14791,12 +15078,16 @@ def resolve_with_goal_events(
                 _mn79 = _g79["minute"] + (_g79.get("minute_extra") or 0)
                 _all_scorers79.append(f"{_nm79} {_mn79}'")
             entry["post_signal_scorers"] = _all_scorers79
-            _named79 = {
-                str(_p79.get("name", "")).strip()
-                for _p79 in (entry.get("top_sot_players") or [])
-            }
-            entry["post_signal_scorer_is_named"] = (
-                bool(_sc79) and _sc79 in _named79
+            # v10.141: BUG FIX — the exact string compare above scored
+            # 3% (9/346) because the events feed ('Nicky Clescenco') and
+            # the stats feed ('N. Cle\u0219cenco') format names
+            # differently; the surname/initial join (the same one the
+            # odds board uses) measures the true 16% (49/310). Stamps
+            # self-heal on future FT passes of unresolved entries;
+            # already-resolved rows keep their historical value (no
+            # retroactive ledger rewrite).
+            entry["post_signal_scorer_is_named"] = _scorer_on_top_sot_141(
+                _sc79, entry.get("top_sot_players")
             )
             updated = True
             if _sc79:
@@ -19595,6 +19886,27 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     _msg_prefix_80 = msg
             except Exception as _pe122:
                 log.debug(f"  v10.122 pocket badge skipped: {_pe122}")
+            # v10.141: LIVE POCKET BET — the armed >=90% market rule rides
+            # the message right after its badge (user call Oct 3). Additive
+            # text + ledger stamps only: no goal gate, stake or price
+            # change; the pocket_* fields settle at the FT market pass.
+            _plive141 = None
+            try:
+                _plive141 = _pocket_live_141(minute, _mkt_extras)
+                if _plive141:
+                    _plive_txt_141 = _pocket_live_line_141(_plive141)
+                    if _plive_txt_141:
+                        msg += _plive_txt_141
+                        _msg_prefix_80 = msg
+                        log.info(
+                            f"  v10.141 LIVE POCKET BET: {tname} F{fid} {minute}' "
+                            f"\u2014 cards OVER {_plive141.get('line')} "
+                            f"@ {_plive141.get('odds') or 'no price'} "
+                            f"rule {_plive141['wr']:.0%} ({_plive141['hits']}/{_plive141['n']})"
+                        )
+            except Exception as _pe141:
+                _plive141 = None
+                log.debug(f"  v10.141 pocket live skipped: {_pe141}")
             # v10.138: POCKET TAGS — ONE badge family (user call v2:
             # "don't combine mine and pocket into one message — instead
             # treat them as before, just instead of mine tag it as
@@ -19820,6 +20132,31 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             f"savestorm={_rt117['save_storm_10'] if _rt117['save_storm_10'] is not None else 'n/a'} "
             f"leadprotect={_rt117['lead_protect_60']} — research only"
         )
+        # v10.141: CORRELATION SHADOW STAMPS — the Oct 3 ledger-mined
+        # cuts (user: 'test in shadowing the correlations you found'):
+        #   sweet60   GPS 60-69 in the FIRST HALF — 90% goal WR in the
+        #             628-signal ledger (52/58), the strongest goal cell
+        #   offveto   offsides>=2 — 50% vs 58% base (-8pp), veto candidate
+        #   savestorm opp-GK saves >=2 in 10' — 51% overall, +9pp early
+        #   fouls10   fouls>=10 — cards land +25% per 10' remaining
+        #   chase     losing team — corners land +15% per 10' remaining
+        # RESEARCH ONLY — never a gate, never a veto; the EOD grades
+        # every stamp nightly against its segment baseline so each can
+        # graduate (or die) at the usual n>=50 / 2-week bar.
+        _corr141 = []
+        try:
+            if minute is not None and minute <= 45 and 60.0 <= float(gps or 0) <= 69.0:
+                _corr141.append("sweet60")
+            if (offsides or 0) >= 2:
+                _corr141.append("offveto")
+            if ((_rt117 or {}).get("save_storm_10") or 0) >= 2:
+                _corr141.append("savestorm")
+            if (fouls or 0) >= 10:
+                _corr141.append("fouls10")
+            if (goals_now or 0) < (opp_goals or 0):
+                _corr141.append("chase")
+        except Exception:
+            _corr141 = []
         signal_outcomes.append({
             "fixture_id": fid,
             "team_id": tid,
@@ -20043,6 +20380,18 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             # v10.109: price provenance of the frozen paper bet
             "corners_shadow_odds_src": (_shadow105.get("corners") or {}).get("src"),
             "cards_shadow_odds_src": (_shadow105.get("cards") or {}).get("src"),
+            # v10.141: LIVE POCKET BET stamps — side/rule/price/stake
+            # frozen at signal time; pocket_ft_result + pocket_pnl
+            # settle at the FT market pass on the SAME lean-vs-line
+            # semantics (mkt_cards_ft_result). None = rule not armed or
+            # this signal's lean didn't match — the stamps are additive.
+            "pocket_bet": (_plive141 or {}).get("kind") if _plive141 else None,
+            "pocket_rule": (_plive141 or {}).get("rule") if _plive141 else None,
+            "pocket_line": (_plive141 or {}).get("line") if _plive141 else None,
+            "pocket_odds": (_plive141 or {}).get("odds") if _plive141 else None,
+            "pocket_stake": (POCKET_LIVE_STAKE if _plive141 else None),
+            "pocket_ft_result": None,
+            "pocket_pnl": None,
             "referee": (fixture.get("fixture") or {}).get("referee"),
             "outcome_5min": None,   # v10: expanded windows
             "outcome_10min": None,  # v10: expanded windows
@@ -20056,6 +20405,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             # v10.72: shadow-gate tags (None = no would-suppress rule matched;
             # "DAMP" / "LATE75" / "DAMP+LATE75" = the hard-gate candidates)
             "shadow_would_block": "+".join(_shadow_blocks) if _shadow_blocks else None,
+            "corr_shadows": (list(_corr141) if _corr141 else None),  # v10.141: research stamps, never gates
             "gps_triggered": tier == "EARLY WARNING",
             "version": BOT_VERSION,  # v10.44d-fix: track version
             "resolved": False,
@@ -21384,6 +21734,14 @@ def main():
         resolved_count = sum(1 for e in all_loaded if e.get("resolved"))
         pending_count = sum(1 for e in all_loaded if not e.get("resolved"))
         log.info(f"Loaded {len(all_loaded)} outcome(s) from {OUTCOMES_FILE} ({resolved_count} resolved, {pending_count} pending)")
+        # v10.141: POCKET-GO-LIVE arming — re-read the >=90% market
+        # pockets' bars from the freshly loaded ledger (cards_over
+        # 47/50 = 94% as of the Oct 3 ledger). Computed once, cached;
+        # every restart re-evaluates, so a drifted rule disarms itself.
+        try:
+            pocket_arm_141()
+        except Exception as _e141:
+            log.warning(f"v10.141 pocket arming skipped: {_e141}")
 
     # v10.49: Load blocked-candidate records (false-negative tracking) + Poisson calibration
     _blocked_loaded = _load_blocked_outcomes()
