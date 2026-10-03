@@ -1621,6 +1621,7 @@ def analyze_pockets(day_signals: list[dict], all_outcomes: list[dict]) -> list[s
 
     # v10.122: exactly the rules the badges advertise (strict >=90%).
     _RULES = [
+        ("cards", "CARDS OVER any min (v10.141 LIVE rule)", 0, 200, ("OVER",)),
         ("corners", "CORNER OVER 61'+  (badge rule)", 61, 200, ("OVER",)),
         ("corners", "CORNER OVER 71'+  (band)", 71, 200, ("OVER",)),
         ("corners", "CORNER UNDER 51-60' (badge rule)", 51, 60, ("UNDER",)),
@@ -1657,6 +1658,98 @@ def analyze_pockets(day_signals: list[dict], all_outcomes: list[dict]) -> list[s
         "  NOTE: badges are display-only; these rows are their scoreboard "
         "— manual betting stays the user's call."
     )
+    # v10.141: POCKET-GO-LIVE — the LIVE bet stamps (pocket_bet/pocket_*
+    # in the ledger, written by the armed cards-over rule) get their own
+    # P&L stream here; plus the auto-arm bars for the two waiting rules
+    # (same discipline as the bot: n>=50 graded AND WR>=90% at boot).
+    try:
+        _pb = [s for s in all_outcomes if s.get("pocket_bet")]
+        _pb_settled = [s for s in _pb if s.get("pocket_ft_result")]
+        lines.append("")
+        if _pb:
+            _h = sum(1 for s in _pb_settled if s["pocket_ft_result"] == "HIT")
+            _pnl = sum(float(s.get("pocket_pnl") or 0.0) for s in _pb_settled)
+            lines.append(
+                f"  LIVE POCKET BETS (v10.141): {len(_pb_settled)}/{len(_pb)} settled "
+                f"· WR {100 * _h / len(_pb_settled):.0f}% ({_h}/{len(_pb_settled)}) "
+                if _pb_settled else
+                f"  LIVE POCKET BETS (v10.141): 0/{len(_pb)} settled yet"
+            )
+            if _pb_settled:
+                lines[-1] = (
+                    f"  LIVE POCKET BETS (v10.141): {len(_pb_settled)}/{len(_pb)} settled "
+                    f"· WR {100 * _h / len(_pb_settled):.0f}% ({_h}/{len(_pb_settled)}) "
+                    f"· P&L {_pnl:+.2f}u flat-stake"
+                )
+        else:
+            lines.append("  LIVE POCKET BETS (v10.141): none stamped yet")
+        _bars = []
+        for _lbl, _mkt, _lo, _hi in (
+            ("corner_over_61", "corners", 61, 200),
+            ("cards_over_5170", "cards", 51, 70),
+        ):
+            _rows141 = _pocket_rows(all_outcomes, _mkt, _lo, _hi, ("OVER",))
+            _n141 = _cnt(_rows141)
+            _bars.append(f"{_lbl} n={_n141}/50, WR {_wr(_rows141)}")
+        lines.append(
+            "  auto-arm bars (n>=50 & WR>=90% at boot): " + " | ".join(_bars)
+        )
+    except Exception as _e141:
+        lines.append(f"  LIVE POCKET BETS (v10.141): analysis error {_e141}")
+    return lines
+
+
+def analyze_corr_shadows(day_signals: list[dict], all_outcomes: list[dict]) -> list[str]:
+    """v10.141: CORRELATION SHADOWS — the Oct 3 ledger-mined cuts the
+    bot now stamps as corr_shadows (research only, never gates):
+      sweet60   GPS 60-69 & first half (90% goal WR in the 628-signal
+                ledger — the strongest goal cell; candidate badge pocket)
+      offveto   offsides>=2 (50% vs 58% base — veto candidate)
+      savestorm opp-GK saves >=2/10' (51% overall, +9pp early — watch)
+      fouls10   fouls>=10 (cards land +25% per 10' remaining)
+      chase     losing team (corners land +15% per 10' remaining)
+    Each row: day n/WR + cumulative n/WR + the market echo for the
+    cards/corners stamps (1+ after signal). Promotion at the usual
+    n>=50 / 2-week bar — this section is the scoreboard."""
+    lines = ["", "=== CORRELATION SHADOWS (v10.141 — ledger-mined cuts, never gates) ==="]
+
+    def _graded(rows):
+        return [r for r in rows if r.get("resolved") and r.get("outcome_full")]
+
+    def _wr(rows):
+        if not rows:
+            return "n/a"
+        h = sum(1 for r in rows if r.get("outcome_full") == "HIT")
+        return f"{100 * h / len(rows):.0f}% ({h}/{len(rows)})"
+
+    _SPEC = [
+        ("sweet60", "GPS 60-69 & min<=45 (goal pocket)", None),
+        ("offveto", "offsides>=2 (veto candidate)", None),
+        ("savestorm", "opp-GK saves>=2/10' (watch)", None),
+        ("fouls10", "fouls>=10 (cards OVER candidate)", "cards"),
+        ("chase", "losing team (corners OVER candidate)", "corners"),
+    ]
+    try:
+        for tag, label, mkt in _SPEC:
+            _d = _graded([s for s in day_signals
+                          if tag in (s.get("corr_shadows") or [])])
+            _a = _graded([s for s in all_outcomes
+                          if tag in (s.get("corr_shadows") or [])])
+            _bit = f"  {label}: day {len(_d)}, WR {_wr(_d)} | cumulative {_wr(_a)}"
+            if mkt:
+                _aft = [s for s in _a if s.get(f"{mkt}_after_signal") is not None]
+                if _aft:
+                    _one = sum(1 for s in _aft if (s.get(f"{mkt}_after_signal") or 0) > 0)
+                    _avg = sum(s.get(f"{mkt}_after_signal") or 0 for s in _aft) / len(_aft)
+                    _bit += (f" | 1+ {mkt} after: {100 * _one / len(_aft):.0f}%"
+                             f" · avg {mkt} after {_avg:.1f}")
+            lines.append(_bit)
+        lines.append(
+            "  NOTE: research stamps from the Oct 3 ledger pass; promote at "
+            "n>=50 & a held edge across 2+ match-weeks."
+        )
+    except Exception as _e141:
+        lines.append(f"  (analysis error {_e141})")
     return lines
 
 
@@ -2261,6 +2354,11 @@ def main():
         # cards 60'+ badges (display-only in bot.py) get graded here
         report_lines.append("")
         report_lines.append(analyze_pockets(day_signals, all_outcomes))
+        # v10.141: correlation shadows — the ledger-mined cuts the bot
+        # stamps as corr_shadows (sweet60 / offveto / savestorm /
+        # fouls10 / chase), graded nightly vs their segment baseline
+        report_lines.append("")
+        report_lines.append(analyze_corr_shadows(day_signals, all_outcomes))
         # v10.117: ratio-trial section — offside-pressure / card-radar /
         # corner-cluster trials + the signal-time ratio stamps
         report_lines.append("")
