@@ -1664,6 +1664,33 @@ def analyze_pockets(day_signals: list[dict], all_outcomes: list[dict]) -> list[s
     # (same discipline as the bot: n>=50 graded AND WR>=90% at boot).
     try:
         _pb = [s for s in all_outcomes if s.get("pocket_bet")]
+        # v10.143: SETTLE from FT cards directly — the ledger's
+        # pocket_ft_result is stamped at signal time and never written
+        # back, so '0/9 settled' was a reporting gap, not a pending
+        # bet (the Oct 4-9 stamps actually went 9/9 HIT, +8.75u).
+        # Lean-vs-line semantics, identical to the bot's stamp: HIT =
+        # FT cards total above the line; odds from pocket_odds.
+        for _s143 in _pb:
+            if _s143.get("pocket_ft_result"):
+                continue
+            try:
+                _line143 = float(_s143.get("pocket_line")
+                                 or _s143.get("mkt_cards_line") or 0)
+                _ft143 = _s143.get("ft_cards_total")
+                if not _line143 or _ft143 is None:
+                    continue
+                if _ft143 > _line143:
+                    _s143["pocket_ft_result"] = "HIT"
+                    _od143 = float(_s143.get("pocket_odds") or 0)
+                    _s143["pocket_pnl"] = (_od143 - 1.0) if _od143 else 1.0
+                elif _ft143 < _line143:
+                    _s143["pocket_ft_result"] = "MISS"
+                    _s143["pocket_pnl"] = -1.0
+                else:
+                    _s143["pocket_ft_result"] = "PUSH"
+                    _s143["pocket_pnl"] = 0.0
+            except (TypeError, ValueError):
+                continue
         _pb_settled = [s for s in _pb if s.get("pocket_ft_result")]
         lines.append("")
         if _pb:
@@ -1699,6 +1726,439 @@ def analyze_pockets(day_signals: list[dict], all_outcomes: list[dict]) -> list[s
     return lines
 
 
+def analyze_chase_surge(day_signals: list[dict], all_outcomes: list[dict]) -> list[str]:
+    """v10.143: CHASE-SURGE — the Oct 11 comeback test scoreboard.
+
+    User hypothesis: 'check only second half — if a team underperforming
+    or losing only scores high pressure buildup and SOT increase in
+    quick time does it get followed by a scoring goal?'
+    VERDICT (731-signal ledger + 23,926 polls): YES, it doubles — a
+    2nd-half LOSING team with a 2+ SOT/10' surge scores by FT 56%
+    (15/27) vs 26% (6/23) without the surge; who-scores-next flips from
+    opponent-dominant (43% opp / 26% team) to team-dominant (56% team /
+    19% opp-only). But 56% is CONTEXT, not a 90% pocket — it prices the
+    'next team goal' market at ~1.8 fair, and the surge either converts
+    fast (30% within 15', 2x the 15.9% baseline) or fizzles by FT.
+    This section grades the split nightly so the cell can graduate (or
+    die) at the usual bar. Never a badge, never a gate.
+    """
+    lines = ["", "=== CHASE-SURGE (v10.143 comeback test — 2ndH losing + SOT surge) ==="]
+
+    def _mkt_any_goal(s):
+        try:
+            ft = s.get("pred_actual_total_goals")
+            at = (s.get("goals_at_signal") or 0) + (s.get("opponent_goals_at_signal") or 0)
+            if ft is None or at is None:
+                return None
+            return ft > at
+        except Exception:
+            return None
+
+    def _split(rows):
+        sur, flat = [], []
+        for s in rows:
+            try:
+                _m = int(s.get("game_minute") or 0)
+                _losing = (s.get("goals_at_signal") or 0) < (s.get("opponent_goals_at_signal") or 0)
+                _sd = s.get("sot_delta_10m")
+                _sd = float(_sd) if _sd is not None else 0.0
+                if not (_m >= 45 and _losing):
+                    continue
+                (sur if _sd >= 2 else flat).append(s)
+            except Exception:
+                continue
+        return sur, flat
+
+    def _line(prefix, rows):
+        if not rows:
+            return f"  {prefix}: n=0"
+        n = len(rows)
+        th = sum(1 for s in rows if s.get("outcome_full") == "HIT")
+        ag = [_mkt_any_goal(s) for s in rows]
+        ag = [x for x in ag if x is not None]
+        agh = sum(ag) if ag else 0
+        # who scores next: team hit, or opponent-only goal
+        us = sum(1 for s in rows if s.get("outcome_full") == "HIT")
+        them = sum(1 for s in rows
+                   if s.get("outcome_full") != "HIT" and _mkt_any_goal(s))
+        none_ = n - us - them
+        return (f"  {prefix}: n={n} | team-scores-FT {th}/{n} ({100 * th / n:.0f}%) "
+                f"| any-goal {agh}/{len(ag) or n} "
+                f"({100 * agh / len(ag) if ag else 0:.0f}%) | "
+                f"next: team {us} ({100 * us / n:.0f}%) / opp-only {them} "
+                f"({100 * them / n:.0f}%) / none {none_}")
+
+    try:
+        for scope, rows in (("DAY", day_signals), ("CUMULATIVE", all_outcomes)):
+            sur, flat = _split([s for s in rows if s.get("resolved")])
+            lines.append(f"  [{scope}]")
+            lines.append(_line("SURGE   2+ SOT/10'", sur))
+            lines.append(_line("FLAT    no surge  ", flat))
+        lines.append(
+            "  VERDICT: surge doubles the team-scores rate and flips "
+            "who-scores-next — context/veto grade, NOT a 90% pocket."
+        )
+    except Exception as _e143:
+        lines.append(f"  (analysis error {_e143})")
+    return lines
+
+
+def analyze_mirror_surge(day_signals: list[dict], all_outcomes: list[dict]) -> list[str]:
+    """v10.144: 1stH MIRROR POCKET — the pre-HT SOT-surge scoreboard.
+
+    The mirror of CHASE-SURGE (2ndH): a FIRST-half SOT surge (2+ SOT in
+    the last 10') on any scoreline. Oct 11 finding (731-row ledger): 92%
+    any-goal (61/66); re-validated 69/75 (92%) on the 894-row ledger
+    (task 2-b, research/mirror-audit/REPORT.md). The ≤40' cell the bot
+    BADGES is 94.9% (56/59) while the 41-44' band runs 81% — the badge
+    gate is minute<=40 for exactly that reason; the corr_shadows stamp
+    carries the full <45' research cell so this section grades it all.
+    Pre-deploy ledgers (no mirror_surge stamps yet) get the equivalent
+    recomputed from game_minute<45 & sot_delta_10m>=2 — the CHASE-SURGE
+    precedent. Team-scores runs ~15pp below any-goal (the Botev split):
+    the badge is an ANY-goal number, never a team bet."""
+    lines = ["", "=== 1stH MIRROR POCKET (v10.144 stamp) ==="]
+
+    def _mkt_any_goal(s):
+        try:
+            ft = s.get("pred_actual_total_goals")
+            at = (s.get("goals_at_signal") or 0) + (s.get("opponent_goals_at_signal") or 0)
+            if ft is None or at is None:
+                return None
+            return ft > at
+        except Exception:
+            return None
+
+    def _line(prefix, rows):
+        if not rows:
+            return f"  {prefix}: n=0"
+        n = len(rows)
+        th = sum(1 for s in rows if s.get("outcome_full") == "HIT")
+        ag = [_mkt_any_goal(s) for s in rows]
+        ag = [x for x in ag if x is not None]
+        agh = sum(ag) if ag else 0
+        return (f"  {prefix}: n={n} | any-goal {agh}/{len(ag) or n} "
+                f"({100 * agh / len(ag) if ag else 0:.0f}%) "
+                f"| team-scores {th}/{n} ({100 * th / n:.0f}%)")
+
+    def _stamped(rows):
+        return [s for s in rows
+                if "mirror_surge" in (s.get("corr_shadows") or [])]
+
+    def _equiv(rows):
+        # pre-deploy fallback: the same cell recomputed from the
+        # standard fields (the CHASE-SURGE precedent)
+        out = []
+        for s in rows:
+            try:
+                if (int(s.get("game_minute") or 0) < 45
+                        and float(s.get("sot_delta_10m") or 0) >= 2):
+                    out.append(s)
+            except Exception:
+                continue
+        return out
+
+    def _minute(s):
+        try:
+            return int(s.get("game_minute") or 0)
+        except Exception:
+            return 0
+
+    try:
+        _resolved_all = [s for s in all_outcomes if s.get("resolved")]
+        _stamped_any = bool(_stamped(_resolved_all))
+        if not _stamped_any:
+            lines.append(
+                "  (no mirror_surge stamps in the ledger yet — pre-deploy "
+                "rows; equivalent recomputed: minute<45 & sot_delta_10m>=2)"
+            )
+        for scope, rows in (("DAY", day_signals), ("CUMULATIVE", all_outcomes)):
+            base = [s for s in rows if s.get("resolved")]
+            cell = _stamped(base) if _stamped_any else _equiv(base)
+            lines.append(f"  [{scope}]")
+            lines.append(_line("MIRROR  1stH surge", cell))
+            lines.append(_line("BADGE   <=40' cell",
+                               [s for s in cell if _minute(s) <= 40]))
+            lines.append(_line("LATE    41-44' band",
+                               [s for s in cell if 41 <= _minute(s) <= 44]))
+        lines.append(
+            "  VERDICT: 92% any-goal class while it holds — the BADGE cell "
+            "is <=40' (94.9%, 56/59 on the 894-row ledger); team-scores "
+            "runs ~15pp below (the Botev split — the badge is an ANY-goal "
+            "number; the bot's TEAM line carries its own WR)."
+        )
+    except Exception as _e144:
+        lines.append(f"  (analysis error {_e144})")
+    return lines
+
+
+def analyze_team_pocket(day_signals: list[dict], all_outcomes: list[dict]) -> list[str]:
+    """v10.144: TEAM POCKET LINES — the team-market scoreboard.
+
+    v10.145: the TEAM line is DUAL — team % + fair + worth next to
+    any-goal % + fair — and stamps team_pocket_rid / team_pocket_wr /
+    team_pocket_any_wr; the signal gate freezes the full-ledger >=90%
+    any-goal family (8 LIVE — G7 85.5% and PRIME31 87.8% are CUT: no
+    TEAM line on their signals).
+
+    The bot's v10.144 TEAM line stamps team_pocket_rid / team_pocket_wr
+    on every signal whose pocket family carried the line; this section
+    grades those rows on BOTH markets — team-scores (outcome_full ==
+    HIT) vs any-goal (FT total > at-signal total): the Botev 18% split
+    (pocket won, team bet lost) is exactly what it watches. The pocket
+    families are ALSO recomputed from the rule definitions (the LEDGER
+    POCKETS precedent — grade.py semantics) so the side-by-side
+    any-goal vs TEAM table prints from day one; 'none stamped yet' is
+    the honest pre-deploy line."""
+    lines = ["", "=== TEAM POCKET LINES (v10.145 dual) ==="]
+
+    def _mkt_any_goal(s):
+        try:
+            ft = s.get("pred_actual_total_goals")
+            at = (s.get("goals_at_signal") or 0) + (s.get("opponent_goals_at_signal") or 0)
+            if ft is None or at is None:
+                return None
+            return ft > at
+        except Exception:
+            return None
+
+    def _team(s):
+        # v10.144: grade.py semantics — unresolved rows (no FT write-back,
+        # e.g. in-play at the data cut) leave the denominator, never count
+        # as team-MISS (the bot dict's (wr, hits, n) uses the same rule).
+        v = s.get("outcome_full")
+        if v not in ("HIT", "MISS"):
+            return None
+        return v == "HIT"
+
+    # ---- rule recomputations (grade.py / team-pocket analyze.py
+    # semantics — byte-identical field logic) ----
+    def _m(s):
+        try:
+            return int(s.get("game_minute") or 0)
+        except Exception:
+            return 0
+
+    def _sot(s):
+        try:
+            return int(s.get("sot") or 0)
+        except Exception:
+            return 0
+
+    def _tot(s):
+        return (s.get("goals_at_signal") or 0) + (s.get("opponent_goals_at_signal") or 0)
+
+    def _cl(s):
+        return str(s.get("mkt_corners_lean") or "").upper()
+
+    def _sd(s):
+        try:
+            return float(s.get("sot_delta_10m") or 0)
+        except Exception:
+            return 0.0
+
+    def _gps(s):
+        try:
+            return float(s.get("gps") or 0)
+        except Exception:
+            return 0.0
+
+    def _s90(s):
+        return 21 <= _m(s) <= 40 and (_sot(s) >= 3 or s.get("tier") == "CRITICAL")
+
+    _FAMS = [
+        ("ALL",   "ALL signals", lambda s: True),
+        ("G1-EARLY-TOT1", "G1 10-33' <=1G no c-OVER",
+         lambda s: 10 <= _m(s) <= 33 and _tot(s) <= 1 and "OVER" not in _cl(s)),
+        ("G3-FUSION", "G3 10-33' <=1G c-OVER",
+         lambda s: 10 <= _m(s) <= 33 and _tot(s) <= 1 and "OVER" in _cl(s)),
+        ("G5-SOT3-TIGHT", "G5 21-35' 0-0 SOT>=3",
+         lambda s: 21 <= _m(s) <= 35 and _tot(s) == 0 and _sot(s) >= 3),
+        ("G7-VOLUME", "G7 34-40' <=1G [Botev]",
+         lambda s: 34 <= _m(s) <= 40 and _tot(s) <= 1),
+        ("S90", "S90 21-40' SOT>=3/CRIT", _s90),
+        ("S90-SOT4", "S90 & SOT>=4", lambda s: _s90(s) and _sot(s) >= 4),
+        ("S90-ZZ35", "S90 & 0-0 <=35'",
+         lambda s: _s90(s) and _tot(s) == 0 and _m(s) <= 35),
+        ("S90-GPS80", "S90 & GPS>=80",
+         lambda s: _s90(s) and _gps(s) >= 80),
+        ("PRIME31", "PRIME 21-31'", lambda s: 21 <= _m(s) <= 31),
+        ("MIRROR", "MIRROR 1stH surge <=40'",
+         lambda s: _m(s) <= 40 and _sd(s) >= 2),
+    ]
+
+    try:
+        # (a) the bot's own stamps — post-deploy scoreboard
+        _stamped = [s for s in all_outcomes if s.get("team_pocket_rid")]
+        if _stamped:
+            for scope, rows in (("DAY", day_signals), ("CUMULATIVE", all_outcomes)):
+                sel = [s for s in rows
+                       if s.get("team_pocket_rid") and s.get("resolved")]
+                lines.append(f"  [{scope}] team_pocket stamps: {len(sel)}")
+                if not sel:
+                    continue
+                _by_rid = {}
+                for s in sel:
+                    _by_rid.setdefault(s.get("team_pocket_rid"), []).append(s)
+                for rid, rs in sorted(_by_rid.items()):
+                    n = len(rs)
+                    _tr = [x for x in (_team(s) for s in rs) if x is not None]
+                    th = sum(_tr)
+                    ag = [x for x in (_mkt_any_goal(s) for s in rs)
+                          if x is not None]
+                    agh = sum(ag) if ag else 0
+                    _wr_cited = [s.get("team_pocket_wr") for s in rs
+                                 if s.get("team_pocket_wr") is not None]
+                    _wr_txt = (f" · cited WR {100 * sum(_wr_cited) / len(_wr_cited):.0f}%"
+                               if _wr_cited else "")
+                    # v10.145: the dual line also stamps its any-goal WR
+                    # — cite it next to the team WR.
+                    _wr_any_cited = [s.get("team_pocket_any_wr") for s in rs
+                                     if s.get("team_pocket_any_wr") is not None]
+                    if _wr_any_cited:
+                        _wr_txt += (f" \u00b7 cited any WR "
+                                    f"{100 * sum(_wr_any_cited) / len(_wr_any_cited):.0f}%")
+                    lines.append(
+                        f"    {rid}: n={n} | team-scores {th}/{len(_tr) or n} "
+                        f"({100 * th / len(_tr) if _tr else 0:.0f}%) "
+                        f"| any-goal {agh}/{len(ag) or n} "
+                        f"({100 * agh / len(ag) if ag else 0:.0f}%)"
+                        f"{_wr_txt}"
+                    )
+        else:
+            lines.append(
+                "  (no team_pocket_rid/team_pocket_wr stamps yet — pre-deploy "
+                "ledger; families recomputed from the rule definitions)"
+            )
+        # (b) the family table — any-goal WR vs TEAM WR side by side
+        for scope, rows in (("DAY", day_signals), ("CUMULATIVE", all_outcomes)):
+            lines.append(f"  [{scope}] pocket families — any-goal vs TEAM market:")
+            for rid, label, fn in _FAMS:
+                sel = [s for s in rows if fn(s)]
+                if not sel:
+                    continue
+                a = [x for x in (_mkt_any_goal(s) for s in sel) if x is not None]
+                t = [x for x in (_team(s) for s in sel) if x is not None]
+                pwtl = sum(1 for s in sel
+                           if _mkt_any_goal(s) and _team(s) is False)
+                # v10.145: the dual-line gate, recomputed live on this
+                # scope's rows — CUMULATIVE rows only, never the ALL
+                # aggregate (the bot's frozen dict is the signal gate).
+                _gate = ""
+                if scope == "CUMULATIVE" and rid != "ALL":
+                    _awr = (sum(a) / len(a)) if a else 0.0
+                    _gate = (" | v10.145 gate: LIVE (>=90% any)"
+                             if _awr >= 0.90 else
+                             " | v10.145 gate: CUT (no TEAM line)")
+                lines.append(
+                    f"    {label}: n={len(sel)} | any-goal "
+                    f"{sum(a)}/{len(a) or len(sel)} "
+                    f"({100 * sum(a) / len(a) if a else 0:.0f}%) | TEAM "
+                    f"{sum(t)}/{len(t) or len(sel)} "
+                    f"({100 * sum(t) / len(t) if t else 0:.0f}%)"
+                    + (f" | pocket-won-team-lost {pwtl}" if rid == "ALL" else "")
+                    + f"{_gate}"
+                )
+        lines.append(
+            "  v10.145 signal gate (frozen dict): 8 LIVE families — S90, "
+            "S90-SOT4, ZZ35, GPS80, G1, G3, G5, MIRROR; CUT: G7 85.5%, "
+            "PRIME31 87.8% (full 894-row ledger; re-check when the "
+            "ledger doubles)"
+        )
+        lines.append(
+            "  VERDICT: the TEAM line is DUAL — team % + fair + worth "
+            "next to any-goal % + fair — and only rides pockets with "
+            ">=90% any-goal on the full ledger. Size the team-to-score "
+            "bet on the TEAM number (fair 1/WR, worth >= fair x1.15), "
+            "never the badge %."
+        )
+    except Exception as _e144:
+        lines.append(f"  (analysis error {_e144})")
+    return lines
+
+
+def analyze_topscorer_picks(data_dir: str, date_label: str) -> list[str]:
+    """v10.144: TOPSCORER PICKS — the /topscorers provenance scoreboard.
+
+    The bot logs every pick to topscorer_picks.jsonl (date, league,
+    player, final p, the three hot-% flags, credits at write time).
+    Outcomes are NOT graded here: scorer results do not enter the
+    signal ledger, and his goals today only join his own L5 window
+    tomorrow — the calibration loop closes at the NEXT morning's build.
+    This section prints the day's picks with their model inputs so the
+    percentages can be audited by hand."""
+    lines = ["", "=== TOPSCORER PICKS (v10.144 provenance; \U0001f9ea paper gate: trust after ~50 picks) ==="]
+    try:
+        rows = load_jsonl(os.path.join(data_dir, "topscorer_picks.jsonl"))
+        if not rows:
+            lines.append("  no picks logged yet — the v10.144 bot writes")
+            lines.append("  topscorer_picks.jsonl at each morning /topscorers")
+            lines.append("  build (date, league, player, final p, hot/h2h/")
+            lines.append("  opp flags, credits); hit-tracking lands when")
+            lines.append("  scorer outcomes join the ledger")
+            return lines
+        _day = str(date_label or "")
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", _day):
+            rows = [r for r in rows if str(r.get("date") or "") == _day]
+            if not rows:
+                lines.append(f"  no picks logged for {_day} (file carries "
+                             f"other days)")
+                return lines
+        lines.append(f"  {len(rows)} pick(s):")
+        for r in rows:
+            _fl = []
+            try:
+                if int(r.get("hot_games_scored") or 0) >= 3:
+                    _fl.append("HOT")
+                elif int(r.get("hot_games_scored") or 0) == 2:
+                    _fl.append("hot-soft")
+            except Exception:
+                pass
+            try:
+                if int(r.get("h2h_player_goals") or 0) > 0:
+                    _fl.append("H2H")
+            except Exception:
+                pass
+            try:
+                if r.get("opp_ga_pg") is not None \
+                        and float(r.get("opp_ga_pg") or 0) >= 2.0:
+                    _fl.append("opp-leaky")
+            except Exception:
+                pass
+            try:
+                _p = float(r.get("p") or 0)
+            except Exception:
+                _p = 0.0
+            lines.append(
+                f"    {r.get('date')} {r.get('league')}: {r.get('name')} "
+                f"({r.get('team')}) vs {r.get('opp')} · {100 * _p:.0f}%"
+                + (f" · {' / '.join(_fl)}" if _fl else "")
+            )
+        _avg = sum(float(r.get("p") or 0) for r in rows) / len(rows)
+        _hot = sum(1 for r in rows
+                   if str(r.get("hot_games_scored") or "").isdigit()
+                   and int(r.get("hot_games_scored") or 0) >= 3)
+        _h2h = sum(1 for r in rows
+                   if str(r.get("h2h_player_goals") or "").isdigit()
+                   and int(r.get("h2h_player_goals") or 0) > 0)
+        _leak = sum(1 for r in rows
+                    if r.get("opp_ga_pg") is not None
+                    and float(r.get("opp_ga_pg") or 0) >= 2.0)
+        lines.append(
+            f"  summary: avg p {100 * _avg:.0f}% · hot {_hot} · "
+            f"scored-last-H2H {_h2h} · opp-leaky {_leak}"
+        )
+        lines.append(
+            "  hit-tracking: placeholder — scorer outcomes are not in the"
+        )
+        lines.append(
+            "  ledger yet; his goals today enter tomorrow's L5 window"
+        )
+    except Exception as _e144:
+        lines.append(f"  (analysis error {_e144})")
+    return lines
+
+
 def analyze_corr_shadows(day_signals: list[dict], all_outcomes: list[dict]) -> list[str]:
     """v10.141: CORRELATION SHADOWS — the Oct 3 ledger-mined cuts the
     bot now stamps as corr_shadows (research only, never gates):
@@ -1728,6 +2188,20 @@ def analyze_corr_shadows(day_signals: list[dict], all_outcomes: list[dict]) -> l
         ("savestorm", "opp-GK saves>=2/10' (watch)", None),
         ("fouls10", "fouls>=10 (cards OVER candidate)", "cards"),
         ("chase", "losing team (corners OVER candidate)", "corners"),
+        # v10.142: the PRIME badge's own scoreboard + the winning-scoreline
+        # market-inefficiency candidate (priced ledger: 77% true vs 65%
+        # implied, +12pp — the largest priced edge cell in the Oct 10 pass).
+        ("prime31", "PRIME 21-31' clock pocket (v10.142 badge)", None),
+        ("win_cont", "winning scoreline (mkt-inefficiency candidate)", None),
+        # v10.143: the comeback-test stamp — 2nd-half losing team with a
+        # 2+ SOT/10' surge (56% team-scores-FT vs 26% flat; see the
+        # CHASE-SURGE section for the full split).
+        ("chase_surge", "2ndH losing + SOT surge (comeback test)", None),
+        # v10.144: the 1stH mirror of chase_surge — pre-HT SOT surge,
+        # any scoreline (badge cell <=40' 94.9% any-goal 56/59; the
+        # stamp carries the full <45' research cell — see the 1stH
+        # MIRROR POCKET section for the split).
+        ("mirror_surge", "1stH SOT surge pre-HT (mirror pocket)", None),
     ]
     try:
         for tag, label, mkt in _SPEC:
@@ -2263,7 +2737,7 @@ def main():
     all_polls, _polls_total, _archived_days = load_polls_multisource(
         args.data_dir, _polls_window)
     print(
-        "[eod v10.132] load: %d outcomes, %d poll records, %d total "
+        "[eod v10.145] load: %d outcomes, %d poll records, %d total "
         "lines (%d poll days on disk), windowed=%s, %.1fs"
         % (len(all_outcomes), len(all_polls), _polls_total,
            len(_archived_days), _polls_window is not None,
@@ -2354,11 +2828,23 @@ def main():
         # cards 60'+ badges (display-only in bot.py) get graded here
         report_lines.append("")
         report_lines.append(analyze_pockets(day_signals, all_outcomes))
+        # v10.144: the TEAM-market scoreboard — the bot's team_pocket
+        # stamps (post-deploy) + the family table any-goal vs TEAM WR
+        report_lines.append("")
+        report_lines.append(analyze_team_pocket(day_signals, all_outcomes))
         # v10.141: correlation shadows — the ledger-mined cuts the bot
         # stamps as corr_shadows (sweet60 / offveto / savestorm /
         # fouls10 / chase), graded nightly vs their segment baseline
         report_lines.append("")
         report_lines.append(analyze_corr_shadows(day_signals, all_outcomes))
+        # v10.143: the comeback-test scoreboard — 2ndH losing split by
+        # SOT surge (the Oct 11 user hypothesis, confirmed as context)
+        report_lines.append("")
+        report_lines.append(analyze_chase_surge(day_signals, all_outcomes))
+        # v10.144: the 1stH mirror — pre-HT SOT surge (any scoreline),
+        # the <=40' badge cell + the weak 41-44' band
+        report_lines.append("")
+        report_lines.append(analyze_mirror_surge(day_signals, all_outcomes))
         # v10.117: ratio-trial section — offside-pressure / card-radar /
         # corner-cluster trials + the signal-time ratio stamps
         report_lines.append("")
@@ -2373,6 +2859,10 @@ def main():
         report_lines.append("")
         report_lines.append(analyze_poll_to_goal(day_polls, day_signals))
 
+    # v10.144: topscorer provenance — the morning /topscorers picks
+    # with their hot/h2h/opp flags (hit-tracking placeholder)
+    report_lines.append("")
+    report_lines.append(analyze_topscorer_picks(args.data_dir, date_label))
     # v10.49: Poisson calibration section — is GOALS_PER_SOT=0.31 right per league?
     report_lines.append("")
     report_lines.append(analyze_calibration(day_signals, args.data_dir))
@@ -2418,7 +2908,7 @@ def main():
                 / 1024.0)
         except Exception:
             _rss_mb = -1.0
-    print("[eod v10.132] done in %.1fs, rss=%.0f MB"
+    print("[eod v10.145] done in %.1fs, rss=%.0f MB"
           % (time.time() - _t_load0, _rss_mb), file=sys.stderr)
 
     # Write JSON report
