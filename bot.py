@@ -632,10 +632,21 @@ _GB_CONT_RATE: dict[str, float] = {"G1": 0.625, "G2": 0.841, "G3": 0.757}
 # (38/43), G3 78% (7/9); G1 has no states in the ledger. Printed in the
 # live alert beside the lab line — display-only, no gating.
 _GB_LEDGER_V121: dict[str, str] = {
-    "G1": "no G1 states in ledger yet",
-    "G2": "next-goal 88% (38/43)",
-    "G3": "next-goal 78% (7/9)",
+    "G1": "next-goal 86% (27/30) all-time",
+    "G2": "next-goal 79% (42/53) Sep 12-Oct 9",
+    "G3": "next-goal 84% (31/37) Sep 12-Oct 9",
 }
+# v10.142: G3 is currently the STRONGEST burst class (84% vs G2 79%
+# combined; the new Oct 6-10 poll week alone: G3 75% vs G2 57%). The
+# alert marks it with a 🏆 line so the user can size accordingly;
+# G2 still pays FASTER (median 11' to goal vs G3 15').
+_GB_STRONGEST_V142 = "G3"
+# v10.142: PRIME 21-31' — the clock pocket. Full ledger (Sep 12-Oct 9,
+# 731 signals): team-scores-by-FT 78% (90/115); out-of-sample on the
+# Sep 29-Oct 9 days (never fitted on those): 85% (29/34). The next
+# band (33-44') runs 69% — the badge marks the top of the clock curve.
+# DISPLAY-ONLY tuple, same shape as the v10.122 pocket constants.
+_PRIME31_V142 = (0.78, 90, 115)
 _shadow_tags: dict[str, int] = {}  # session-scoped would-suppress counters (heartbeat)
 # (d): STOP-mode renewal probe — api_get() raises BEFORE any call once
 # quota_remaining <= 0, which made STOP a dead-end: the bot could never see
@@ -1426,7 +1437,25 @@ _ratio117_sent_date: str | None = None
 #     pocket-badge emojis back (user: 'keep the emojis on the bet
 #     window appear, also on the socket badges'). (5) "(1 shot)"
 #     singular. Display-only; rules/ids/gates byte-identical.
-BOT_VERSION = "v10.141"
+BOT_VERSION = "v10.142"
+# v10.142 (Oct 10 — the 731-signal ledger pass + user call 'mark the G3,
+#     what do we implement live'): DISPLAY-ONLY + research stamps, zero
+#     gate/stake/rule changes:
+#     (1) G3 MARKED STRONGEST: the goal-burst alert now carries a 🏆
+#     line on G3 fires — combined Sep 12-Oct 9 next-goal-by-FT G3 84%
+#         (31/37) vs G2 79% (42/53); the alert's ledger-check line
+#         refreshes from the stale Sep 12-18 numbers (G2 88%/G3 78%)
+#         to the current cumulative. Break-evens unchanged (1/rate).
+#     (2) PRIME 21-31' BADGE: every regular signal in 21-31' wears
+#         "🔥 PRIME 21-31' — team-scores 78% (90/115)" (full-ledger;
+#         out-of-sample 85% (29/34) on Sep 29-Oct 9, days it was never
+#         fitted on). The strongest clock cell in the ledger — display
+#         only, same slot as the other pocket badges.
+#     (3) NEW CORRELATION SHADOW STAMPS: prime31 (the badge's own
+#         scoreboard stamp) and win_cont (WINNING scoreline — priced
+#         ledger shows 77% true vs 65% implied, +12pp, the largest
+#         market-inefficiency cell; research only). EOD v10.142 grades
+#         both nightly at the usual n>=50 / 2-week bar.
 
 # --- v10: Goal Pressure Score (GPS) ---
 # Composite 0-100 score calculated on EVERY stats poll.
@@ -6995,6 +7024,20 @@ def _goalburst_send_alert(entry: dict, label: str) -> None:
     _rate = _GB_CONT_RATE.get(entry.get("gb_class") or "", 0.0)
     _be = f"{1.0 / _rate:.2f}" if _rate > 0 else "n/a"
 
+    # v10.142: the 🏆 STRONGEST-CLASS line — G3 84% (31/37) vs G2 79%
+    # (42/53) next-goal-by-FT on the combined Sep 12-Oct 9 ledger; G2
+    # still pays faster (median 11' to goal vs G3 15'). Display-only.
+    _trophy142 = ""
+    try:
+        if (entry.get("gb_class") or "") == _GB_STRONGEST_V142:
+            _trophy142 = (
+                "\U0001f3c6 STRONGEST BURST CLASS \u2014 G3 84% (31/37) "
+                "vs G2 79% (42/53) by FT; "
+                "G2 pays faster (median 11' vs 15')\n"
+            )
+    except Exception:
+        _trophy142 = ""
+
     try:
         with httpx.Client(timeout=10.0) as _c:
             send_telegram(_c, (
@@ -7005,7 +7048,8 @@ def _goalburst_send_alert(entry: dict, label: str) -> None:
                 f"maxGPS {entry['max_gps']:.0f} — "
                 f"{'BLIND class (no pressure signal fired)' if entry['gps_blind'] else 'pressure already lit'}\n"
                 f"bet frame: {entry['bet_desc']} — informational, compare the live O-line price\n"
-                f"ledger-check (Sep 12-18 signals): {_GB_LEDGER_V121.get(entry.get('gb_class') or '', 'n/a')}\n"
+                f"ledger-check: {_GB_LEDGER_V121.get(entry.get('gb_class') or '', 'n/a')}\n"
+                f"{_trophy142}"
                 f"\U0001f4b0 {_odds_line} | break-even {_be} — bet only above\n"
                 f"[{BOT_VERSION}]"
             ))
@@ -19886,6 +19930,23 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     _msg_prefix_80 = msg
             except Exception as _pe122:
                 log.debug(f"  v10.122 pocket badge skipped: {_pe122}")
+            # v10.142: PRIME 21-31' BADGE — the strongest clock cell in the
+            # 731-signal ledger: team-scores-by-FT 78% (90/115) all-time,
+            # 85% (29/34) OUT-OF-SAMPLE on Sep 29-Oct 9 (days this cut was
+            # never fitted on). Display-only, one line, same message slot
+            # as the pocket badges; the prime31 corr stamp grades it in
+            # the EOD nightly. Never a gate, never a stake change.
+            try:
+                if minute is not None and 21 <= int(minute) <= 31:
+                    _wr142, _h142, _n142 = _PRIME31_V142
+                    msg += (
+                        f"\n\U0001f525 PRIME 21-31' — team-scores "
+                        f"{int(round(_wr142 * 100))}% ({_h142}/{_n142}) "
+                        f"ledger · strongest clock cell"
+                    )
+                    _msg_prefix_80 = msg
+            except Exception as _pe142:
+                log.debug(f"  v10.142 prime badge skipped: {_pe142}")
             # v10.141: LIVE POCKET BET — the armed >=90% market rule rides
             # the message right after its badge (user call Oct 3). Additive
             # text + ledger stamps only: no goal gate, stake or price
@@ -20155,6 +20216,14 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 _corr141.append("fouls10")
             if (goals_now or 0) < (opp_goals or 0):
                 _corr141.append("chase")
+            # v10.142 additions: prime31 (the PRIME badge's own scoreboard
+            # stamp) and win_cont (WINNING scoreline — priced ledger: 77%
+            # true vs 65% implied, +12pp, the largest market-inefficiency
+            # cell found in the Oct 10 pass). Research only, never gates.
+            if minute is not None and 21 <= int(minute) <= 31:
+                _corr141.append("prime31")
+            if (goals_now or 0) > (opp_goals or 0):
+                _corr141.append("win_cont")
         except Exception:
             _corr141 = []
         signal_outcomes.append({
