@@ -647,6 +647,17 @@ _GB_STRONGEST_V142 = "G3"
 # band (33-44') runs 69% — the badge marks the top of the clock curve.
 # DISPLAY-ONLY tuple, same shape as the v10.122 pocket constants.
 _PRIME31_V142 = (0.78, 90, 115)
+# v10.144: 1stH MIRROR pocket — the mirror of chase_surge (2ndH): a
+# first-half SOT surge (2+ SOT in the last 10') before HT. Oct 11
+# finding: 92% any-goal (61/66) on the 731-signal ledger; re-validated
+# 69/75 (92%) on the 894-row ledger (task 2-b, research/mirror-audit/
+# REPORT.md). The STAMP fires on the full <45' research cell; the BADGE
+# is armed on the ≤40' cell only — (wr, hits, n) same tuple shape as
+# the pocket constants. Never a gate.
+MIRROR_SURGE_MIN_SOT_DELTA = 2   # SOT added in the last 10 game minutes
+MIRROR_SURGE_MINUTE_MAX = 45     # stamp: strictly first half (minute < 45)
+_MIRROR_POCKET_V144 = (0.949, 56, 59)   # BADGE cell: minute<=40 & sd>=2, any-goal,
+#   894-row ledger (task 2-b fresh-verified; the 41-44' band is 81% — weak)
 _shadow_tags: dict[str, int] = {}  # session-scoped would-suppress counters (heartbeat)
 # (d): STOP-mode renewal probe — api_get() raises BEFORE any call once
 # quota_remaining <= 0, which made STOP a dead-end: the bot could never see
@@ -1437,7 +1448,44 @@ _ratio117_sent_date: str | None = None
 #     pocket-badge emojis back (user: 'keep the emojis on the bet
 #     window appear, also on the socket badges'). (5) "(1 shot)"
 #     singular. Display-only; rules/ids/gates byte-identical.
-BOT_VERSION = "v10.142"
+# v10.144 (Oct 11 — the Botev follow-through): DISPLAY-ONLY +
+# research stamps, zero gate/stake/rule changes:
+#     (1) TEAM POCKET LINE: every fired GOALS pocket now carries the
+#         TEAM-market WR of the same trigger (894-row ledger,
+#         research/team-pocket/REPORT.md): G1 79% (44/56), G3 78%
+#         (61/78), G5 78% (21/27), S90 73.5% (86/117), G7 68% (48/71),
+#         MIRROR 81% (48/59) — with fair odds 1/WR and a worth-floor
+#         (+15% margin, min 1.55). The Botev lesson closed: the team
+#         bet gets its own honest number next to the any-goal badge.
+#     (2) 1stH MIRROR POCKET: a pre-HT SOT surge (2+ SOT/10') is 92%
+#         any-goal (69/75 ledger); the ≤40' cell is 94.9% (56/59,
+#         task 2-b fresh-verified) and now BADGED; corr_shadows gains
+#         the mirror_surge stamp (full <45' research cell) for the
+#         EOD scoreboard. The 41-44' band (81%) stays stamp-only.
+#     (3) TOP SHOOTER LINE: the signal team's #1 top-SOT non-scorer is
+#         named in EVERY signal (shots>=3 fallback when SOT is 0);
+#         PLAYERS_SOT_CREDIT_CAP 60 -> 100 (Oct 10: 80/137 signals
+#         lost the player line — the cap was exhausted).
+#     (4) HOT-% TOPSCORERS: /topscorers gains hot-streak (x1.15/x1.07),
+#         his-H2H-goals (x1.12) and opponent-leak (x1.10) modifiers on
+#         the Poisson core, with provenance log topscorer_picks.jsonl;
+#         cap 130 -> 170, worst case 11 credits/entry.
+# v10.145 (Oct 11 — user call 'keep both % of any-goal and team-goal,
+#     cite the fair odds — show only from any-goal 90.4% pocket onwards,
+#     and the hot-% stays paper'): DISPLAY-ONLY, zero gate/stake/rule
+#     changes:
+#     (1) TEAM pocket line goes DUAL: team % + fair + worth-floor AND
+#         any-goal % + fair, in one line under the pocket. GATED to the
+#         >=90%-any-goal family on the FULL 894-row ledger (research/
+#         dual-pocket re-validation; the 3-day slice is NOT the basis):
+#         S90 90.4% (104/115), S90-SOT4 91.5%, ZZ35 92.6%, GPS80 94.2%,
+#         G1 92.9%, G3 92.3%, G5 92.6%, MIRROR 94.9% keep the line —
+#         G7 (85.5%) and PRIME31 (87.8%) are CUT: no team line on their
+#         signals (under 90% any-goal, we don't need them).
+#     (2) /topscorers foot gains '🧪 paper until picks validate' — the
+#         hot-% modifiers stay shadow until topscorer_picks.jsonl grades
+#         ~50+ picks; the number is never a badge-grade claim.
+BOT_VERSION = "v10.145"
 # v10.142 (Oct 10 — the 731-signal ledger pass + user call 'mark the G3,
 #     what do we implement live'): DISPLAY-ONLY + research stamps, zero
 #     gate/stake/rule changes:
@@ -8564,7 +8612,7 @@ _last_top_sot_info: dict = {}
 # when the events line is empty and the feed is behind stats, ONE call
 # resolves the 'scores next' names. 1 credit, daily-capped, per-league
 # censused (never burn credits on a league that never delivers).
-PLAYERS_SOT_CREDIT_CAP = 60      # players-API fetches per day (1 credit each)
+PLAYERS_SOT_CREDIT_CAP = 100     # v10.144: Oct 10 had 80/137 signals missing the player line (cap exhausted); players-API fetches per day (1 credit each, each fetch serves BOTH teams + parks in the cache)
 PLAYERS_CENSUS_MIN_FETCHES = 6   # fetches before a league can be learned NO-DATA
 PLAYERS_FEED_CENSUS_FILE = os.path.join(_VOLUME_DIR, "players_feed_census.json")
 _players_feed_census: dict[int, dict] = {}   # league_id -> counters
@@ -11988,22 +12036,44 @@ def _shadow90_rule(minute, sot, tier, gps=None, cur_total=None):
 # The SHADOW-90 core fell to 89.6% — still badged (core rule), but the
 # sub-flags now carry the honest numbers. Same names, same renderers,
 # values only — zero behavioral change (display-only constants).
-_S90_POCKET_V121 = (0.896, 60, 67)       # 21-40' SOT>=3/CRIT any-goal (Sep 12-21)
+# v10.143: re-graded on the 731-signal ledger (Sep 12-Oct 9) — the
+# Oct 11 user call. Values only, same rules, same renderers.
+_S90_POCKET_V121 = (0.897, 87, 97)       # 21-40' SOT>=3/CRIT any-goal (Sep 12-Oct 9)
 _S90_SUB_V121 = {
-    "sot4": (0.938, 30, 32),             # SHADOW-90 & SOT>=4
-    "zero_zero": (0.947, 36, 38),        # 21-35' only (v10.122 scope)
-    "gps80": (0.939, 31, 33),            # SHADOW-90 & GPS>=80
+    "sot4": (0.918, 45, 49),             # SHADOW-90 & SOT>=4
+    "zero_zero": (0.958, 23, 24),        # 21-35' only (v10.122 scope)
+    "gps80": (0.951, 39, 41),            # SHADOW-90 & GPS>=80
 }
-_CORNER_OVER_61_V122 = (0.900, 27, 30)    # corners OVER 61'+ rule (push-aware, Oct 3 ledger)
+_CORNER_OVER_61_V122 = (0.903, 28, 31)    # corners OVER 61'+ rule (push-aware, Oct 9 EOD)
 _CORNER_OVER_71_V122 = (0.929, 13, 14)    # corners OVER 71'+ band (push-aware, Oct 3 ledger)
 _CORNER_OVER_51_CUM_V122 = (0.873, 62, 71)  # corners OVER 51'+ cumulative (push-aware, Oct 3 ledger)
-_CORNER_UNDER_5160_V122 = (0.893, 25, 28)  # corners UNDER 51-60' (push-aware, Oct 3 ledger)
-_CORNER_UNDER_71_V122 = (0.929, 13, 14)     # corners UNDER 71'+ (push-aware, Oct 3 ledger)
+_CORNER_UNDER_5160_V122 = (0.813, 26, 32)  # corners UNDER 51-60' (Oct 9 EOD — BELOW 90%, badge suppressed v10.143)
+_CORNER_UNDER_71_V122 = (0.889, 16, 18)     # corners UNDER 71'+ (Oct 9 EOD — BELOW 90%, badge suppressed v10.143)
 _CORNER_AVG_ODDS_V122 = 1.89
-_CARDS_UNDER_60_V122 = (0.867, 13, 15)    # cards UNDER 60'+ rule (Oct 3 ledger)
-_CARDS_ANY_60_V122 = (0.864, 19, 22)     # cards any lean 60'+ (context, Oct 3 ledger)
-_CARDS_OVER_5170_V122 = (1.00, 14, 14)   # cards OVER 51-70' rule (Oct 3 ledger)
+_CARDS_UNDER_60_V122 = (0.813, 13, 16)    # cards UNDER 60'+ rule (Oct 9 EOD — BELOW 90%, badge suppressed v10.143)
+_CARDS_ANY_60_V122 = (0.826, 19, 23)     # cards any lean 60'+ (context, Oct 9 EOD — BELOW 90%, suppressed v10.143)
+_CARDS_OVER_5170_V122 = (1.00, 18, 18)   # cards OVER 51-70' rule (Oct 9 EOD)
 _CARDS_OVER_ANY_V141 = (0.94, 47, 50)    # v10.141 LIVE rule: cards OVER any minute
+
+# v10.145: TEAM POCKET WIN-RATES — DUAL-market, gated to the >=90%
+# any-goal family on the FULL 894-row ledger (Sep 12 - Oct 11;
+# research/team-pocket/REPORT.md + research/dual-pocket re-validation;
+# the last-3-days slice is explicitly NOT the basis — on it several
+# keepers dipped under 90%). rid -> (any_wr, any_h, any_n,
+# team_wr, team_h, team_n). GATE: any_wr >= 0.90 — the S90 90.4% floor
+# is the weakest keeper. G7-VOLUME (85.5% any) and PRIME31 (87.8% any)
+# are CUT: their pockets carry NO team line. Team = signaled team
+# scores after signal (outcome_full); any = FT total > at-signal total.
+_TEAM_POCKET_WR_145 = {
+    "S90":           (0.904, 104, 115, 0.735, 86, 117),  # 21-40' SOT>=3/CRIT (badge)
+    "S90-SOT4":      (0.915, 54, 59, 0.750, 45, 60),
+    "S90-ZZ35":      (0.926, 25, 27, 0.778, 21, 27),
+    "S90-GPS80":     (0.942, 49, 52, 0.755, 40, 53),
+    "G1-EARLY-TOT1": (0.929, 52, 56, 0.786, 44, 56),   # 10-33' <=1G no c-OVER
+    "G3-FUSION":     (0.923, 72, 78, 0.782, 61, 78),   # 10-33' <=1G c-OVER
+    "G5-SOT3-TIGHT": (0.926, 25, 27, 0.778, 21, 27),   # 21-35' 0-0 SOT>=3
+    "MIRROR":        (0.949, 56, 59, 0.814, 48, 59),   # 1stH surge <=40'
+}
 
 # ============================================================
 # v10.134: PATTERN MINE — the Sep 12-21 ledger mining pass
@@ -12114,13 +12184,17 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                     f" \u00b7 51'+ cum {int(round(_cwr * 100))}% ({_ch}/{_ccn})"
                 )
         elif "UNDER" in _cl_up:
-            if 51 <= _m <= 60:
+            # v10.143: STRICT >=90% — the UNDER pockets fell below the
+            # bar on the Oct 9 scoreboard (51-60' 81%, 71'+ 89%): the
+            # badges are suppressed; the EOD keeps grading the leans and
+            # they re-earn the badge the day they clear 90% again.
+            if 51 <= _m <= 60 and _CORNER_UNDER_5160_V122[0] >= 0.90:
                 _wr, _h, _n = _CORNER_UNDER_5160_V122
                 out.append(
                     f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
                     f" \u00b7 ledger {int(round(_wr * 100))}% ({_h}/{_n})"
                 )
-            elif _m >= 71:
+            elif _m >= 71 and _CORNER_UNDER_71_V122[0] >= 0.90:
                 _wr, _h, _n = _CORNER_UNDER_71_V122
                 out.append(
                     f"\n\U0001f3af CORNERS 90% POCKET{_ctx(_cn, _cl)} \u2192 {_ft(_cl, 'UNDER')}"
@@ -12142,7 +12216,9 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
                 f" \u00b7 ledger {int(round(_awr141 * 100))}% ({_ah141}/{_an141})"
                 f" \u00b7 LIVE BET (any minute)"
             )
-        elif "UNDER" in _kl_up and _m >= 60:
+        elif "UNDER" in _kl_up and _m >= 60 and _CARDS_UNDER_60_V122[0] >= 0.90:
+            # v10.143: STRICT >=90% — cards UNDER 60' fell to 81% on the
+            # Oct 9 scoreboard; badge suppressed until it clears 90%.
             _wr, _h, _n = _CARDS_UNDER_60_V122
             _awr, _ah, _an = _CARDS_ANY_60_V122
             out.append(
@@ -12165,7 +12241,11 @@ def _pocket_badges_122(minute, mkt_extras) -> str:
 # 'instead of balance mid pressure ... "next-goal bet hit 100%
 # (49/49"'). The trigger contexts stay ledger-side (mine_stamps ids).
 _POCKET_VERB_140 = {
-    "GOALS": "next-goal bet hit",
+    # v10.143: the verb NAMES THE MARKET (the Botev lesson — the user
+    # bet 'Botev to score' on an ANY-next-goal pocket and felt robbed
+    # when Spartak's goal settled it). Same shape the user liked,
+    # market explicit: "next goal ANY team · bet hit 91% (157/172)".
+    "GOALS": "next goal ANY team \u00b7 bet hit",
     "CORNERS": "corners bet hit",
     "CARDS": "cards bet hit",
 }
@@ -12250,21 +12330,21 @@ def _pattern_mine_stamps_138(minute, mkt_extras, team_goals, opp_goals,
             if _need is not None:
                 if _need <= 2:
                     _badge("C1-DIST-GATE", "CORNERS",
-                           "OVER, need \u22642 any minute", 100.0, 47, 47)
+                           "OVER, need \u22642 any minute", 90.2, 55, 61)
                 else:
                     _mveto("C-OVER-NEED3")
         if "UNDER" in _cl_up:
             if _m >= 61 and _tot >= 2:
-                _badge("C5-UNDER-TOT2", "CORNERS",
-                       "2+ goals & UNDER 61'+", 95.0, 19, 20)
+                # v10.143: C5 fell to 60% (3/5) — ledger-only stamp.
+                _mveto("C5-UNDER-TOT2")
             elif _m >= 51:
                 try:
                     _cv = _rt117_delta10(_ratio117_corners_hist, (fid, tid), _m, corners)
                 except Exception:
                     _cv = None
                 if _cv is not None and _cv <= 2:
-                    _badge("C3-UNDER-STALL", "CORNERS",
-                           "UNDER, flow stalled 51'+", 93.1, 27, 29)
+                    # v10.143: C3 fell to 71% (5/7) — ledger-only stamp.
+                    _mveto("C3-UNDER-STALL")
             if str(league_class or "").strip().upper()[:1] == "A":
                 _mveto("V-C-UNDER-CLASSA")
 
@@ -12286,24 +12366,29 @@ def _pattern_mine_stamps_138(minute, mkt_extras, team_goals, opp_goals,
                     pass
         elif "OVER" in _kl_up and not (51 <= _m <= 70):
             _badge("K-OVER-ANYMIN", "CARDS",
-                   "OVER any minute (outside 51-70')", 91.4, 32, 35)
+                   "OVER any minute (outside 51-70')", 95.0, 57, 60)
 
         # --- goal badges (tagged \U0001f3af POCKET since v10.138) ----
         if 10 <= _m <= 33 and _tot <= 1:
             if "OVER" in _cl_up:
                 _badge("G3-FUSION", "GOALS",
-                       "10-33' & \u22641 goal & OVER corners", 100.0, 42, 42)
+                       "10-33' & \u22641 goal & OVER corners", 95.5, 64, 67)
             else:
                 _badge("G1-EARLY-TOT1", "GOALS",
-                       "10-33' & \u22641 goal on board", 97.1, 67, 69)
+                       "10-33' & \u22641 goal on board", 95.3, 41, 43)
         elif 10 <= _m <= 33 and "OVER" in _cl_up and _tot >= 2:
-            _badge("G2-EARLY-COVER", "GOALS",
-                   "10-33' & OVER corners", 98.2, 54, 55)
+            # v10.143: G2 fell to 87.5% (14/16) on the 731-signal ledger
+            # — BELOW the strict >=90% bar. Ledger-only stamp now (the
+            # EOD keeps grading it; badge returns if it clears 90%).
+            _mveto("G2-EARLY-COVER")
         elif 34 <= _m <= 40 and _tot <= 1:
-            _badge("G7-VOLUME", "GOALS", "34-40' & \u22641 goal", 92.9, 104, 112)
+            # v10.143: the stat covers the FULL G7 rule (10-40' & <=1
+            # goal): 91.3% (157/172) on the 731-signal ledger — the
+            # 34-40' branch is the remainder the G1/G3 slices don't take.
+            _badge("G7-VOLUME", "GOALS", "34-40' & \u22641 goal", 91.3, 157, 172)
         if 21 <= _m <= 35 and _tot == 0 and int(sot or 0) >= 3:
             _badge("G5-SOT3-TIGHT", "GOALS", "0-0 & SOT\u22653, 21-35'",
-                   100.0, 14, 14, extra=" \u00b7 thin")
+                   95.8, 23, 24, extra=" \u00b7 thin")
         try:
             _cdebt = (int(sot) - _tg) if sot is not None else None
         except (TypeError, ValueError):
@@ -12312,8 +12397,10 @@ def _pattern_mine_stamps_138(minute, mkt_extras, team_goals, opp_goals,
         if (_cdebt is not None and 1 <= _cdebt <= 2
                 and _fsc is not None and 2 <= _fsc <= 3
                 and _ib_dom >= 0):
-            _badge("G4-MIDPRESS", "GOALS", "balanced mid-pressure",
-                   100.0, 49, 49, extra=" \u00b7 sub-ledger")
+            # v10.143: G4 collapsed to 67% (24/36) on the stamped rows
+            # since Sep 26 — far below the 90% bar. Ledger-only stamp;
+            # the EOD scoreboard watches for a recovery.
+            _mveto("G4-MIDPRESS")
 
         # --- goal vetoes (the NO BET family) --------------------
         if _m >= 61 and _kl_up and "NEUTRAL" not in _kl_up:
@@ -12567,6 +12654,49 @@ def _pocket_live_line_141(meta):
         )
     except Exception:
         return ""
+
+
+def _team_pocket_line_145(rids, team_name: str, s90_on: bool,
+                          mirror_on: bool = False):
+    """v10.145: the DUAL-market line for a fired GOALS pocket in the
+    >=90%-any-goal family — BOTH numbers with their fair odds in one
+    line: team-to-score (the bet the user places; its own honest WR,
+    always below the any-goal number) and any-goal (the pocket's badge
+    market). GATE: rid must be in _TEAM_POCKET_WR_145 (any-goal WR
+    >= 90% on the full 894-row ledger) — G7 and PRIME31 pockets get NO
+    line (user call Oct 11: 'show only from any-goal 90.4% pocket
+    onwards, we dont need under 90%'). Candidates = fired mine ids +
+    S90 (badge) + MIRROR (the v10.144 mirror badge); picks the strongest
+    TEAM WR. Never a badge, never a gate. Returns (line, rid, team_wr,
+    any_wr) — the call site stamps rid/wr/any_wr on the ledger row for
+    the EOD. fair = 1/WR for each market; worth-floor = team fair x1.15
+    with a 1.55 minimum (the +15% margin the team market needs)."""
+    try:
+        _cand = [rid for rid in (rids or []) if rid in _TEAM_POCKET_WR_145]
+        if s90_on:
+            _cand.append("S90")
+        if mirror_on:
+            _cand.append("MIRROR")
+        _cand = [rid for rid in _cand if _TEAM_POCKET_WR_145.get(rid)]
+        if not _cand:
+            return "", None, None, None
+        _cand.sort(key=lambda r: -float(_TEAM_POCKET_WR_145[r][3]))
+        rid = _cand[0]
+        awr, ah, an, twr, th, tn = _TEAM_POCKET_WR_145[rid]
+        _fair_t = round(1.0 / twr, 2)
+        _fair_a = round(1.0 / awr, 2)
+        _value = max(1.55, round(_fair_t * 1.15, 2))
+        return (
+            f"\n\U0001f3af TEAM pocket \u2014 {team_name} to score \u00b7 "
+            f"team {int(round(twr * 100))}% ({th}/{tn}) \u00b7 fair {_fair_t} \u00b7 "
+            f"worth \u2265{_value} \u00b7 any-goal {int(round(awr * 100))}% "
+            f"({ah}/{an}) \u00b7 fair {_fair_a} \u00b7 \u226590% pocket",
+            rid,
+            twr,
+            awr,
+        )
+    except Exception:
+        return "", None, None, None
 
 
 # ============================================================
@@ -12850,6 +12980,10 @@ def _parse_h2h(client: httpx.Client, t1: int, t2: int) -> dict | None:
                 rows.append({
                     "total": int(g["home"]) + int(g["away"]),
                     "ts": (it.get("fixture") or {}).get("timestamp"),
+                    # v10.144: the meeting's fixture id — the player-level
+                    # H2H lookups consume it (additive, fetch_form_context
+                    # ignores unknown keys).
+                    "fid": int((it.get("fixture") or {}).get("id") or 0),
                 })
             except Exception:
                 continue
@@ -12865,6 +12999,10 @@ def _parse_h2h(client: httpx.Client, t1: int, t2: int) -> dict | None:
             "avg_total": sum(r["total"] for r in rows) / float(len(rows)),
             "n": len(rows),
             "recent": recent,
+            # v10.144: additive — the meeting fixture ids (player-level
+            # H2H checks consume them) + per-meeting totals.
+            "fids": [r["fid"] for r in rows if r.get("fid")],
+            "totals": [r["total"] for r in rows],
         }
     except Exception:
         return None
@@ -13035,6 +13173,8 @@ def _form_ctx_goal_mods(fid: int, is_home_sg: bool) -> tuple[float, float, float
 # met inside the 31-day window (same convention as the form context),
 # and a Poisson P(he scores today) = season goals/game x last-5 x H2H.
 # User request Sep 13. Cost ~8 credits per league, morning-only (full
+# v10.144: the hot-% model (his H2H goals + opponent last-5 + ≤2 H2H
+# player lookups) lifts the worst case to ~11 credits/league, cap 170).
 # tank right after the 00:00 UTC reset), daily-capped; same budget/
 # pace guards as every optional layer; daemon-threaded so the polling
 # loop NEVER waits on it; date-keyed topscorer_sent.json means a
@@ -13042,11 +13182,22 @@ def _form_ctx_goal_mods(fid: int, is_home_sg: bool) -> tuple[float, float, float
 # never a gate, nothing recorded in the ledger.
 TOPSCORER_SEND_HOUR_LOCAL = 10   # Sofia hour when the auto-send may fire
 TOPSCORER_MAX_LEAGUES = 15       # report length cap (busiest leagues first)
-TOPSCORER_DAILY_CAP = 130        # credits/day for the whole report layer
+TOPSCORER_DAILY_CAP = 170        # v10.144: 130 -> 170 — richer model, worst case 11/entry, 15 leagues = 165
 TOPSCORER_L5_FIXTURES = 5        # per-player last-5 lookups
+# v10.144: the hot-% model — three player-level modifiers on the
+# Poisson core (user call Oct 11: 'more complex — how hot is he, did HE
+# score in the H2H, is the opponent leaking'). All multiplicative AFTER
+# the existing team-form/H2H factors, still clamped by LAM_MIN/MAX.
+TOPSCORER_H2H_MAX_LOOKUPS = 2   # player-level H2H fixture checks (1 credit each)
+TOPSCORER_HOT_BOOST = 1.15      # scored in 3+ of last 5 apps
+TOPSCORER_HOT_BOOST_SOFT = 1.07 # scored in 2 of last 5 apps
+TOPSCORER_H2H_PL_BOOST = 1.12   # he scored in the recent H2H meetings
+TOPSCORER_OPP_GA_BOOST = 1.10   # opp conceded >= 2.0/game over their last 5
+TOPSCORER_OPP_GA_MIN = 2.0
 TOPSCORER_LAM_MIN = 0.05         # clamp on the scorer's lambda
 TOPSCORER_LAM_MAX = 2.5
 TOPSCORER_SENT_FILE = os.path.join(_VOLUME_DIR, "topscorer_sent.json")
+TOPSCORER_PICKS_FILE = os.path.join(_VOLUME_DIR, "topscorer_picks.jsonl")  # v10.144: per-pick provenance
 _ts_credits_today: int = 0
 _ts_credits_date: str = ""
 _ts_inflight: bool = False
@@ -13178,6 +13329,11 @@ def _ts_team_last5(client: httpx.Client, team_id: int) -> dict | None:
         "ga_pg": sum(r["theirs"] for r in rows) / float(len(rows)),
         "n": len(rows),
         "fids": [r["fid"] for r in rows],
+        # v10.144: additive — the most recent game's score line (rows
+        # are most-recent-first; the opponent-leak modifier + display
+        # cite it: "opp leaked X last game").
+        "last_ga": rows[0]["theirs"],
+        "last_gf": rows[0]["mine"],
     }
 
 
@@ -13195,6 +13351,7 @@ def _ts_player_last5(client: httpx.Client, player_id: int,
     goals = 0
     minutes = 0
     read_fixtures = 0
+    _per_game: list[tuple[int, int]] = []  # v10.144: (fid, goals) per app
     for fid in (fids or [])[:TOPSCORER_L5_FIXTURES]:
         found = False
         try:
@@ -13213,6 +13370,12 @@ def _ts_player_last5(client: httpx.Client, player_id: int,
                         st_arr = pl.get("statistics") or []
                         st = st_arr[0] if st_arr else {}
                         goals += int((st.get("goals") or {}).get("total") or 0)
+                        # v10.144: per-fixture goals — the hot-streak
+                        # granularity rides along free (same payloads).
+                        _per_game.append(
+                            (int(fid),
+                             int((st.get("goals") or {}).get("total") or 0))
+                        )
                         minutes += int((st.get("games") or {}).get("minutes") or 0)
                         games += 1
                         found = True
@@ -13229,16 +13392,27 @@ def _ts_player_last5(client: httpx.Client, player_id: int,
             time.sleep(0.25)
     if games == 0 and read_fixtures == 0:
         return None
-    return {"games": games, "goals": goals, "minutes": minutes}
+    return {
+        "games": games, "goals": goals, "minutes": minutes,
+        # v10.144: additive hot-streak granularity (0 extra credits).
+        "per_game": _per_game,
+        "games_scored": sum(1 for _f, _g in _per_game if _g > 0),
+    }
 
 
 def _ts_score_prob(scorer: dict, l5: dict | None, team_form: dict | None,
-                   h2h: dict | None) -> float:
-    """P(scorer scores >=1 today) = 1 - exp(-lambda), lambda = season
-    goals/game blended 50/50 with his own last-5 rate, scaled by the
-    SAME clamped environment factors the v10.97 predictions use (his
-    team's last-5 scoring form; the H2H goal environment when the clubs
-    met within 31 days). Display-only."""
+                   h2h: dict | None, h2h_pl: dict | None = None,
+                   opp_form: dict | None = None) -> float:
+    """v10.144: hot-% model — the v10.98 Poisson core plus three
+    player-level modifiers (user call Oct 11: 'more complex — how hot
+    is he, did HE score in the H2H, is the opponent leaking'):
+      hot       scored in 3+ of his last-5 apps -> x1.15 (2 -> x1.07)
+      h2h_pl    he scored in the clubs' recent H2H meetings -> x1.12
+      opp_ga    opponent conceded >= 2.0/game over their last 5 -> x1.10
+    Every modifier is multiplicative AFTER the existing team-form/H2H
+    factors and clamped by the same TOPSCORER_LAM_MIN/MAX on the final
+    lambda; display-only, same honesty as v10.98. New params default
+    None = the v10.143 behavior byte-identical."""
     apps = max(1, int(scorer.get("apps") or 0))
     season_gpg = float(scorer.get("goals") or 0) / float(apps)
     l5_gpg = None
@@ -13256,8 +13430,72 @@ def _ts_score_prob(scorer: dict, l5: dict | None, team_form: dict | None,
             float(h2h.get("avg_total") or 0.0) / PROJECTION_AVG_TOTAL,
             H2H_MOD_MIN, H2H_MOD_MAX,
         )
+    # v10.144 (i): hot streak — scoring appearances in his last 5
+    if l5 is not None and int(l5.get("games") or 0) >= 3:
+        _gs = int(l5.get("games_scored") or 0)
+        if _gs >= 3:
+            mod *= TOPSCORER_HOT_BOOST
+        elif _gs == 2:
+            mod *= TOPSCORER_HOT_BOOST_SOFT
+    # v10.144 (ii): he scored in the recent H2H meetings
+    if h2h_pl is not None and int(h2h_pl.get("goals") or 0) > 0:
+        mod *= TOPSCORER_H2H_PL_BOOST
+    # v10.144 (iii): opponent leaking (their ga_pg over last 5)
+    if opp_form is not None and int(opp_form.get("n") or 0) >= 3 \
+            and float(opp_form.get("ga_pg") or 0.0) >= TOPSCORER_OPP_GA_MIN:
+        mod *= TOPSCORER_OPP_GA_BOOST
     lam = _clamp97(lam * mod, TOPSCORER_LAM_MIN, TOPSCORER_LAM_MAX)
     return 1.0 - math.exp(-lam)
+
+
+def _ts_h2h_player_goals(client: httpx.Client, player_id: int, team_id: int,
+                         h2h_fids: list[int], known: dict[int, int] | None,
+                         ) -> dict | None:
+    """v10.144: the scorer's OWN goals in the clubs' recent H2H fixtures.
+    Reuses goals already read in the player's last-5 pass (`known` maps
+    fid -> goals there — most club pairs never meet inside the 31-day
+    window, so this is usually free); fetches ONLY the H2H fixtures not
+    already read, capped at TOPSCORER_H2H_MAX_LOOKUPS /fixtures/players
+    calls (1 credit each). Returns {goals, games, n_fixtures} or None
+    when nothing read. A meeting he did not feature in counts as 0
+    goals (honest — the display then shows no H2H flag)."""
+    global _ts_credits_today
+    goals = 0
+    games = 0
+    n_fix = 0
+    for fid in list(h2h_fids or [])[:TOPSCORER_H2H_MAX_LOOKUPS]:
+        n_fix += 1
+        _k = (known or {}).get(int(fid))
+        if _k is not None:
+            # already read during the player's own last-5 pass — free reuse
+            goals += int(_k)
+            games += 1
+            continue
+        try:
+            data = api_get(client, "/fixtures/players", {"fixture": int(fid)})
+            _ts_credits_today += 1
+            _found = False
+            for blk in (data.get("response") or []):
+                t = blk.get("team") or {}
+                if t.get("id") is None or int(t.get("id")) != int(team_id):
+                    continue
+                for pl in blk.get("players") or []:
+                    if int((pl.get("player") or {}).get("id") or 0) != int(player_id):
+                        continue
+                    st_arr = pl.get("statistics") or []
+                    st = st_arr[0] if st_arr else {}
+                    goals += int((st.get("goals") or {}).get("total") or 0)
+                    games += 1
+                    _found = True
+                    break
+                if _found:
+                    break
+            time.sleep(0.25)
+        except Exception:
+            continue
+    if n_fix == 0:
+        return None
+    return {"goals": goals, "games": games, "n_fixtures": n_fix}
 
 
 _ts_last_block_reason: str | None = None  # v10.107: exact guard that blocked the last build
@@ -13349,7 +13587,7 @@ def _build_topscorer_report(client: httpx.Client) -> str | None:
     _no_pick: list[str] = []  # v10.112: leagues with data but no playing scorer
     _cap_hit = False          # v10.112: credit cap stopped the scan early
     for lid, ent in ranked[:TOPSCORER_MAX_LEAGUES]:
-        if _ts_credits_today + 8 > TOPSCORER_DAILY_CAP:
+        if _ts_credits_today + 11 > TOPSCORER_DAILY_CAP:  # v10.144: worst case 11/entry (opp last-5 + ≤2 H2H player lookups)
             log.info(
                 f"v10.98: top-scorer report credit cap reached "
                 f"({_ts_credits_today}/{TOPSCORER_DAILY_CAP}) — stopping at "
@@ -13406,6 +13644,7 @@ def _build_topscorer_report(client: httpx.Client) -> str | None:
             pass
 
         # context: his team's last-5 + his own last-5 + the clubs' H2H
+        # v10.144: + the opponent's last-5 + his goals in the recent H2H
         l5 = _ts_team_last5(client, pick["tid"])
         pl5 = _ts_player_last5(
             client, pick["pid"], pick["tid"], (l5 or {}).get("fids") or []
@@ -13414,7 +13653,21 @@ def _build_topscorer_report(client: httpx.Client) -> str | None:
         if opp_tid is not None:
             h2h = _parse_h2h(client, int(pick["tid"]), int(opp_tid))
             _ts_credits_today += 1
-        p = _ts_score_prob(pick, pl5, l5, h2h)
+        # v10.144 (iii): the OPPONENT's last-5 (1 credit) — leakiness
+        opp_l5 = (
+            _ts_team_last5(client, int(opp_tid))
+            if opp_tid is not None else None
+        )
+        # v10.144 (ii): HIS goals in the clubs' recent H2H meetings —
+        # free reuse of the last-5 payloads via the known map, ≤2 fetches
+        h2h_pl = None
+        if h2h is not None and h2h.get("recent") and h2h.get("fids"):
+            h2h_pl = _ts_h2h_player_goals(
+                client, pick["pid"], pick["tid"],
+                [f for f in h2h["fids"]],
+                known={int(f): g for f, g in ((pl5 or {}).get("per_game") or [])},
+            )
+        p = _ts_score_prob(pick, pl5, l5, h2h, h2h_pl=h2h_pl, opp_form=opp_l5)
 
         if pl5 is not None and int(pl5.get("games") or 0) >= 1:
             l5_txt = f"L5: {int(pl5.get('goals') or 0)}\u26bd in {int(pl5.get('games'))}"
@@ -13422,6 +13675,28 @@ def _build_topscorer_report(client: httpx.Client) -> str | None:
             l5_txt = "L5: not played"
         else:
             l5_txt = "L5 n/a"
+        # v10.144 (i): hot-streak display (scored in N of his last apps)
+        _hot_txt = ""
+        if pl5 is not None and int(pl5.get("games") or 0) >= 3:
+            _gs = int(pl5.get("games_scored") or 0)
+            if _gs >= 3:
+                _hot_txt = f" \u00b7 \U0001f525 scored {_gs}/{int(pl5.get('games'))}"
+            elif _gs == 2:
+                _hot_txt = f" \u00b7 scored {_gs}/{int(pl5.get('games'))}"
+        # v10.144 (ii): he scored in the recent H2H meetings
+        _h2hpl_txt = ""
+        if h2h_pl is not None and int(h2h_pl.get("goals") or 0) > 0:
+            _h2hpl_txt = " \u00b7 scored last H2H"
+        # v10.144 (iii): opponent leaking
+        _opp_txt = ""
+        if opp_l5 is not None and int(opp_l5.get("n") or 0) >= 3 \
+                and float(opp_l5.get("ga_pg") or 0.0) >= TOPSCORER_OPP_GA_MIN:
+            _opp_txt = f" \u00b7 opp leaked {opp_l5.get('last_ga')} last game"
+        # compact: max 2 flags ride the line (hot first, then h2h, then
+        # opp — the message stays one screen; the picks log keeps all 3)
+        _flags_txt144 = "".join(
+            [t for t in (_hot_txt, _h2hpl_txt, _opp_txt) if t][:2]
+        )
         if h2h is not None and int(h2h.get("n") or 0) > 0:
             tag = " last mo" if h2h.get("recent") else " older"
             h2h_txt = f"H2H {float(h2h['avg_total']):.1f} g/g{tag}"
@@ -13434,9 +13709,27 @@ def _build_topscorer_report(client: httpx.Client) -> str | None:
         entries.append(
             f"\u26bd {ent['name']} \u2014 {pick['name']} ({pick['team']}){_prev_tag}\n"
             f"   vs {opp_name} {ko} Sofia \u00b7 {pick['apps']} apps \u00b7 "
-            f"{pick['goals']}\u26bd season \u00b7 {l5_txt} \u00b7 {h2h_txt} \u2192 "
+            f"{pick['goals']}\u26bd season \u00b7 {l5_txt} \u00b7 {h2h_txt}"
+            f"{_flags_txt144} \u2192 "
             f"\U0001f3af {p * 100:.0f}% scores today"
         )
+        # v10.144: provenance log — one row per pick (the EOD prints the
+        # model's own inputs; hit-tracking lands when scorer outcomes
+        # join the ledger — his goals today enter tomorrow's L5 window).
+        try:
+            with open(TOPSCORER_PICKS_FILE, "a", encoding="utf-8") as _pf:
+                _pf.write(json.dumps({
+                    "date": _ts_today(), "league": ent["name"],
+                    "name": pick["name"], "team": pick["team"],
+                    "opp": opp_name, "p": round(p, 3),
+                    "hot_games_scored": (pl5 or {}).get("games_scored"),
+                    "h2h_player_goals": (h2h_pl or {}).get("goals"),
+                    "opp_ga_pg": (opp_l5 or {}).get("ga_pg"),
+                    "opp_last_ga": (opp_l5 or {}).get("last_ga"),
+                    "credits": _ts_credits_today,
+                }) + "\n")
+        except Exception:
+            pass
         time.sleep(0.4)
 
     if not entries:
@@ -13483,8 +13776,9 @@ def _build_topscorer_report(client: httpx.Client) -> str | None:
         f"{datetime.now(BULGARIA_TZ).strftime('%H:%M')} Sofia, before kickoffs"
     )
     foot = (
-        "\n\nScore chance: season \u26bd/game \u00d7 his last-5 \u00d7 H2H (clubs, last "
-        "month) \u2014 Poisson, display-only"
+        "\n\nScore chance: season \u26bd/game \u00d7 his last-5 \u00d7 H2H "
+        "(clubs + his H2H goals) \u00d7 hot streak \u00d7 opponent defense "
+        "\u2014 Poisson, display-only \u00b7 \U0001f9ea paper until picks validate"
     )
     return head + "\n\n" + "\n\n".join(entries) + foot
 
@@ -16792,7 +17086,9 @@ def check_telegram_commands(client: httpx.Client) -> None:
 
             elif text == "/topscorers":
                 # v10.98: manual trigger of the morning top-scorer report
-                # (same build as the 10:00 auto-send; ~8 credits/league).
+                # (same build as the 10:00 auto-send). v10.144: the richer
+                # hot-% model (hot streak + his H2H goals + opponent
+                # defense) costs ~11 credits/league worst case.
                 if _ts_inflight:
                     send_telegram(
                         client,
@@ -16804,7 +17100,9 @@ def check_telegram_commands(client: httpx.Client) -> None:
                     send_telegram(
                         client,
                         "\u2b50 Building today's top-scorer report "
-                        "(~8 credits/league, about a minute)...",
+                        "(richer model: hot streak \u00b7 H2H goals \u00b7 "
+                        "opponent defense, ~11 credits/league, "
+                        "about a minute)...",
                     )
 
             elif text == "/goalsboard":
@@ -19579,6 +19877,41 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             log.debug(f"  v10.139 next-scorer block skipped: {_se139}")
         msg = msg.replace(_scorer_sentinel_139, _scorer_block_139)
 
+        # v10.144: TOP SHOOTER LINE — the signal team's #1 top-SOT
+        # non-scorer, named in EVERY signal that has the data (user call
+        # Oct 11: most recent signals lost the top-SOT player entirely on
+        # busy days). The Next-scorer block above carries the odds table;
+        # this is the one-glance name. The fetch already guarantees
+        # "hasn't scored" (non-scorers only, v10.57/58 + the v10.140
+        # score-ahead repair). Fallback when the top entry has 0 SOT: the
+        # first busy shooter (>=3 shots) with "no SOT yet"; no line when
+        # nobody qualifies (all_scored / no data — the honest reason
+        # lines already speak).
+        _top_shooter_144 = None
+        try:
+            if top_sot_players:
+                _tn144, _ts144, _tt144 = top_sot_players[0]
+                if (_ts144 or 0) > 0:
+                    _top_shooter_144 = _tn144
+                    msg += (
+                        f"\n\U0001f3af Top shooter yet to score: {_tn144}"
+                        f" (SOT {_ts144} \u00b7 {_tt144 or 0} shots)"
+                    )
+                else:
+                    _fb144 = next(
+                        (p for p in top_sot_players
+                         if (p[1] or 0) == 0 and (p[2] or 0) >= 3),
+                        None,
+                    )
+                    if _fb144:
+                        _top_shooter_144 = _fb144[0]
+                        msg += (
+                            f"\n\U0001f3af Top shooter yet to score: {_fb144[0]}"
+                            f" ({_fb144[2] or 0} shots \u00b7 no SOT yet)"
+                        )
+        except Exception as _tp144:
+            log.debug(f"  v10.144 top shooter line skipped: {_tp144}")
+
         # v10.103: PRICE GATE — the entry-price verdict on the SAME fast
         # capture (zero extra credits, zero added latency): a drained live
         # price demotes BET -> NO_BET in the ledger and a one-line verdict
@@ -19727,10 +20060,40 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 msg += (
                     "\n\U0001f3af 90% POCKET \u2014 21-40' SOT\u22653/CRIT: "
                     + " \u00b7 ".join(_bits121)
-                    + f" \u00b7 frame Over @ \u2265{SHADOW90_PRICE_MIN:.2f} \u00b7 paper"
+                    + f" \u00b7 next goal ANY team \u00b7 bet Over @ \u2265{SHADOW90_PRICE_MIN:.2f} \u00b7 paper"
                 )
         except Exception as _p90e121:
             log.debug(f"  v10.121 90-pocket badge skipped: {_p90e121}")
+        # v10.144: 1stH MIRROR BADGE — armed on the ≤40' cell (task 2-b
+        # fresh-verified 94.9% any-goal, 56/59 on the 894-row ledger; the
+        # 41-44' band runs 81% — stamp-only, see the corr_shadows stamp).
+        # Message-time surge via the same _ratio117_sot_hist the corners
+        # rule reads — zero API credits. Same slot as the S90 badge; the
+        # two can co-fire (level-based vs delta-based rules). Display
+        # only, never a gate. NOTE: no _msg_prefix_80 touch here — the
+        # first capture (below, in the market-block region) already
+        # includes everything appended above it (the S90-badge pattern).
+        _mirror_fired_144 = False
+        try:
+            if _MIRROR_POCKET_V144 is not None and minute is not None \
+                    and int(minute) <= 40:
+                _sd144 = _rt117_delta10(
+                    _ratio117_sot_hist, (fid, tid), int(minute), sot)
+                if (_sd144 or 0) >= MIRROR_SURGE_MIN_SOT_DELTA:
+                    _mwr144, _mh144, _mn144 = _MIRROR_POCKET_V144
+                    msg += (
+                        f"\n\U0001fa9e 1stH MIRROR POCKET \u2014 "
+                        f"+{MIRROR_SURGE_MIN_SOT_DELTA} SOT/10' \u226440' \u00b7 "
+                        f"{int(round(_mwr144 * 100))}% any-goal "
+                        f"({_mh144}/{_mn144}) \u00b7 next goal ANY team \u00b7 paper"
+                    )
+                    _mirror_fired_144 = True
+                    log.info(
+                        f"  v10.144 MIRROR POCKET: F{fid} {tname} {minute}' "
+                        f"\u2014 1stH surge +{_sd144} SOT/10' badge rode"
+                    )
+        except Exception as _mir_e144:
+            log.debug(f"  v10.144 mirror badge skipped: {_mir_e144}")
         # v10.125: the v10.111 manual-price invitation is REMOVED (user
         # Sep 19: 'i dont want to type manual /price so exclude that
         # feature, it must be automatic; if it has no live price -
@@ -19842,7 +20205,7 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                 minute, _deficit_now, _lg_class, _dog_flag_msg,
             )
             msg = (
-                f"{_green_hdr}{_grade_word} \u2014 {_hit_pct}% goal chance "
+                f"{_green_hdr}{_grade_word} \u2014 {_hit_pct}% team goal chance "
                 f"({sig_label})\n\n" + msg
             )
         except Exception as _he95:
@@ -19855,6 +20218,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
         # parsed above). Counts live-update via editMessageText.
         _mkt_block, _mkt_extras = "", {}
         _mine_ids_138 = []  # v10.134/138: PATTERN MINE ids (ledger field)
+        _team_rid_145 = None   # v10.145: TEAM pocket line stamps (ledger)
+        _team_wr_145 = None    # v10.145: the line's TEAM WR (ledger)
+        _team_any_wr_145 = None  # v10.145: the line's any-goal WR (ledger)
         _veto_gate_138 = None  # v10.136/138: goals veto that demoted the BET
         _shadow105 = {"corners": None, "cards": None}  # v10.105
         _msg_prefix_80 = msg
@@ -20007,6 +20373,29 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
                     )
             except Exception as _me138:
                 log.debug(f"  v10.138 mine stamps skipped: {_me138}")
+            # v10.145: TEAM POCKET LINE (dual) — one line under the fired
+            # GOALS pocket carrying BOTH markets: team-to-score % + fair
+            # + worth-floor AND the pocket's any-goal % + fair. GATED to
+            # the >=90%-any-goal family on the FULL 894-row ledger (G7
+            # and PRIME31 fire with NO team line). Candidates = fired
+            # mine ids + S90 (badge) + MIRROR (the v10.144 mirror badge).
+            # Display only; stamps rid/wr/any_wr on the ledger row.
+            try:
+                _team_txt_145, _team_rid_145, _team_wr_145, _team_any_wr_145 = (
+                    _team_pocket_line_145(
+                        _mine_ids_138, tname, bool(_s90_rule),
+                        _mirror_fired_144,
+                    )
+                )
+                if _team_txt_145:
+                    msg += _team_txt_145
+                    _msg_prefix_80 = msg
+                    log.info(
+                        f"  v10.145 TEAM POCKET (dual): F{fid} {tname} {minute}' \u2014 "
+                        f"team-market line rode the signal"
+                    )
+            except Exception as _te145:
+                log.debug(f"  v10.145 team pocket line skipped: {_te145}")
             if _mkt_block:
                 msg += _mkt_block
         except Exception as _me80:
@@ -20461,6 +20850,13 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "pocket_stake": (POCKET_LIVE_STAKE if _plive141 else None),
             "pocket_ft_result": None,
             "pocket_pnl": None,
+            # v10.144/145: TEAM pocket stamps — which fired GOALS pocket
+            # carried the dual team-market line + its WRs (team and
+            # any-goal; the EOD grades team-scores vs any-goal on these
+            # rows; the Botev 18% split made this necessary).
+            "team_pocket_rid": _team_rid_145,
+            "team_pocket_wr": _team_wr_145,
+            "team_pocket_any_wr": _team_any_wr_145,
             "referee": (fixture.get("fixture") or {}).get("referee"),
             "outcome_5min": None,   # v10: expanded windows
             "outcome_10min": None,  # v10: expanded windows
@@ -20483,6 +20879,9 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             "top_sot_players": [
                 {"name": n, "sot": c, "shots": t} for n, c, t in top_sot_players
             ] if top_sot_players else [],
+            # v10.144: the top-shooter line's cited name (None when the
+            # line was skipped — no data / all scored / no SOT fallback)
+            "top_shooter_cited": _top_shooter_144,
             # v10.139: the opponent's non-scorer Top-SOT players + the
             # scorer odds the message cited (anytime-scorer board join).
             # Grading material for the next ledger pass: does the top
@@ -20577,6 +20976,45 @@ def process_fixture_stats(client: httpx.Client, fixture: dict) -> None:
             gps, accel_count,
         )
         signal_outcomes[-1].update(recency)
+        # v10.143: CHASE-SURGE shadow stamp — the Oct 11 comeback test
+        # (user hypothesis CONFIRMED as a context signal, NOT a pocket):
+        # a 2nd-half LOSING team with an SOT surge (2+ SOT in the last
+        # 10') scores by FT 56% (15/27 ledger rows) vs 26% (6/23) without
+        # the surge — a +30pp lift that also flips who-scores-next (team
+        # 56% / opponent-only 19%, vs 26% / 43% flat). Poll-level: 30%
+        # goal-in-15' vs 15.9% no-surge baseline. 56% << the 90% bar —
+        # never a badge, never a gate; the EOD grades the cell nightly.
+        try:
+            if (
+                minute is not None and int(minute) >= 45
+                and (goals_now or 0) < (opp_goals or 0)
+                and ((recency or {}).get("sot_delta_10m") or 0) >= 2
+            ):
+                _cs143 = signal_outcomes[-1].get("corr_shadows") or []
+                if "chase_surge" not in _cs143:
+                    _cs143.append("chase_surge")
+                    signal_outcomes[-1]["corr_shadows"] = _cs143
+        except Exception:
+            pass
+        # v10.144: 1stH MIRROR stamp — the pre-HT SOT surge (Oct 11
+        # finding: 92% any-goal 61/66; re-validated 69/75 (92%) on the
+        # 894-row ledger; the ≤40' badge cell is 56/59 (94.9%)). Mirror
+        # of chase_surge: any scoreline, FIRST half, any-goal market.
+        # Research stamp in corr_shadows — never a gate; fires for ANY
+        # minute<45 (the 41-44' band is 81% — the BADGE is the ≤40'
+        # cell, the stamp is the full research cell the EOD grades).
+        try:
+            if (
+                minute is not None and int(minute) < MIRROR_SURGE_MINUTE_MAX
+                and ((recency or {}).get("sot_delta_10m") or 0)
+                >= MIRROR_SURGE_MIN_SOT_DELTA
+            ):
+                _mir144 = signal_outcomes[-1].get("corr_shadows") or []
+                if "mirror_surge" not in _mir144:
+                    _mir144.append("mirror_surge")
+                    signal_outcomes[-1]["corr_shadows"] = _mir144
+        except Exception:
+            pass
         # v10.11: Save pending outcome immediately (survives restarts)
         save_outcome(signal_outcomes[-1])
 
